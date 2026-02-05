@@ -18,7 +18,7 @@ pip install PAT
 
 Editable install:
 ```bash
-git clone https://github.com/avrahamraviv/sirc-torch-pruning.git
+git clone https://github.com/AvrahamRaviv/sirc-torch-pruning.git
 cd sirc-torch-pruning && pip install -e .
 ```
 
