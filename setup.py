@@ -6,7 +6,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 # Dependencies
-requirements = ["torch>=2.0", "numpy"]
+requirements = ["torch>=2.0", "numpy", "graphviz"]
 
 setuptools.setup(
     name="PAT",
