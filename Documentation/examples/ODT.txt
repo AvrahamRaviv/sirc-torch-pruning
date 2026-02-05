@@ -1,0 +1,73 @@
+# step 1: init Pruner, at main_flows/train/__init__.py:
+# a. import
+"""
+from torch_pruning.utils import Pruning
+"""
+# b. init:
+"""
+general_confs = configs.general
+
+--->
+# init pruner
+pruner = Pruning(model, output_dir, device=device, example_inputs=(torch.randn(1, 3, 384, 512), torch.randn(1, 4032, 4)))
+<---
+
+eval_table, run_wandb = utils.configure_wandb(configs, model)
+"""
+
+# c. prune at init (if needed):
+"""
+--->
+# channel pruning at initialization
+pruner.prune(model, train_confs.start_epoch)
+<---
+
+for epoch in range(train_confs.start_epoch, train_confs.epochs):
+"""
+
+# step 2: Regularization, at at main_flows/train/__init__.py and trainer.py:
+"""
+a. pass pruner into train_one_epoch, at main_flows/train/__init__.py::
+train_one_epoch(
+    model, anchor_generator, criterion, data_loader_train, optimizer, device, epoch,
+    run_wandb, list_of_probes=train_confs.list_of_probes, max_steps=train_confs.max_steps, pruner=pruner)
+
+b. update train_one_epoch at trainer.py:
+replace "max_steps=0):" by "max_steps=0, pruner=None):"
+
+c. add regularization, immediately after backward pass:
+# Initializing gradients and back propagation
+optimizer.optimizer.zero_grad()
+losses.backward()
+
+--->
+# Regularization for pruning
+pruner.channel_regularize(model)
+<---
+
+# Computing gradients and updating
+"""
+
+# step 3: Pruning/Masking, at trainer.py:
+"""
+at the end of each epoch:
+
+--->
+# Pruning
+pruner.prune(model, epoch)
+<---
+
+# Evaluation
+"""
+
+# load pruned model extension, at main_flows.utils:
+"""
+try:
+   missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+   unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
+--->
+except:
+    from torch_pruning.utils import load_state_dict_pruned
+    model_without_ddp = load_state_dict_pruned(model_without_ddp, checkpoint['model'])
+    missing_keys, unexpected_keys = [], []
+<---

@@ -11,6 +11,7 @@ text.txt
 run*
 baselines
 *.txt
+!Documentation/examples/*.txt
 ours.sh
 benchmarks/draw
 tests/*.png
