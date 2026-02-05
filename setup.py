@@ -9,18 +9,17 @@ with open("README.md", "r", encoding="utf-8") as fh:
 requirements = ["torch>=2.0", "numpy"]
 
 setuptools.setup(
-    name="torch-pruning",
-    version="1.6.1",
-    author="Gongfan Fang",
-    author_email="gongfan@u.nus.edu",
-    description="Towards Any Structural Pruning",
+    name="PAT",
+    version="0.1.0",
+    author="Avraham Raviv, Ishay Goldin",
+    author_email="",
+    description="Pruning-Aware Training on top of Torch-Pruning",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/VainF/Torch-Pruning",
+    url="https://github.com/avrahamraviv/sirc-torch-pruning",
     project_urls={
-        "Bug Reports": "https://github.com/VainF/Torch-Pruning/issues",
-        "Source": "https://github.com/VainF/Torch-Pruning",
-        "Documentation": "https://github.com/VainF/Torch-Pruning/wiki",
+        "Bug Reports": "https://github.com/avrahamraviv/sirc-torch-pruning/issues",
+        "Source": "https://github.com/avrahamraviv/sirc-torch-pruning",
     },
     packages=setuptools.find_packages(exclude=["tests*", "examples*", "reproduce*"]),
     classifiers=[
