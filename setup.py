@@ -16,10 +16,10 @@ setuptools.setup(
     description="Pruning-Aware Training on top of Torch-Pruning",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/avrahamraviv/sirc-torch-pruning",
+    url="https://github.com/AvrahamRaviv/sirc-torch-pruning",
     project_urls={
-        "Bug Reports": "https://github.com/avrahamraviv/sirc-torch-pruning/issues",
-        "Source": "https://github.com/avrahamraviv/sirc-torch-pruning",
+        "Bug Reports": "https://github.com/AvrahamRaviv/sirc-torch-pruning/issues",
+        "Source": "https://github.com/AvrahamRaviv/sirc-torch-pruning",
     },
     packages=setuptools.find_packages(exclude=["tests*", "examples*", "reproduce*"]),
     classifiers=[
