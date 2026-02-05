@@ -32,6 +32,7 @@ __all__ = [
     "BNScaleImportance",
     "LAMPImportance",
     "RandomImportance",
+    "MACAwareImportance",
 ]
 
 class Importance(abc.ABC):
@@ -884,3 +885,127 @@ class ActivationImportance(GroupMagnitudeImportance):
         group_imp = self._reduce(group_imp, group_idxs)
         group_imp = self._normalize(group_imp, self.normalizer)
         return group_imp
+
+
+class MACAwareImportance(GroupMagnitudeImportance):
+    """MAC-aware importance that combines base importance with layer MAC costs.
+
+    This importance criterion scales the base importance score by considering
+    the computational cost (MACs) of each layer, encouraging pruning of
+    channels in computationally expensive layers.
+
+    Args:
+        p (int): Norm degree for base importance calculation. Default: 2
+        layers_mac (dict): Dictionary mapping layer names to their MAC counts.
+            Required parameter.
+        params (dict): Configuration parameters with keys:
+            - "type": Combination method ("Sum" or "Mul"). Default: "Sum"
+            - "alpha": Weight for importance vs MAC trade-off (0-1). Default: 0.9
+            - "beta": Exponent for MAC ratio calculation. Default: 2
+            - "use_macs": Whether to use MAC-aware scoring. Default: True
+        current_max (float): Current maximum importance for normalization in "Sum" mode.
+            Required when type="Sum".
+
+    Example:
+        ```python
+        # First compute per-layer MACs using torch_pruning utilities
+        layers_mac = {"conv1": 1000000, "conv2": 2000000, ...}
+
+        scorer = MACAwareImportance(
+            layers_mac=layers_mac,
+            params={"type": "Sum", "alpha": 0.9, "beta": 2, "use_macs": True},
+            current_max=1.0
+        )
+
+        DG = tp.DependencyGraph().build_dependency(model, example_inputs=torch.randn(1,3,224,224))
+        group = DG.get_pruning_group(model.conv1, tp.prune_conv_out_channels, idxs=[2, 6, 9])
+        imp_score = scorer(group)
+        ```
+    """
+
+    def __init__(self, p=2, layers_mac=None, params=None, current_max=None):
+        super().__init__(p=p)
+        if params is None:
+            params = {"type": "Sum", "alpha": 0.9, "beta": 2, "use_macs": True}
+        self.use_macs = params.get("use_macs", True)
+        assert layers_mac is not None, "layers_mac must be provided"
+        self.layers_mac = layers_mac
+        self.min_layer_mac = min(self.layers_mac.values())
+        self.max_layer_mac = max(self.layers_mac.values())
+        self.combination_type = params.get("type", "Sum")
+        self.alpha = params.get("alpha", 0.9)
+        self.beta = params.get("beta", 2)
+        self.current_max = current_max
+
+    @torch.no_grad()
+    def __call__(self, group, act_only=False):
+        """Compute MAC-aware importance for a pruning group.
+
+        Args:
+            group: Pruning group from DependencyGraph
+            act_only: If True, returns base importance without MAC scaling
+                (for computing max importance normalization)
+
+        Returns:
+            1-D tensor of importance scores per channel
+        """
+        # Compute base importance using parent class
+        base_importance = super().__call__(group)
+
+        if base_importance is None:
+            return None
+
+        if not self.use_macs or act_only:
+            return base_importance
+
+        # Extract layer name from group
+        dep, _ = group[0]
+        layer_name = dep.target.name
+        # Handle format "layer_name (Module)" by extracting just the name
+        if " " in layer_name:
+            layer_name = layer_name[:layer_name.index(" ")]
+        # Strip "module." prefix if present (for DataParallel models)
+        if layer_name.startswith("module."):
+            layer_name = layer_name[len("module."):]
+
+        # Get MAC cost for this layer
+        if layer_name not in self.layers_mac:
+            warnings.warn(f"Layer {layer_name} not found in layers_mac, returning base importance")
+            return base_importance
+
+        layer_mac = self.layers_mac[layer_name]
+
+        # Normalize MAC to [0, 1] range
+        mac_range = self.max_layer_mac - self.min_layer_mac
+        if mac_range > 0:
+            layer_mac_norm = (layer_mac - self.min_layer_mac) / mac_range
+        else:
+            layer_mac_norm = 0.5
+
+        # Compute MAC ratio for multiplicative scaling
+        ratio_mac_min = (self.min_layer_mac / layer_mac) ** (1 / self.beta)
+
+        # Combine importance with MAC cost
+        if self.combination_type == "Mul":
+            # Multiplicative: scale importance by MAC ratio
+            # Channels in high-MAC layers get lower effective importance
+            combined_importance = base_importance * ratio_mac_min
+        elif self.combination_type == "Sum":
+            # Additive: weighted sum of normalized importance and MAC penalty
+            # Higher MAC layers get bonus to encourage pruning there
+            # Handle current_max being None, scalar 0, or tensor with value 0
+            use_local_max = (
+                self.current_max is None or
+                (isinstance(self.current_max, (int, float)) and self.current_max == 0) or
+                (torch.is_tensor(self.current_max) and self.current_max.item() == 0)
+            )
+            if use_local_max:
+                norm_importance = base_importance / (base_importance.max() + 1e-8)
+            else:
+                norm_importance = base_importance / self.current_max
+            mac_penalty = 1 - layer_mac_norm  # Higher MAC = lower penalty = lower importance
+            combined_importance = self.alpha * norm_importance + (1 - self.alpha) * mac_penalty
+        else:
+            combined_importance = base_importance
+
+        return combined_importance
