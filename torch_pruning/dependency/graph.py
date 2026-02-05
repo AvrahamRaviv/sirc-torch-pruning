@@ -406,9 +406,27 @@ class DependencyGraph(object):
             ###########################################
             # Rule 1) - Inter-layer Dependency
             ###########################################
+            is_elem = (node.type == ops.OPTYPE.ELEMENTWISE)
+            elem_in_nodes = list(node.inputs) if is_elem else []
+            elem_in_ch = []
+            if is_elem and len(elem_in_nodes) >= 2:
+                for _in in elem_in_nodes:
+                    elem_in_ch.append(self.get_out_channels(_in))
+                has_broadcast = (elem_in_ch[0] == 1 and (elem_in_ch[1] is not None and elem_in_ch[1] > 1)) \
+                                or (elem_in_ch[1] == 1 and (elem_in_ch[0] is not None and elem_in_ch[0] > 1))
+            else:
+                has_broadcast = False
+
             for in_node in node.inputs:
                 handler = self.get_pruner_of_module(in_node.module).prune_out_channels
                 trigger = self.get_pruner_of_module(node.module).prune_in_channels
+                if has_broadcast and is_elem and len(elem_in_nodes) >= 2:
+                    i = 0 if in_node is elem_in_nodes[0] else (1 if in_node is elem_in_nodes[1] else None)
+                    if i is not None:
+                        ch_i = elem_in_ch[i]
+                        ch_other = elem_in_ch[1 - i]
+                        if ch_i == 1 and (ch_other is not None and ch_other > 1):
+                            continue
                 dep = Dependency(
                     trigger=trigger, handler=handler, source=node, target=in_node
                 )
@@ -433,6 +451,10 @@ class DependencyGraph(object):
         """ Trace the model as a graph
         """
         model.eval()
+        grad_d = {}
+        for n, m in model.named_parameters():
+            grad_d[n] = m.requires_grad
+            m.requires_grad = True
         gradfn2module = {}
         visited = {}
         self._2d_4d = True # for pytorch<=1.8
@@ -465,7 +487,22 @@ class DependencyGraph(object):
 
         # Forward the model and record all modules
         if forward_fn is not None:
-            out = forward_fn(model, example_inputs)
+            try:
+                out = forward_fn(model, example_inputs)
+            except TypeError:
+                if isinstance(example_inputs, (list, tuple)) and len(example_inputs) > 0 and hasattr(example_inputs[0], "shape"):
+                    if example_inputs[0].shape[1] == 3:
+                        out = forward_fn(example_inputs)
+                    else:
+                        out = forward_fn(example_inputs[0][:, :1], example_inputs[0][:, :1])
+                else:
+                    out = forward_fn(example_inputs)
+
+            if isinstance(out, dict):
+                if "seg_fw" in out:
+                    out = out["seg_fw"]
+                elif "flows_fw" in out:
+                    out = out["flows_fw"]
         elif isinstance(example_inputs, dict):
             out = model(**example_inputs)
         else:
@@ -475,6 +512,11 @@ class DependencyGraph(object):
                 out = model(example_inputs)
         for hook in hooks:
             hook.remove()
+        for n, m in model.named_parameters():
+            m.requires_grad = grad_d[n]
+
+        if isinstance(out, (list, tuple)) and len(out) == 6:
+            out = out[:4]
 
         # for recursive models or layers
         reused = [m for (m, count) in visited.items() if count > 1]
