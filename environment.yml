@@ -1,0 +1,17 @@
+name: torch-pruning
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch>=2.0
+  - torchvision
+  - numpy
+  - graphviz
+  - python-graphviz
+  - libjpeg-turbo
+  - libpng
+  - pip
+  - pip:
+    - -e .
