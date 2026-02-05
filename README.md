@@ -2,6 +2,8 @@
 
 This project builds on top of [Torch-Pruning](https://github.com/VainF/Torch-Pruning) and adds Pruning-Aware Training (PAT) utilities and workflows.
 
+Docs: see [Documentation/README.md](Documentation/README.md).
+
 ## What is PAT here?
 
 PAT extends structural pruning with training-time routines for:
