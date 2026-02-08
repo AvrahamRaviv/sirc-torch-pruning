@@ -11,10 +11,11 @@ from .. import function
 
 
 class VBPPruner(BasePruner):
-    def __init__(self, model, example_inputs, *args, mean_dict=None, **kwargs):
+    def __init__(self, model, example_inputs, *args, mean_dict=None, verbose=True, **kwargs):
         super().__init__(model, example_inputs, *args, **kwargs)
         self.example_inputs = example_inputs
         self.mean_dict = mean_dict
+        self.verbose = verbose
 
         # mean-check state
         self._meancheck_enabled = False
@@ -101,15 +102,16 @@ class VBPPruner(BasePruner):
                 self._apply_compensation(group, idxs)
 
             dep, idxs = group[0]
-            dep_str = str(dep)
-            idxs_ratio_str = f"{len(idxs)} / {dep.target.module.weight.shape[0]}"
-            log_str = f"Prune {idxs_ratio_str} channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}."
-            print(f"[VBP-prune] {log_str}")
+            if self.verbose:
+                dep_str = str(dep)
+                idxs_ratio_str = f"{len(idxs)} / {dep.target.module.weight.shape[0]}"
+                log_str = f"Prune {idxs_ratio_str} channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}."
+                print(f"[VBP-prune] {log_str}")
             group.prune()
 
             if self._meancheck_enabled and consumer is not None:
                 mu_after = self._collect_out_mean(self.model, consumer, self.example_inputs)
-                if mu_before is not None and mu_after is not None:
+                if mu_before is not None and mu_after is not None and self.verbose:
                     C = min(len(mu_before), len(mu_after))
                     d = (mu_after[:C] - mu_before[:C]).abs()
                     print(
@@ -133,7 +135,8 @@ class VBPPruner(BasePruner):
         # Use calibration means from mean_dict (keyed by root module)
         mu = self.mean_dict.get(root)
         if mu is None:
-            print(f"[VBP] No calibration mean for {root}, skipping compensation")
+            if self.verbose:
+                print(f"[VBP] No calibration mean for {root}, skipping compensation")
             return
 
         rem = torch.as_tensor(idx_to_prune, device=root.weight.device)
@@ -155,7 +158,8 @@ class VBPPruner(BasePruner):
                 delta_b = (W * mu[rem]).sum(dim=1)  # [C_out]
                 self._add_bias(consumer, delta_b)
                 compensated = True
-                print(f"[VBP-comp] consumer {consumer} compensated (calibration mu)")
+                if self.verbose:
+                    print(f"[VBP-comp] consumer {consumer} compensated (calibration mu)")
 
             # ----- Conv consumer -----
             elif handler == function.prune_conv_in_channels:
@@ -171,9 +175,10 @@ class VBPPruner(BasePruner):
                     self._add_bias(consumer, delta_b)
 
                 compensated = True
-                print(f"[VBP-comp] consumer {consumer} compensated (calibration mu)")
+                if self.verbose:
+                    print(f"[VBP-comp] consumer {consumer} compensated (calibration mu)")
 
-        if not compensated:
+        if not compensated and self.verbose:
             print(f"[VBP] No compensation applied for {root} (no param consumer found)")
 
     @torch.no_grad()
