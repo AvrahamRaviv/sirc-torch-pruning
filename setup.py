@@ -9,8 +9,8 @@ with open("README.md", "r", encoding="utf-8") as fh:
 requirements = ["torch>=2.0", "numpy", "graphviz"]
 
 setuptools.setup(
-    name="PAT",
-    version="0.1.0",
+    name="torch-pruning",
+    version="2.0.0",
     author="Avraham Raviv, Ishay Goldin",
     author_email="",
     description="Pruning-Aware Training on top of Torch-Pruning",
