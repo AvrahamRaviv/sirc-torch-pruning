@@ -48,7 +48,6 @@ from tqdm import tqdm
 
 import torch_pruning as tp
 from transformers import ViTForImageClassification
-from transformers.models.vit.modeling_vit import ViTSelfAttention, ViTSelfOutput
 
 # Local ConvNeXt implementation (FB version)
 # Handle both direct execution and module import
@@ -301,21 +300,20 @@ def forward_logits(model, images, model_type: str):
 def create_pruner(model, example_inputs, imp, args):
     """Create VBPPruner with VarianceImportance and bias compensation."""
     ignored_layers = []
-    num_heads = {}
 
     if args.model_type == "vit":
-        # Ignore classifier
+        # MLP-only pruning: ignore everything except fc1 (intermediate.dense)
         ignored_layers.append(model.classifier)
+        ignored_layers.append(model.vit.embeddings.patch_embeddings.projection)
 
-        # Setup attention head grouping
-        for m in model.modules():
-            if isinstance(m, ViTSelfAttention):
-                num_heads[m.query] = m.num_attention_heads
-                num_heads[m.key] = m.num_attention_heads
-                num_heads[m.value] = m.num_attention_heads
-            # Optionally ignore self-output dense for bottleneck mode
-            if args.bottleneck and isinstance(m, ViTSelfOutput):
-                ignored_layers.append(m.dense)
+        for block in model.vit.encoder.layer:
+            # Attention layers — don't prune
+            ignored_layers.append(block.attention.attention.query)
+            ignored_layers.append(block.attention.attention.key)
+            ignored_layers.append(block.attention.attention.value)
+            ignored_layers.append(block.attention.output.dense)
+            # fc2 output channels are the residual stream — don't prune
+            ignored_layers.append(block.output.dense)
 
         output_transform = lambda out: out.logits.sum()
 
@@ -335,23 +333,10 @@ def create_pruner(model, example_inputs, imp, args):
         pruning_ratio=1.0 - args.keep_ratio,
         ignored_layers=ignored_layers,
         output_transform=output_transform,
-        num_heads=num_heads,
-        prune_head_dims=True,
-        prune_num_heads=False,
         mean_dict=imp.means,
     )
 
     return pruner
-
-
-def update_vit_metadata(model, pruner):
-    """Update ViT attention head metadata after pruning."""
-    for m in model.modules():
-        if isinstance(m, ViTSelfAttention):
-            if m.query in pruner.num_heads:
-                m.num_attention_heads = pruner.num_heads[m.query]
-                m.attention_head_size = m.query.out_features // m.num_attention_heads
-                m.all_head_size = m.query.out_features
 
 
 # ---------------------------------------------------------------------------
@@ -389,8 +374,15 @@ def collect_and_sync_stats(model, train_loader, device, imp, args):
 
     # Collect statistics on main rank
     if is_main():
+        # Build target_layers for post-GELU stats (fc1 only)
+        target_layers = None
+        if args.model_type == "vit":
+            target_layers = [
+                (block.intermediate.dense, block.intermediate.intermediate_act_fn)
+                for block in model.vit.encoder.layer
+            ]
         log_info("Collecting activation variance statistics...")
-        imp.collect_statistics(model, train_loader, device)
+        imp.collect_statistics(model, train_loader, device, target_layers=target_layers)
         log_info(f"Statistics collected for {len(imp.variance)} layers")
 
         # Debug: print variance stats
@@ -586,10 +578,6 @@ def main():
     log_info(f"Pruning with keep_ratio={args.keep_ratio}, global={args.global_pruning}")
     prune_model(model, pruner, device, example_inputs)
 
-    # Update ViT metadata if needed
-    if args.model_type == "vit":
-        update_vit_metadata(model, pruner)
-
     # Retention accuracy (before fine-tuning)
     if is_main():
         log_info("Evaluating retention accuracy (before fine-tuning)...")
@@ -681,8 +669,7 @@ def parse_args():
                              help="Model name/path (HF model or ConvNeXt variant)")
     model_group.add_argument("--convnext_checkpoint", default=None,
                              help="Path to ConvNeXt checkpoint (.pth)")
-    model_group.add_argument("--bottleneck", action="store_true",
-                             help="Enable bottleneck mode for ViT (ignore self-output dense)")
+
 
     # Data
     data_group = parser.add_argument_group("Data")
