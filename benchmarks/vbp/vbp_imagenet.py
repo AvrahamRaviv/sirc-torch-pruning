@@ -439,7 +439,9 @@ def train_one_epoch_kd(model, teacher, train_loader, train_sampler, optimizer,
     total_loss = 0.0
     num_batches = 0
 
-    pbar = tqdm(train_loader, disable=not is_main(), desc=f"Epoch {epoch + 1}")
+    total = len(train_loader)
+    pbar = tqdm(train_loader, disable=not is_main(), desc=f"Epoch {epoch + 1}",
+                miniters=max(total // 20, 1))
     for images, labels in pbar:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -483,7 +485,9 @@ def validate(model, val_loader, device, model_type: str):
     loss_sum = 0.0
 
     with torch.no_grad():
-        for images, labels in tqdm(val_loader, disable=not is_main(), desc="Validating"):
+        total_val = len(val_loader)
+        for images, labels in tqdm(val_loader, disable=not is_main(), desc="Validating",
+                                   miniters=max(total_val // 20, 1)):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 

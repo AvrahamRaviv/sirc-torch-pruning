@@ -1040,7 +1040,7 @@ class VarianceImportance(Importance):
     # 1. Collect statistics OFFLINE (NO EMA)
     # ---------------------------------------------------------
     @torch.no_grad()
-    def collect_statistics(self, model, train_loader, device, target_layers=None):
+    def collect_statistics(self, model, train_loader, device, target_layers=None, max_batches=200):
         """
         Collect per-channel activation statistics.
 
@@ -1054,6 +1054,7 @@ class VarianceImportance(Importance):
                 architectures like ViT where VBP needs post-GELU activation
                 stats on MLP fc1 layers specifically.
                 If None, hooks all Conv2d/Linear with no post-activation.
+            max_batches: Maximum number of batches to collect statistics for.
         """
         self.sum.clear()
         self.sum_sq.clear()
@@ -1075,9 +1076,18 @@ class VarianceImportance(Importance):
                     handles.append(m.register_forward_hook(self._make_conv_linear_hook(m)))
 
         model.eval()
-        for images, _ in train_loader:
+        total = min(len(train_loader), max_batches) if max_batches else len(train_loader)
+        try:
+            from tqdm import tqdm
+            pbar = tqdm(train_loader, desc="Collecting stats", total=total,
+                        miniters=max(total // 20, 1))
+        except ImportError:
+            pbar = train_loader
+        for batch_idx, (images, _) in enumerate(pbar):
             images = images.to(device, non_blocking=True)
             model(images)
+            if max_batches is not None and (batch_idx + 1) >= max_batches:
+                break
 
         for h in handles:
             h.remove()
