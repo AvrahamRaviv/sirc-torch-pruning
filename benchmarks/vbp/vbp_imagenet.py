@@ -718,34 +718,10 @@ def parse_args():
 
     # Output
     out_group = parser.add_argument_group("Output")
-    out_group.add_argument("--save_dir", default=None,
-                           help="Directory for saving outputs. "
-                                "Auto-constructed from args if not set: "
-                                "<output_root>/<model>/<setup>/kr_<keep_ratio>")
-    out_group.add_argument("--output_root", default="./output/vbp",
-                           help="Root output directory (used when --save_dir is not set)")
+    out_group.add_argument("--save_dir", default="./output/vbp",
+                           help="Directory for saving outputs")
 
-    args = parser.parse_args()
-
-    # Auto-construct save_dir if not explicitly set
-    if args.save_dir is None:
-        model_short = os.path.basename(args.model_name.rstrip("/"))
-        setup_parts = []
-        if args.global_pruning:
-            setup_parts.append("global")
-        else:
-            setup_parts.append("local")
-        if args.use_kd:
-            setup_parts.append("kd")
-        else:
-            setup_parts.append("no_kd")
-        if args.norm_per_layer:
-            setup_parts.append("norm")
-        setup_name = "_".join(setup_parts)
-        kr_folder = f"kr_{args.keep_ratio}"
-        args.save_dir = os.path.join(args.output_root, model_short, setup_name, kr_folder)
-
-    return args
+    return parser.parse_args()
 
 
 if __name__ == '__main__':
