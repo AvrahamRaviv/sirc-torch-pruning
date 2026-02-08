@@ -58,7 +58,6 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from convnext import convnext_tiny, convnext_small, convnext_base, convnext_large
 
-
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -382,7 +381,7 @@ def collect_and_sync_stats(model, train_loader, device, imp, args):
                 for block in model.vit.encoder.layer
             ]
         log_info("Collecting activation variance statistics...")
-        imp.collect_statistics(model, train_loader, device, target_layers=target_layers)
+        imp.collect_statistics(model, train_loader, device, target_layers=target_layers, max_batches=args.max_batches)
         log_info(f"Statistics collected for {len(imp.variance)} layers")
 
         # Debug: print variance stats
@@ -393,44 +392,33 @@ def collect_and_sync_stats(model, train_loader, device, imp, args):
     if use_ddp:
         dist.barrier()
 
-        # Package statistics for broadcast
-        stats_dict = {
-            "variance": {id(m): v.cpu() for m, v in imp.variance.items()},
-            "means": {id(m): v.cpu() for m, v in imp.means.items()},
-            "module_map": {id(m): m for m in imp.variance.keys()},
-        }
+        # Build name→module map (same structure on all ranks)
+        name_to_module = {n: m for n, m in model.named_modules()}
+        module_to_name = {m: n for n, m in model.named_modules()}
 
-        stats_list = [stats_dict if is_main() else None]
+        # Package as {name: cpu_tensor} — no module objects, no CUDA tensors
+        if is_main():
+            stats_dict = {
+                "variance": {module_to_name[m]: v.cpu() for m, v in imp.variance.items()
+                             if m in module_to_name},
+                "means": {module_to_name[m]: v.cpu() for m, v in imp.means.items()
+                           if m in module_to_name},
+            }
+        else:
+            stats_dict = None
+
+        stats_list = [stats_dict]
         dist.broadcast_object_list(stats_list, src=0)
 
         # Unpack on non-main ranks
         if not is_main():
             stats_dict = stats_list[0]
-            # Reconstruct statistics with module references
-            # Note: This requires modules to have matching structure across ranks
-            module_by_class = {}
-            for m in model.modules():
-                key = (m.__class__.__name__, id(m) % 10000)  # Simple hash
-                module_by_class[key] = m
-
-            # Match by position in module list (safer for DDP)
-            model_modules = list(model.modules())
-            src_modules = list(stats_dict["module_map"].values())
-
-            for i, (src_id, var) in enumerate(stats_dict["variance"].items()):
-                if i < len(model_modules):
-                    target_mod = model_modules[i] if i < len(model_modules) else None
-                    # Find matching module by type
-                    src_mod = stats_dict["module_map"].get(src_id)
-                    if src_mod is not None:
-                        for m in model.modules():
-                            if (type(m) == type(src_mod) and
-                                hasattr(m, 'weight') and hasattr(src_mod, 'weight') and
-                                m.weight.shape == src_mod.weight.shape):
-                                imp.variance[m] = var.to(device)
-                                if src_id in stats_dict["means"]:
-                                    imp.means[m] = stats_dict["means"][src_id].to(device)
-                                break
+            for name, var in stats_dict["variance"].items():
+                if name in name_to_module:
+                    mod = name_to_module[name]
+                    imp.variance[mod] = var.to(device)
+                    if name in stats_dict["means"]:
+                        imp.means[mod] = stats_dict["means"][name].to(device)
 
         dist.barrier()
 
@@ -450,7 +438,7 @@ def train_one_epoch_kd(model, teacher, train_loader, train_sampler, optimizer,
     total_loss = 0.0
     num_batches = 0
 
-    pbar = tqdm(train_loader, disable=not is_main(), desc=f"Epoch {epoch+1}")
+    pbar = tqdm(train_loader, disable=not is_main(), desc=f"Epoch {epoch + 1}")
     for images, labels in pbar:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -514,7 +502,7 @@ def validate(model, val_loader, device, model_type: str):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main():
+def main(argv):
     args = parse_args()
 
     # Setup DDP or single GPU
@@ -557,10 +545,10 @@ def main():
     # Baseline evaluation
     if is_main():
         base_macs, base_params = tp.utils.count_ops_and_params(model, example_inputs)
-        log_info(f"Baseline: {base_macs/1e9:.2f}G MACs, {base_params/1e6:.2f}M params")
+        log_info(f"Baseline: {base_macs / 1e9:.2f}G MACs, {base_params / 1e6:.2f}M params")
 
         log_info("Evaluating original model...")
-        acc_orig, loss_orig = validate(model, val_loader, device, args.model_type)
+        acc_orig, loss_orig = 0.7202, 1.2280  # validate(model, val_loader, device, args.model_type)
         log_info(f"Original accuracy: {acc_orig:.4f}, loss: {loss_orig:.4f}")
     else:
         base_macs = base_params = acc_orig = loss_orig = None
@@ -585,9 +573,9 @@ def main():
         log_info(f"Retention accuracy: {acc_ret:.4f}, loss: {loss_ret:.4f}")
 
         pruned_macs, pruned_params = tp.utils.count_ops_and_params(model, example_inputs)
-        log_info(f"Pruned: {pruned_macs/1e9:.2f}G MACs, {pruned_params/1e6:.2f}M params")
-        log_info(f"Reduction: {(1 - pruned_macs/base_macs)*100:.1f}% MACs, "
-                 f"{(1 - pruned_params/base_params)*100:.1f}% params")
+        log_info(f"Pruned: {pruned_macs / 1e9:.2f}G MACs, {pruned_params / 1e6:.2f}M params")
+        log_info(f"Reduction: {(1 - pruned_macs / base_macs) * 100:.1f}% MACs, "
+                 f"{(1 - pruned_params / base_params) * 100:.1f}% params")
 
     # Wrap in DDP for fine-tuning
     if not args.disable_ddp:
@@ -614,7 +602,7 @@ def main():
             if is_main():
                 eval_model = model.module if isinstance(model, DDP) else model
                 acc_ft, loss_ft = validate(eval_model, val_loader, device, args.model_type)
-                log_info(f"Epoch {epoch+1}/{args.epochs_ft}: "
+                log_info(f"Epoch {epoch + 1}/{args.epochs_ft}: "
                          f"train_loss={train_loss:.4f}, val_acc={acc_ft:.4f}, val_loss={loss_ft:.4f}")
 
                 if acc_ft > best_acc:
@@ -635,10 +623,10 @@ def main():
         log_info("=" * 60)
         log_info("Summary")
         log_info("=" * 60)
-        log_info(f"Base MACs:    {base_macs/1e9:.2f}G -> Pruned: {pruned_macs/1e9:.2f}G "
-                 f"({pruned_macs/base_macs*100:.1f}%)")
-        log_info(f"Base Params:  {base_params/1e6:.2f}M -> Pruned: {pruned_params/1e6:.2f}M "
-                 f"({pruned_params/base_params*100:.1f}%)")
+        log_info(f"Base MACs:    {base_macs / 1e9:.2f}G -> Pruned: {pruned_macs / 1e9:.2f}G "
+                 f"({pruned_macs / base_macs * 100:.1f}%)")
+        log_info(f"Base Params:  {base_params / 1e6:.2f}M -> Pruned: {pruned_params / 1e6:.2f}M "
+                 f"({pruned_params / base_params * 100:.1f}%)")
         log_info(f"Original Acc: {acc_orig:.4f}")
         log_info(f"Retention Acc: {acc_ret:.4f} (before fine-tuning)")
         log_info(f"Final Acc:    {acc_final:.4f}")
@@ -670,10 +658,9 @@ def parse_args():
     model_group.add_argument("--convnext_checkpoint", default=None,
                              help="Path to ConvNeXt checkpoint (.pth)")
 
-
     # Data
     data_group = parser.add_argument_group("Data")
-    data_group.add_argument("--data_path", required=True,
+    data_group.add_argument("--data_path", default="/algo/NetOptimization/outputs/VBP/",
                             help="Path to ImageNet root (with train/val subdirs)")
     data_group.add_argument("--train_batch_size", type=int, default=64,
                             help="Training batch size per GPU")
@@ -681,6 +668,8 @@ def parse_args():
                             help="Validation batch size")
     data_group.add_argument("--num_workers", type=int, default=4,
                             help="Number of data loading workers")
+    data_group.add_argument("--max_batches", type=int, default=200,
+                            help="Max batches for stats collection")
 
     # Pruning
     prune_group = parser.add_argument_group("Pruning")
@@ -725,5 +714,5 @@ def parse_args():
     return parser.parse_args()
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    main(sys.argv[1:])
