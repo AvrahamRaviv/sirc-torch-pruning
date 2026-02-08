@@ -333,6 +333,7 @@ def create_pruner(model, example_inputs, imp, args):
         ignored_layers=ignored_layers,
         output_transform=output_transform,
         mean_dict=imp.means,
+        verbose=is_main(),
     )
 
     return pruner
@@ -516,6 +517,11 @@ def main(argv):
         device = setup_distributed(args)
 
     setup_logging(args.save_dir)
+
+    # Suppress warnings on non-main ranks
+    if not is_main():
+        import warnings
+        warnings.filterwarnings("ignore")
 
     if is_main():
         log_info("=" * 60)
