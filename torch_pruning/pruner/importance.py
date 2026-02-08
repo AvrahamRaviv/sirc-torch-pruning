@@ -33,6 +33,7 @@ __all__ = [
     "LAMPImportance",
     "RandomImportance",
     "MACAwareImportance",
+    "VarianceImportance",
 ]
 
 class Importance(abc.ABC):
@@ -1009,3 +1010,163 @@ class MACAwareImportance(GroupMagnitudeImportance):
             combined_importance = base_importance
 
         return combined_importance
+
+
+class VarianceImportance(Importance):
+    """
+    Variance-based activation importance (Exact VBP).
+
+    Usage:
+        importance = VarianceImportance(norm_per_layer=False)
+        importance.collect_statistics(model, train_loader, device)
+        pruner = MagnitudePruner(..., importance=importance)
+    """
+
+    def __init__(self, norm_per_layer: bool = False, eps: float = 1e-8):
+        super().__init__()
+        self.norm_per_layer = norm_per_layer
+        self.eps = eps
+
+        # Exact accumulators: module -> tensors
+        self.sum = {}
+        self.sum_sq = {}
+        self.count = {}
+
+        # final per-module statistics after collection
+        self.variance = {}   # module -> var[C]
+        self.means = {}      # module -> mean[C]
+
+    # ---------------------------------------------------------
+    # 1. Collect statistics OFFLINE (NO EMA)
+    # ---------------------------------------------------------
+    @torch.no_grad()
+    def collect_statistics(self, model, train_loader, device, target_layers=None):
+        """
+        Collect per-channel activation statistics.
+
+        Args:
+            model: The model to collect statistics from.
+            train_loader: DataLoader for training/calibration data.
+            device: Device to run on.
+            target_layers: Optional list of (module, post_act_fn) tuples.
+                If provided, only hooks these modules and applies post_act_fn
+                to the output before collecting stats. This is required for
+                architectures like ViT where VBP needs post-GELU activation
+                stats on MLP fc1 layers specifically.
+                If None, hooks all Conv2d/Linear with no post-activation.
+        """
+        self.sum.clear()
+        self.sum_sq.clear()
+        self.count.clear()
+        self.variance.clear()
+        self.means.clear()
+
+        handles = []
+        if target_layers is not None:
+            for module, post_act_fn in target_layers:
+                handles.append(
+                    module.register_forward_hook(
+                        self._make_conv_linear_hook(module, post_act_fn=post_act_fn)
+                    )
+                )
+        else:
+            for m in model.modules():
+                if isinstance(m, (nn.Conv2d, nn.Linear)):
+                    handles.append(m.register_forward_hook(self._make_conv_linear_hook(m)))
+
+        model.eval()
+        for images, _ in train_loader:
+            images = images.to(device, non_blocking=True)
+            model(images)
+
+        for h in handles:
+            h.remove()
+
+        self._compute_statistics()
+
+    # ---------------------------------------------------------
+    # Hook: accumulate sum(x), sum(x^2), count
+    # ---------------------------------------------------------
+    def _make_conv_linear_hook(self, module, post_act_fn=None):
+        def hook(mod, inp, out):
+            if out is None:
+                return
+            x = out.detach()
+
+            # Apply post-activation (e.g., GELU for ViT MLP fc1)
+            if post_act_fn is not None:
+                x = post_act_fn(x)
+
+            if x.dim() == 4:
+                # Conv2d: [B, C, H, W] -> [B*H*W, C]
+                x = x.permute(0, 2, 3, 1).reshape(-1, x.size(1))
+            elif x.dim() == 3:
+                # Transformer Linear: [B, T, C] -> [B*T, C]
+                x = x.reshape(-1, x.size(-1))
+            elif x.dim() == 2:
+                # Standard Linear: [B, C]
+                pass
+            else:
+                return
+
+            n = x.size(0)
+            if mod not in self.sum:
+                self.sum[mod] = x.sum(dim=0).cpu()
+                self.sum_sq[mod] = (x * x).sum(dim=0).cpu()
+                self.count[mod] = n
+            else:
+                self.sum[mod] += x.sum(dim=0).cpu()
+                self.sum_sq[mod] += (x * x).sum(dim=0).cpu()
+                self.count[mod] += n
+
+        return hook
+
+    # ---------------------------------------------------------
+    # Compute final mean and variance: var = E[x^2] - (E[x])^2
+    # ---------------------------------------------------------
+    def _compute_statistics(self):
+        self.variance.clear()
+        self.means.clear()
+
+        for module in self.sum.keys():
+            s = self.sum[module]
+            s2 = self.sum_sq[module]
+            n = float(self.count[module])
+
+            mean = s / n               # [C]
+            mean_sq = s2 / n           # [C]
+            var = mean_sq - mean * mean
+
+            # Numerical safety
+            var = torch.clamp(var, min=0.0)
+
+            # Optional normalization per layer
+            if self.norm_per_layer:
+                layer_mean = var.mean()
+                if layer_mean > 0:
+                    var = var / (layer_mean + self.eps)
+
+            self.means[module] = mean.clone()   # <-- for VBP compensation
+            self.variance[module] = var         # <-- for importance
+
+    # ---------------------------------------------------------
+    # 2. Torch-Pruning interface: importance(group)
+    # ---------------------------------------------------------
+    @torch.no_grad()
+    def __call__(self, group, **kwargs):
+        """
+        Returns importance values for the channels in this pruning group.
+        Lower variance => lower importance => pruned first by MagnitudePruner.
+        """
+        dep, idxs = group[0]
+        module = dep.target.module
+
+        if module not in self.variance:
+            # If this module had no stats (unlikely), fallback
+            return torch.ones(len(idxs))
+
+        var = self.variance[module]
+        idxs = torch.as_tensor(idxs, dtype=torch.long)
+        scores = var[idxs].clone()
+
+        return scores
