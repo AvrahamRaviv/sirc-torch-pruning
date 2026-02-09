@@ -476,19 +476,18 @@ def train_one_epoch_kd(model, teacher, train_loader, train_sampler, optimizer,
                 reduction="batchmean"
             ) * (args.kd_T ** 2)
 
-            loss = args.kd_alpha * ce_loss + args.kd_beta * kd_loss
+            loss = args.kd_alpha * ce_loss + (1 - args.kd_alpha) * kd_loss
         else:
             loss = ce_loss
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
         total_loss += loss.item()
         num_batches += 1
         pbar.set_postfix({"loss": loss.item()})
-
-    scheduler.step()
     return total_loss / max(num_batches, 1)
 
 
@@ -716,8 +715,6 @@ def parse_args():
                           help="Enable knowledge distillation from unpruned teacher")
     kd_group.add_argument("--kd_alpha", type=float, default=0.7,
                           help="Weight for CE loss in KD")
-    kd_group.add_argument("--kd_beta", type=float, default=0.3,
-                          help="Weight for KD loss")
     kd_group.add_argument("--kd_T", type=float, default=2.0,
                           help="Temperature for KD softmax")
 
