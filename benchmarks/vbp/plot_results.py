@@ -29,18 +29,18 @@ import matplotlib.pyplot as plt
 
 # Paper Table 10, DeiT-T (arxiv 2507.12988)
 PAPER_DEIT_T = {
-    # prune_pct: (retention_acc, macs_G, params_M)
-    0:  (72.02, 1.26, 5.72),
-    5:  (71.67, 1.22, 5.54),
-    10: (70.95, 1.19, 5.36),
-    15: (70.05, 1.15, 5.18),
-    20: (68.87, 1.12, 5.01),
-    25: (67.37, 1.08, 4.83),
-    30: (64.76, 1.05, 4.65),
-    35: (61.12, 1.01, 4.48),
-    40: (55.64, 0.98, 4.30),
-    45: (49.77, 0.94, 4.12),
-    50: (39.58, 0.91, 3.94),
+    # prune_pct: (retention_acc, finetuned_acc, macs_G, params_M)
+    0:  (72.02, 72.02, 1.26, 5.72),
+    5:  (71.67, 72.05, 1.22, 5.54),
+    10: (70.95, 71.92, 1.19, 5.36),
+    15: (70.05, 71.76, 1.15, 5.18),
+    20: (68.87, 71.60, 1.12, 5.01),
+    25: (67.37, 71.44, 1.08, 4.83),
+    30: (64.76, 71.20, 1.05, 4.65),
+    35: (61.12, 70.86, 1.01, 4.48),
+    40: (55.64, 70.55, 0.98, 4.30),
+    45: (49.77, 70.08, 0.94, 4.12),
+    50: (39.58, 69.70, 0.91, 3.94),
 }
 
 
@@ -193,7 +193,7 @@ def print_table(setups):
             paper_str = f"{paper_ret:.2f}" if paper_ret is not None else "  —"
             delta = f"{ret - paper_ret:+.2f}" if (ret is not None and paper_ret is not None) else "  —"
             params_str = f"{params:.2f}" if params is not None else "  —"
-            paper_params = f"{paper[2]:.2f}" if paper else "  —"
+            paper_params = f"{paper[3]:.2f}" if paper else "  —"
 
             print(f"  {pp:>5}% | {kr:>.2f} | {ret_str:>6}% | {best_str:>6}% | "
                   f"{paper_str:>9}% | {delta:>6} | "
@@ -207,18 +207,23 @@ def plot_results(setups, save_path):
     colors = plt.cm.tab10.colors
     fig, axes = plt.subplots(1, 2, figsize=(16, 7))
 
-    # --- Paper reference (both plots) ---
-    paper_params = [PAPER_DEIT_T[p][2] for p in sorted(PAPER_DEIT_T.keys()) if p > 0]
-    paper_ret = [PAPER_DEIT_T[p][0] for p in sorted(PAPER_DEIT_T.keys()) if p > 0]
+    # --- Paper data ---
+    paper_pcts = sorted(k for k in PAPER_DEIT_T.keys() if k > 0)
+    paper_params = [PAPER_DEIT_T[p][3] for p in paper_pcts]
+    paper_ret = [PAPER_DEIT_T[p][0] for p in paper_pcts]
+    paper_ft = [PAPER_DEIT_T[p][1] for p in paper_pcts]
 
-    for ax in axes:
-        ax.plot(paper_params, paper_ret, "s--", color="gray", linewidth=2,
-                markersize=7, label="Paper Table 10 (retention)", zorder=2, alpha=0.7)
-        ax.axhline(y=PAPER_DEIT_T[0][0], color="lightgray", linestyle=":",
-                    linewidth=1, label=f"Baseline ({PAPER_DEIT_T[0][0]:.1f}%)")
+    # --- Baseline point ---
+    base_params = PAPER_DEIT_T[0][3]
+    base_acc = PAPER_DEIT_T[0][0]
 
     # --- Plot 1: Retention accuracy vs Params ---
     ax = axes[0]
+    ax.plot(paper_params, paper_ret, "s--", color="gray", linewidth=2,
+            markersize=7, label="Paper (retention)", zorder=2, alpha=0.7)
+    ax.plot(base_params, base_acc, "o", color="black", markersize=10,
+            zorder=5, label=f"Baseline ({base_acc:.1f}%, {base_params:.2f}M)")
+
     for i, (setup_name, results) in enumerate(setups.items()):
         params = [r["pruned_params_M"] for r in results if "retention_acc" in r]
         rets = [r["retention_acc"] for r in results if "retention_acc" in r]
@@ -229,12 +234,16 @@ def plot_results(setups, save_path):
     ax.set_xlabel("Parameters (M)", fontsize=13)
     ax.set_ylabel("Retention Accuracy (%)", fontsize=13)
     ax.set_title("Retention Accuracy vs Parameters", fontsize=14)
-    ax.legend(fontsize=9, loc="lower right")
+    ax.legend(fontsize=9, loc="lower left")
     ax.grid(True, alpha=0.3)
-    ax.invert_xaxis()
 
     # --- Plot 2: Best accuracy (after FT) vs Params ---
     ax = axes[1]
+    ax.plot(paper_params, paper_ft, "s--", color="gray", linewidth=2,
+            markersize=7, label="Paper (fine-tuned)", zorder=2, alpha=0.7)
+    ax.plot(base_params, base_acc, "o", color="black", markersize=10,
+            zorder=5, label=f"Baseline ({base_acc:.1f}%, {base_params:.2f}M)")
+
     for i, (setup_name, results) in enumerate(setups.items()):
         params = [r["pruned_params_M"] for r in results if "best_acc" in r]
         bests = [r["best_acc"] for r in results if "best_acc" in r]
@@ -245,9 +254,8 @@ def plot_results(setups, save_path):
     ax.set_xlabel("Parameters (M)", fontsize=13)
     ax.set_ylabel("Best Accuracy after FT (%)", fontsize=13)
     ax.set_title("Best Accuracy (post Fine-Tuning) vs Parameters", fontsize=14)
-    ax.legend(fontsize=9, loc="lower right")
+    ax.legend(fontsize=9, loc="lower left")
     ax.grid(True, alpha=0.3)
-    ax.invert_xaxis()
 
     fig.suptitle("VBP — DeiT-T", fontsize=16, fontweight="bold", y=1.01)
     fig.tight_layout()
@@ -261,14 +269,11 @@ def main():
         description="Plot VBP experiment results for DeiT-T",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--root", required=True,
+    parser.add_argument("--root", default="",
                         help="Root dir containing setup subfolders (e.g., .../DeiT_tiny)")
-    parser.add_argument("--save", default=None,
-                        help="Output plot path (default: <root>/vbp_results.png)")
     args = parser.parse_args()
-
-    if args.save is None:
-        args.save = os.path.join(args.root, "vbp_results.png")
+    args.root = os.getcwd()
+    args.save = os.path.join(args.root, "vbp_results.png")
 
     setups = scan_root(args.root)
 
