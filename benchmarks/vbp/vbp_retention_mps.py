@@ -130,7 +130,7 @@ class HFImageNetDataset(torch.utils.data.Dataset):
 # ---------------------------------------------------------------------------
 def load_model(args, device):
     if args.model_type == "vit":
-        model = ViTForImageClassification.from_pretrained(args.model)
+        model = ViTForImageClassification.from_pretrained(args.model, local_files_only=True)
         return model.to(device)
     raise ValueError(f"Unknown model_type: {args.model_type}")
 
@@ -400,7 +400,7 @@ def parse_args():
         description="VBP retention accuracy test (MPS/CPU/CUDA) — uses tp.pruner.VBPPruner",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--model", default="facebook/deit-small-patch16-224",
+    p.add_argument("--model", default="/algo/NetOptimization/outputs/VBP/DeiT_tiny",
                    help="HuggingFace model name")
     p.add_argument("--model_type", default="vit", choices=["vit"])
     p.add_argument("--data_path", default="../imagenet-1k-test/data",
@@ -420,7 +420,7 @@ def parse_args():
     return p.parse_args()
 
 
-def main():
+def main(argv):
     args = parse_args()
     device = get_device(force_cpu=args.cpu)
     print(f"Device: {device}")
@@ -431,5 +431,5 @@ def main():
     run_vbp(model, val_dataset, device, args)
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    main(sys.argv[1:])

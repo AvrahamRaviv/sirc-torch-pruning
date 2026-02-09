@@ -13,6 +13,7 @@ from collections import OrderedDict
 from ..utils.compute_mat_grad import ComputeMatGrad
 import random
 import warnings
+from tqdm import tqdm
 
 __all__ = [
     # Base Class
@@ -1077,12 +1078,7 @@ class VarianceImportance(Importance):
 
         model.eval()
         total = min(len(train_loader), max_batches) if max_batches else len(train_loader)
-        try:
-            from tqdm import tqdm
-            pbar = tqdm(train_loader, desc="Collecting stats", total=total,
-                        miniters=max(total // 20, 1))
-        except ImportError:
-            pbar = train_loader
+        pbar = tqdm(train_loader, desc="Collecting stats", total=total, miniters=max(total // 20, 1))
         for batch_idx, (images, _) in enumerate(pbar):
             images = images.to(device, non_blocking=True)
             model(images)

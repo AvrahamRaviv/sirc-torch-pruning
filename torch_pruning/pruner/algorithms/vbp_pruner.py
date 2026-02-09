@@ -102,8 +102,8 @@ class VBPPruner(BasePruner):
                 self._apply_compensation(group, idxs)
 
             dep, idxs = group[0]
+            dep_str = str(dep)
             if self.verbose:
-                dep_str = str(dep)
                 idxs_ratio_str = f"{len(idxs)} / {dep.target.module.weight.shape[0]}"
                 log_str = f"Prune {idxs_ratio_str} channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}."
                 print(f"[VBP-prune] {log_str}")
