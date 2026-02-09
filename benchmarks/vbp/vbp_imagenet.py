@@ -470,8 +470,8 @@ def train_one_epoch_kd(model, teacher, train_loader, train_sampler, optimizer,
     num_batches = 0
 
     total = len(train_loader)
-    pbar = tqdm(train_loader, disable=not is_main(), desc=f"Epoch {epoch + 1}", miniters=max(total // 20, 1))
-    for images, labels in pbar:
+    log_interval = max(total // 20, 1)
+    for batch_idx, (images, labels) in enumerate(train_loader):
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
@@ -502,7 +502,10 @@ def train_one_epoch_kd(model, teacher, train_loader, train_sampler, optimizer,
 
         total_loss += loss.item()
         num_batches += 1
-        pbar.set_postfix({"loss": loss.item()}, refresh=False)
+
+        if is_main() and (batch_idx % log_interval == 0 or batch_idx == total - 1):
+            avg_loss = total_loss / num_batches
+            log_info(f"Epoch {epoch + 1} [{batch_idx + 1}/{total}] loss={avg_loss:.4f}")
 
     if not step_per_batch:
         scheduler.step()
