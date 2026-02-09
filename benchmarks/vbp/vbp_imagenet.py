@@ -111,7 +111,6 @@ def setup_distributed(args):
 
     args.rank = dist.get_rank()
     args.world_size = dist.get_world_size()
-    args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(args.local_rank)
     device = torch.device("cuda", args.local_rank)
 
@@ -440,8 +439,7 @@ def train_one_epoch_kd(model, teacher, train_loader, train_sampler, optimizer,
     num_batches = 0
 
     total = len(train_loader)
-    pbar = tqdm(train_loader, disable=not is_main(), desc=f"Epoch {epoch + 1}",
-                miniters=max(total // 20, 1))
+    pbar = tqdm(train_loader, disable=not is_main(), desc=f"Epoch {epoch + 1}", miniters=max(total // 20, 1))
     for images, labels in pbar:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -486,8 +484,8 @@ def validate(model, val_loader, device, model_type: str):
 
     with torch.no_grad():
         total_val = len(val_loader)
-        for images, labels in tqdm(val_loader, disable=not is_main(), desc="Validating",
-                                   miniters=max(total_val // 20, 1)):
+        pbar = tqdm(val_loader, disable=not is_main(), desc="Validating", miniters=max(total_val // 20, 1))
+        for images, labels in pbar:
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
@@ -558,7 +556,7 @@ def main(argv):
         log_info(f"Baseline: {base_macs / 1e9:.2f}G MACs, {base_params / 1e6:.2f}M params")
 
         log_info("Evaluating original model...")
-        acc_orig, loss_orig = 0.7202, 1.2280  # validate(model, val_loader, device, args.model_type)
+        acc_orig, loss_orig = validate(model, val_loader, device, args.model_type)  # 0.7202, 1.2280
         log_info(f"Original accuracy: {acc_orig:.4f}, loss: {loss_orig:.4f}")
     else:
         base_macs = base_params = acc_orig = loss_orig = None
@@ -663,7 +661,7 @@ def parse_args():
     model_group = parser.add_argument_group("Model")
     model_group.add_argument("--model_type", default="vit", choices=["vit", "convnext"],
                              help="Model architecture type")
-    model_group.add_argument("--model_name", default="google/vit-base-patch16-224",
+    model_group.add_argument("--model_name", default="/algo/NetOptimization/outputs/VBP/DeiT_tiny",
                              help="Model name/path (HF model or ConvNeXt variant)")
     model_group.add_argument("--convnext_checkpoint", default=None,
                              help="Path to ConvNeXt checkpoint (.pth)")
@@ -712,7 +710,7 @@ def parse_args():
     ddp_group = parser.add_argument_group("Distributed")
     ddp_group.add_argument("--disable_ddp", action="store_true",
                            help="Disable DDP for single-GPU debugging")
-    ddp_group.add_argument("--local-rank", type=int,
+    ddp_group.add_argument("--local_rank", type=int,
                            default=int(os.environ.get("LOCAL_RANK", 0)),
                            help="Local rank for DDP (set by torchrun)")
 
