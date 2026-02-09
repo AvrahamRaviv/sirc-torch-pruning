@@ -312,68 +312,12 @@ def _make_post_gelu_nchw(act_fn):
 # ---------------------------------------------------------------------------
 # Sparse pre-training
 # ---------------------------------------------------------------------------
-def train_one_epoch_sparse(model, train_loader, train_sampler, optimizer,
-                           scheduler, device, epoch, args, fc1_modules,
-                           step_per_batch=True):
-    """One epoch of sparse pre-training (L2,1 reg or GMP with CE)."""
-    model.train()
-    if train_sampler is not None:
-        train_sampler.set_epoch(epoch)
-
-    total_loss = 0.0
-    total_ce = 0.0
-    total_reg = 0.0
-    num_batches = 0
-
-    total = len(train_loader)
-    log_interval = max(total // 20, 1)
-
-    for batch_idx, (images, labels) in enumerate(train_loader):
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        logits = forward_logits(model, images, args.model_type)
-        ce_loss = F.cross_entropy(logits, labels)
-
-        if args.sparse_mode == "l1_group":
-            reg_loss = l21_regularization(fc1_modules, device)
-            loss = ce_loss + args.l1_lambda * reg_loss
-            total_reg += reg_loss.item()
-        else:
-            loss = ce_loss
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        if step_per_batch:
-            scheduler.step()
-
-        total_loss += loss.item()
-        total_ce += ce_loss.item()
-        num_batches += 1
-
-        if is_main() and (batch_idx % log_interval == 0 or batch_idx == total - 1):
-            avg_loss = total_loss / num_batches
-            if args.sparse_mode == "l1_group":
-                avg_ce = total_ce / num_batches
-                avg_reg = total_reg / num_batches
-                log_info(f"Sparse {epoch+1} [{batch_idx+1}/{total}] "
-                         f"loss={avg_loss:.4f} CE={avg_ce:.4f} L21={avg_reg:.2f}")
-            else:
-                log_info(f"Sparse {epoch+1} [{batch_idx+1}/{total}] "
-                         f"loss={avg_loss:.4f}")
-
-    if not step_per_batch:
-        scheduler.step()
-    return total_loss / max(num_batches, 1)
-
-
-def run_sparse_pretraining(model, train_loader, train_sampler, val_loader,
-                           device, args):
+def run_sparse_pretraining(model, teacher, train_loader, train_sampler,
+                           val_loader, device, args):
     """Optional sparse pre-training stage before VBP stats collection.
 
     Supports DDP: wraps model for training, unwraps after.
-    Modifies model in-place.
+    Modifies model in-place. Uses KD from teacher if --use_kd is set.
     """
     if args.model_type != "vit":
         log_info(f"WARNING: Sparse pre-training only supports ViT, "
@@ -409,9 +353,10 @@ def run_sparse_pretraining(model, train_loader, train_sampler, val_loader,
             log_info(f"GMP epoch {epoch+1}: target={target_s:.4f}, "
                      f"actual={ws['global']:.4f}")
 
-        train_loss = train_one_epoch_sparse(
+        train_loss = train_one_epoch(
             train_model, train_loader, train_sampler, optimizer, scheduler,
-            device, epoch, args, fc1_modules, step_per_batch=step_per_batch)
+            device, epoch, args, teacher=teacher, fc1_modules=fc1_modules,
+            step_per_batch=step_per_batch, phase="Sparse")
 
         # Validate on unwrapped model
         if is_main():
@@ -603,16 +548,27 @@ def build_ft_scheduler(optimizer, epochs, steps_per_epoch):
     return scheduler, True
 
 
-def train_one_epoch_kd(model, teacher, train_loader, train_sampler, optimizer,
-                       scheduler, device, epoch, args, step_per_batch=True):
-    """One epoch of training with optional knowledge distillation."""
+def train_one_epoch(model, train_loader, train_sampler, optimizer,
+                    scheduler, device, epoch, args,
+                    teacher=None, fc1_modules=None,
+                    step_per_batch=True, phase="Epoch"):
+    """Unified training epoch: optional KD + optional L2,1 regularization.
+
+    Args:
+        teacher: If not None and args.use_kd, apply knowledge distillation.
+        fc1_modules: If not None and args.sparse_mode == "l1_group",
+            add L2,1 group regularization.
+        phase: Log prefix ("Epoch" for fine-tuning, "Sparse" for sparse phase).
+    """
     model.train()
     if train_sampler is not None:
         train_sampler.set_epoch(epoch)
 
     use_kd = args.use_kd and teacher is not None
+    use_l21 = fc1_modules is not None and args.sparse_mode == "l1_group"
 
     total_loss = 0.0
+    total_reg = 0.0
     num_batches = 0
 
     total = len(train_loader)
@@ -621,24 +577,27 @@ def train_one_epoch_kd(model, teacher, train_loader, train_sampler, optimizer,
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        # Student forward
-        student_logits = forward_logits(model, images, args.model_type)
-        ce_loss = F.cross_entropy(student_logits, labels)
+        logits = forward_logits(model, images, args.model_type)
+        ce_loss = F.cross_entropy(logits, labels)
 
         # Knowledge distillation
         if use_kd:
             with torch.no_grad():
                 teacher_logits = forward_logits(teacher, images, args.model_type)
-
             kd_loss = F.kl_div(
-                F.log_softmax(student_logits / args.kd_T, dim=1),
+                F.log_softmax(logits / args.kd_T, dim=1),
                 F.softmax(teacher_logits / args.kd_T, dim=1),
                 reduction="batchmean"
             ) * (args.kd_T ** 2)
-
             loss = args.kd_alpha * ce_loss + (1 - args.kd_alpha) * kd_loss
         else:
             loss = ce_loss
+
+        # L2,1 group regularization
+        if use_l21:
+            reg_loss = l21_regularization(fc1_modules, device)
+            loss = loss + args.l1_lambda * reg_loss
+            total_reg += reg_loss.item()
 
         optimizer.zero_grad()
         loss.backward()
@@ -651,7 +610,10 @@ def train_one_epoch_kd(model, teacher, train_loader, train_sampler, optimizer,
 
         if is_main() and (batch_idx % log_interval == 0 or batch_idx == total - 1):
             avg_loss = total_loss / num_batches
-            log_info(f"Epoch {epoch + 1} [{batch_idx + 1}/{total}] loss={avg_loss:.4f}")
+            parts = [f"loss={avg_loss:.4f}"]
+            if use_l21:
+                parts.append(f"L21={total_reg / num_batches:.2f}")
+            log_info(f"{phase} {epoch+1} [{batch_idx+1}/{total}] {' '.join(parts)}")
 
     if not step_per_batch:
         scheduler.step()
@@ -735,12 +697,7 @@ def main(argv):
     else:
         base_macs = base_params = acc_orig = loss_orig = None
 
-    # --- Sparse pre-training (optional, default: skip) ---
-    if args.sparse_mode != "none":
-        run_sparse_pretraining(model, train_loader, train_sampler,
-                               val_loader, device, args)
-
-    # Create teacher for KD (deep copy after sparse pre-training, before pruning)
+    # Create teacher for KD (deep copy of original pretrained model)
     teacher = None
     if args.use_kd:
         teacher = copy.deepcopy(model)
@@ -748,6 +705,11 @@ def main(argv):
         for p in teacher.parameters():
             p.requires_grad = False
         log_info("Created teacher model for knowledge distillation")
+
+    # --- Sparse pre-training (optional, default: skip) ---
+    if args.sparse_mode != "none":
+        run_sparse_pretraining(model, teacher, train_loader, train_sampler,
+                               val_loader, device, args)
 
     # Create importance scorer
     imp = tp.importance.VarianceImportance(norm_per_layer=args.norm_per_layer)
@@ -797,10 +759,10 @@ def main(argv):
 
         best_acc = 0.0
         for epoch in range(args.epochs_ft):
-            train_loss = train_one_epoch_kd(
-                model, teacher, train_loader, train_sampler,
+            train_loss = train_one_epoch(
+                model, train_loader, train_sampler,
                 optimizer, scheduler, device, epoch, args,
-                step_per_batch=step_per_batch,
+                teacher=teacher, step_per_batch=step_per_batch,
             )
 
             if is_main():
