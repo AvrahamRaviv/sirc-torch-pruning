@@ -293,6 +293,16 @@ def forward_logits(model, images, model_type: str):
 
 
 # ---------------------------------------------------------------------------
+# ConvNeXt VBP helpers
+# ---------------------------------------------------------------------------
+def _make_post_gelu_nchw(act_fn):
+    """Post-act fn: apply GELU then permute NHWC -> NCHW for stats hook."""
+    def fn(x):
+        return act_fn(x).permute(0, 3, 1, 2)
+    return fn
+
+
+# ---------------------------------------------------------------------------
 # Pruner setup
 # ---------------------------------------------------------------------------
 def create_pruner(model, example_inputs, imp, args):
@@ -316,8 +326,16 @@ def create_pruner(model, example_inputs, imp, args):
         output_transform = lambda out: out.logits.sum()
 
     elif args.model_type == "convnext":
-        # Ignore classification head
+        # MLP-only: ignore everything except pwconv1 (intermediate dim)
         ignored_layers.append(model.head)
+        for ds in model.downsample_layers:
+            for m in ds.modules():
+                if isinstance(m, nn.Conv2d):
+                    ignored_layers.append(m)
+        for stage in model.stages:
+            for block in stage:
+                ignored_layers.append(block.dwconv)
+                ignored_layers.append(block.pwconv2)
         output_transform = lambda out: out.sum()
 
     else:
@@ -379,6 +397,11 @@ def collect_and_sync_stats(model, train_loader, device, imp, args):
             target_layers = [
                 (block.intermediate.dense, block.intermediate.intermediate_act_fn)
                 for block in model.vit.encoder.layer
+            ]
+        elif args.model_type == "convnext":
+            target_layers = [
+                (block.pwconv1, _make_post_gelu_nchw(block.act))
+                for stage in model.stages for block in stage
             ]
         log_info("Collecting activation variance statistics...")
         imp.collect_statistics(model, train_loader, device, target_layers=target_layers, max_batches=args.max_batches)
