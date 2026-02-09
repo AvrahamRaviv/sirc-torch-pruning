@@ -6,6 +6,8 @@ and variance distribution metrics to quantify VBP signal quality.
 Reference: Zhu & Gupta 2017 — "To prune, or not to prune" (GMP schedule)
 """
 
+from __future__ import annotations
+
 import math
 
 import torch
