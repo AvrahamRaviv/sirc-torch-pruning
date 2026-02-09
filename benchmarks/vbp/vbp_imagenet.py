@@ -58,6 +58,19 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from convnext import convnext_tiny, convnext_small, convnext_base, convnext_large
 
+try:
+    from .sparse_utils import (
+        get_fc1_modules, l21_regularization, gmp_sparsity_schedule,
+        apply_unstructured_pruning, remove_pruning_reparametrization,
+        compute_variance_entropy, compute_weight_sparsity,
+    )
+except ImportError:
+    from sparse_utils import (
+        get_fc1_modules, l21_regularization, gmp_sparsity_schedule,
+        apply_unstructured_pruning, remove_pruning_reparametrization,
+        compute_variance_entropy, compute_weight_sparsity,
+    )
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -294,6 +307,139 @@ def _make_post_gelu_nchw(act_fn):
     def fn(x):
         return act_fn(x).permute(0, 3, 1, 2)
     return fn
+
+
+# ---------------------------------------------------------------------------
+# Sparse pre-training
+# ---------------------------------------------------------------------------
+def train_one_epoch_sparse(model, train_loader, train_sampler, optimizer,
+                           scheduler, device, epoch, args, fc1_modules,
+                           step_per_batch=True):
+    """One epoch of sparse pre-training (L2,1 reg or GMP with CE)."""
+    model.train()
+    if train_sampler is not None:
+        train_sampler.set_epoch(epoch)
+
+    total_loss = 0.0
+    total_ce = 0.0
+    total_reg = 0.0
+    num_batches = 0
+
+    total = len(train_loader)
+    log_interval = max(total // 20, 1)
+
+    for batch_idx, (images, labels) in enumerate(train_loader):
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        logits = forward_logits(model, images, args.model_type)
+        ce_loss = F.cross_entropy(logits, labels)
+
+        if args.sparse_mode == "l1_group":
+            reg_loss = l21_regularization(fc1_modules, device)
+            loss = ce_loss + args.l1_lambda * reg_loss
+            total_reg += reg_loss.item()
+        else:
+            loss = ce_loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        if step_per_batch:
+            scheduler.step()
+
+        total_loss += loss.item()
+        total_ce += ce_loss.item()
+        num_batches += 1
+
+        if is_main() and (batch_idx % log_interval == 0 or batch_idx == total - 1):
+            avg_loss = total_loss / num_batches
+            if args.sparse_mode == "l1_group":
+                avg_ce = total_ce / num_batches
+                avg_reg = total_reg / num_batches
+                log_info(f"Sparse {epoch+1} [{batch_idx+1}/{total}] "
+                         f"loss={avg_loss:.4f} CE={avg_ce:.4f} L21={avg_reg:.2f}")
+            else:
+                log_info(f"Sparse {epoch+1} [{batch_idx+1}/{total}] "
+                         f"loss={avg_loss:.4f}")
+
+    if not step_per_batch:
+        scheduler.step()
+    return total_loss / max(num_batches, 1)
+
+
+def run_sparse_pretraining(model, train_loader, train_sampler, val_loader,
+                           device, args):
+    """Optional sparse pre-training stage before VBP stats collection.
+
+    Supports DDP: wraps model for training, unwraps after.
+    Modifies model in-place.
+    """
+    if args.model_type != "vit":
+        log_info(f"WARNING: Sparse pre-training only supports ViT, "
+                 f"skipping for {args.model_type}")
+        return
+
+    fc1_pairs = get_fc1_modules(model, model_type=args.model_type)
+    fc1_modules = [m for _, m in fc1_pairs]
+    log_info(f"Sparse pre-training: mode={args.sparse_mode}, "
+             f"{len(fc1_modules)} fc1 layers, epochs={args.epochs_sparse}")
+
+    # Wrap in DDP for sparse training
+    use_ddp = not args.disable_ddp and dist.is_initialized()
+    if use_ddp:
+        train_model = DDP(model, device_ids=[args.local_rank],
+                          output_device=args.local_rank)
+    else:
+        train_model = model
+
+    optimizer = torch.optim.AdamW(train_model.parameters(), lr=args.lr_sparse,
+                                  weight_decay=0.01)
+    scheduler, step_per_batch = build_ft_scheduler(
+        optimizer, args.epochs_sparse, len(train_loader))
+
+    for epoch in range(args.epochs_sparse):
+        # GMP: apply sparsity mask before training epoch
+        if args.sparse_mode == "gmp":
+            target_s = gmp_sparsity_schedule(
+                epoch, args.epochs_sparse,
+                init_s=0.0, target_s=args.gmp_target_sparsity)
+            apply_unstructured_pruning(fc1_modules, target_s)
+            ws = compute_weight_sparsity(fc1_modules)
+            log_info(f"GMP epoch {epoch+1}: target={target_s:.4f}, "
+                     f"actual={ws['global']:.4f}")
+
+        train_loss = train_one_epoch_sparse(
+            train_model, train_loader, train_sampler, optimizer, scheduler,
+            device, epoch, args, fc1_modules, step_per_batch=step_per_batch)
+
+        # Validate on unwrapped model
+        if is_main():
+            acc, val_loss = validate(model, val_loader, device, args.model_type)
+            log_info(f"Sparse {epoch+1}/{args.epochs_sparse}: "
+                     f"train_loss={train_loss:.4f}, val_acc={acc:.4f}")
+            if acc < 0.01:
+                log_info("WARNING: Model accuracy collapsed below 1%!")
+
+        if use_ddp:
+            dist.barrier()
+
+    # Cleanup DDP wrapper
+    if use_ddp:
+        del train_model
+
+    # GMP: bake masks into weights
+    if args.sparse_mode == "gmp":
+        remove_pruning_reparametrization(fc1_modules)
+        ws = compute_weight_sparsity(fc1_modules)
+        log_info(f"GMP done — final weight sparsity: {ws['global']:.4f}")
+        for m in fc1_modules:
+            assert not hasattr(m, "weight_mask"), "weight_mask still present"
+
+    # Post-sparse accuracy
+    if is_main():
+        acc_sparse, _ = validate(model, val_loader, device, args.model_type)
+        log_info(f"Post-sparse accuracy: {acc_sparse:.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +724,23 @@ def main(argv):
     model = load_model(args, device)
     example_inputs = torch.randn(1, 3, 224, 224).to(device)
 
-    # Create teacher for KD (deep copy before pruning)
+    # Baseline evaluation
+    if is_main():
+        base_macs, base_params = tp.utils.count_ops_and_params(model, example_inputs)
+        log_info(f"Baseline: {base_macs / 1e9:.2f}G MACs, {base_params / 1e6:.2f}M params")
+
+        log_info("Evaluating original model...")
+        acc_orig, loss_orig = validate(model, val_loader, device, args.model_type)
+        log_info(f"Original accuracy: {acc_orig:.4f}, loss: {loss_orig:.4f}")
+    else:
+        base_macs = base_params = acc_orig = loss_orig = None
+
+    # --- Sparse pre-training (optional, default: skip) ---
+    if args.sparse_mode != "none":
+        run_sparse_pretraining(model, train_loader, train_sampler,
+                               val_loader, device, args)
+
+    # Create teacher for KD (deep copy after sparse pre-training, before pruning)
     teacher = None
     if args.use_kd:
         teacher = copy.deepcopy(model)
@@ -587,22 +749,18 @@ def main(argv):
             p.requires_grad = False
         log_info("Created teacher model for knowledge distillation")
 
-    # Baseline evaluation
-    if is_main():
-        base_macs, base_params = tp.utils.count_ops_and_params(model, example_inputs)
-        log_info(f"Baseline: {base_macs / 1e9:.2f}G MACs, {base_params / 1e6:.2f}M params")
-
-        log_info("Evaluating original model...")
-        acc_orig, loss_orig = validate(model, val_loader, device, args.model_type)  # 0.7202, 1.2280
-        log_info(f"Original accuracy: {acc_orig:.4f}, loss: {loss_orig:.4f}")
-    else:
-        base_macs = base_params = acc_orig = loss_orig = None
-
     # Create importance scorer
     imp = tp.importance.VarianceImportance(norm_per_layer=args.norm_per_layer)
 
     # Collect and sync statistics across ranks
     collect_and_sync_stats(model, train_loader, device, imp, args)
+
+    # Log variance distribution metrics
+    if is_main():
+        var_metrics = compute_variance_entropy(imp)
+        log_info(f"Variance distribution — entropy={var_metrics['entropy']:.4f}, "
+                 f"cv={var_metrics['cv']:.4f}, gini={var_metrics['gini']:.4f}, "
+                 f"top10%={var_metrics['top10_pct']:.4f}")
 
     # Create pruner
     pruner = create_pruner(model, example_inputs, imp, args)
@@ -739,6 +897,20 @@ def parse_args():
                           help="Weight for CE loss in KD")
     kd_group.add_argument("--kd_T", type=float, default=2.0,
                           help="Temperature for KD softmax")
+
+    # Sparse pre-training (optional, default: none = skip)
+    sparse_group = parser.add_argument_group("Sparse Pre-training")
+    sparse_group.add_argument("--sparse_mode", default="none",
+                              choices=["l1_group", "gmp", "none"],
+                              help="Sparse pre-training mode (none = skip)")
+    sparse_group.add_argument("--epochs_sparse", type=int, default=5,
+                              help="Sparse pre-training epochs")
+    sparse_group.add_argument("--lr_sparse", type=float, default=1e-4,
+                              help="Learning rate for sparse phase")
+    sparse_group.add_argument("--l1_lambda", type=float, default=1e-4,
+                              help="L2,1 regularization strength (l1_group mode)")
+    sparse_group.add_argument("--gmp_target_sparsity", type=float, default=0.5,
+                              help="Target weight sparsity for GMP mode")
 
     # DDP
     ddp_group = parser.add_argument_group("Distributed")
