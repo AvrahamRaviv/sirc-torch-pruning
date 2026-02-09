@@ -235,18 +235,12 @@ def load_model(args, device):
     """Load ViT (HuggingFace) or ConvNeXt (FB implementation)."""
     if args.model_type == "vit":
         # HuggingFace ViT
-        try:
-            model = ViTForImageClassification.from_pretrained(
-                args.model_name,
-                local_files_only=os.path.isdir(args.model_name),
-            )
-        except Exception:
-            model = ViTForImageClassification.from_pretrained(args.model_name)
+        model = ViTForImageClassification.from_pretrained(args.model_name, local_files_only=os.path.isdir(args.model_name))
         model = model.to(device)
         log_info(f"Loaded ViT from {args.model_name}")
 
     elif args.model_type == "convnext":
-        # FB ConvNeXt implementation
+        # FB ConvNeXt implementation — model_name is the checkpoint path
         variant_map = {
             "convnext_tiny": convnext_tiny,
             "convnext_small": convnext_small,
@@ -254,7 +248,7 @@ def load_model(args, device):
             "convnext_large": convnext_large,
         }
 
-        # Determine variant from model_name
+        # Determine variant from model_name (path or variant string)
         variant = args.model_name.lower()
         for key in variant_map:
             if key in variant:
@@ -266,15 +260,15 @@ def load_model(args, device):
 
         model = model_fn(pretrained=False)
 
-        # Load checkpoint if specified
-        if args.convnext_checkpoint and os.path.exists(args.convnext_checkpoint):
-            state = torch.load(args.convnext_checkpoint, map_location="cpu", weights_only=True)
+        # Load checkpoint (model_name is the .pth path)
+        if os.path.exists(args.model_name):
+            state = torch.load(args.model_name, map_location="cpu", weights_only=True)
             if "model" in state:
                 state = state["model"]
             model.load_state_dict(state, strict=True)
-            log_info(f"Loaded ConvNeXt checkpoint from {args.convnext_checkpoint}")
+            log_info(f"Loaded ConvNeXt checkpoint from {args.model_name}")
         else:
-            log_info("ConvNeXt initialized without pretrained weights")
+            log_info(f"WARNING: Checkpoint not found at {args.model_name}, using random weights")
 
         model = model.to(device)
 
@@ -685,9 +679,7 @@ def parse_args():
     model_group.add_argument("--model_type", default="vit", choices=["vit", "convnext"],
                              help="Model architecture type")
     model_group.add_argument("--model_name", default="/algo/NetOptimization/outputs/VBP/DeiT_tiny",
-                             help="Model name/path (HF model or ConvNeXt variant)")
-    model_group.add_argument("--convnext_checkpoint", default=None,
-                             help="Path to ConvNeXt checkpoint (.pth)")
+                             help="Model name/path (HF model ID or ConvNeXt .pth path)")
 
     # Data
     data_group = parser.add_argument_group("Data")
