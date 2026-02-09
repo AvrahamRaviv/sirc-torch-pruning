@@ -487,7 +487,7 @@ def train_one_epoch_kd(model, teacher, train_loader, train_sampler, optimizer,
 
         total_loss += loss.item()
         num_batches += 1
-        pbar.set_postfix({"loss": loss.item()})
+        pbar.set_postfix({"loss": loss.item()}, refresh=False)
     return total_loss / max(num_batches, 1)
 
 
