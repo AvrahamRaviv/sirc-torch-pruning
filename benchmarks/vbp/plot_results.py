@@ -66,28 +66,28 @@ def parse_log(log_path):
         result["keep_ratio"] = float(m.group(1))
 
     # Original accuracy
-    m = re.search(r"Original Acc(?:uracy)?:\s*([\d.]+)", text)
+    m = re.search(r"Original [Aa]cc(?:uracy)?:\s*([\d.]+)", text)
     if m:
         result["original_acc"] = float(m.group(1))
         if result["original_acc"] < 1.0:
             result["original_acc"] *= 100
 
     # Retention accuracy
-    m = re.search(r"Retention Acc(?:uracy)?:\s*([\d.]+)", text)
+    m = re.search(r"Retention [Aa]cc(?:uracy)?:\s*([\d.]+)", text)
     if m:
         result["retention_acc"] = float(m.group(1))
         if result["retention_acc"] < 1.0:
             result["retention_acc"] *= 100
 
     # Best accuracy (after fine-tuning)
-    m = re.search(r"Best Acc(?:uracy)?:\s*([\d.]+)", text)
+    m = re.search(r"Best [Aa]cc(?:uracy)?:\s*([\d.]+)", text)
     if m:
         result["best_acc"] = float(m.group(1))
         if result["best_acc"] < 1.0:
             result["best_acc"] *= 100
 
     # Final accuracy
-    m = re.search(r"Final Acc(?:uracy)?:\s*([\d.]+)", text)
+    m = re.search(r"Final [Aa]cc(?:uracy)?:\s*([\d.]+)", text)
     if m:
         result["final_acc"] = float(m.group(1))
         if result["final_acc"] < 1.0:
