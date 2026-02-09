@@ -443,8 +443,22 @@ def collect_and_sync_stats(model, train_loader, device, imp, args):
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+def build_ft_scheduler(optimizer, epochs, steps_per_epoch):
+    """Build cosine LR scheduler with per-batch stepping.
+
+    Returns:
+        (scheduler, step_per_batch): scheduler and its stepping granularity.
+        If step_per_batch=True, call scheduler.step() every batch.
+        If step_per_batch=False, call scheduler.step() every epoch.
+    """
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs * steps_per_epoch, eta_min=1e-8
+    )
+    return scheduler, True
+
+
 def train_one_epoch_kd(model, teacher, train_loader, train_sampler, optimizer,
-                       scheduler, device, epoch, args):
+                       scheduler, device, epoch, args, step_per_batch=True):
     """One epoch of training with optional knowledge distillation."""
     model.train()
     if train_sampler is not None:
@@ -483,11 +497,15 @@ def train_one_epoch_kd(model, teacher, train_loader, train_sampler, optimizer,
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        scheduler.step()
+        if step_per_batch:
+            scheduler.step()
 
         total_loss += loss.item()
         num_batches += 1
         pbar.set_postfix({"loss": loss.item()}, refresh=False)
+
+    if not step_per_batch:
+        scheduler.step()
     return total_loss / max(num_batches, 1)
 
 
@@ -612,15 +630,16 @@ def main(argv):
         log_info(f"Fine-tuning for {args.epochs_ft} epochs...")
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr_ft, weight_decay=0.01)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs_ft * len(train_loader), eta_min=1e-8
+        scheduler, step_per_batch = build_ft_scheduler(
+            optimizer, args.epochs_ft, len(train_loader)
         )
 
         best_acc = 0.0
         for epoch in range(args.epochs_ft):
             train_loss = train_one_epoch_kd(
                 model, teacher, train_loader, train_sampler,
-                optimizer, scheduler, device, epoch, args
+                optimizer, scheduler, device, epoch, args,
+                step_per_batch=step_per_batch,
             )
 
             if is_main():
