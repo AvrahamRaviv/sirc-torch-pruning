@@ -93,24 +93,22 @@ def parse_log(log_path):
         if result["final_acc"] < 1.0:
             result["final_acc"] *= 100
 
-    # Pruned params from summary line: "Base Params:  5.72M -> Pruned: 5.18M (90.6%)"
+    # Early pruned stats: "Pruned: 1.04G MACs, 5.54M params" (appears right after retention)
+    m = re.search(r"Pruned:\s*([\d.]+)G MACs,\s*([\d.]+)M params", text)
+    if m:
+        result["pruned_macs_G"] = float(m.group(1))
+        result["pruned_params_M"] = float(m.group(2))
+
+    # Summary line (overrides with same values, but also captures base stats)
     m = re.search(r"Base Params:\s*([\d.]+)M\s*->\s*Pruned:\s*([\d.]+)M", text)
     if m:
         result["base_params_M"] = float(m.group(1))
         result["pruned_params_M"] = float(m.group(2))
 
-    # Pruned MACs
     m = re.search(r"Base MACs:\s*([\d.]+)G\s*->\s*Pruned:\s*([\d.]+)G", text)
     if m:
         result["base_macs_G"] = float(m.group(1))
         result["pruned_macs_G"] = float(m.group(2))
-
-    # Fallback: parse from earlier "Pruned: X.XXG MACs, X.XXM params" line
-    if "pruned_params_M" not in result:
-        m = re.search(r"Pruned:\s*([\d.]+)G MACs,\s*([\d.]+)M params", text)
-        if m:
-            result["pruned_macs_G"] = float(m.group(1))
-            result["pruned_params_M"] = float(m.group(2))
 
     # Compute prune_pct from keep_ratio
     if "keep_ratio" in result:
