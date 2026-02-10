@@ -72,12 +72,12 @@ def parse_log(log_path):
         if result["original_acc"] < 1.0:
             result["original_acc"] *= 100
 
-    # Retention accuracy
-    m = re.search(r"Retention [Aa]cc(?:uracy)?:\s*([\d.]+)", text)
-    if m:
-        result["retention_acc"] = float(m.group(1))
-        if result["retention_acc"] < 1.0:
-            result["retention_acc"] *= 100
+    # Retention accuracy — one-shot: "Retention acc: 0.65"
+    #                      PAT:      "Step 3 retention: acc=0.65, loss=..."
+    # Use last occurrence (final prune step in PAT).
+    for m in re.finditer(r"(?:Retention [Aa]cc(?:uracy)?:\s*([\d.]+)|retention: acc=([\d.]+))", text):
+        val = float(m.group(1) or m.group(2))
+        result["retention_acc"] = val * 100 if val < 1.0 else val
 
     # Best accuracy (after fine-tuning)
     m = re.search(r"Best [Aa]cc(?:uracy)?:\s*([\d.]+)", text)
