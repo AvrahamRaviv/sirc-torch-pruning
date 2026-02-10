@@ -732,23 +732,27 @@ def validate(model, val_loader, device, model_type: str):
 # Pruning-Aware Training (PAT)
 # ---------------------------------------------------------------------------
 def run_pat(model, teacher, train_loader, train_sampler, val_loader,
-            device, example_inputs, args):
+            device, example_inputs, args,
+            base_macs=None, base_params=None, acc_orig=None):
     """Iterative pruning-aware training: prune in multiple steps with fine-tuning.
 
     Each step: collect fresh stats -> prune a fraction -> fine-tune.
     Geometric schedule: per_step_keep^pat_steps = keep_ratio.
+    Also used for one-shot pruning (pat_steps=1).
     """
     pat_steps = args.pat_steps
+    epochs_per_step = args.pat_epochs_per_step
     per_step_keep = args.keep_ratio ** (1.0 / pat_steps)
     per_step_prune = 1.0 - per_step_keep
 
     log_info(f"PAT: {pat_steps} steps, per_step_keep={per_step_keep:.4f}, "
-             f"target_keep={args.keep_ratio}")
+             f"epochs_per_step={epochs_per_step}, target_keep={args.keep_ratio}")
 
     use_ddp = not args.disable_ddp and dist.is_initialized()
 
     # Track cumulative keep ratio for logging
     cumulative_keep = 1.0
+    best_acc = 0.0
 
     for step_i in range(pat_steps):
         log_info(f"\n{'='*60}")
@@ -783,8 +787,8 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
             log_info(f"  cumulative_keep={cumulative_keep:.4f}, "
                      f"MACs={pruned_macs / 1e9:.2f}G, params={pruned_params / 1e6:.2f}M")
 
-        # 5. Fine-tune for pat_epochs_per_step epochs
-        if args.pat_epochs_per_step > 0:
+        # 5. Fine-tune for epochs_per_step epochs
+        if epochs_per_step > 0:
             # Wrap in DDP for fine-tuning
             train_model = model
             if use_ddp:
@@ -795,15 +799,15 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
             optimizer = torch.optim.AdamW(train_model.parameters(),
                                           lr=args.lr_ft, weight_decay=0.01)
             scheduler, step_per_batch = build_ft_scheduler(
-                optimizer, args.pat_epochs_per_step, len(train_loader))
+                optimizer, epochs_per_step, len(train_loader))
 
             # Optional variance concentration hooks
             var_hooks = None
             if args.var_loss_weight > 0:
                 var_hooks = VarianceConcentrationHooks(model, args.model_type)
 
-            for ep in range(args.pat_epochs_per_step):
-                global_epoch = step_i * args.pat_epochs_per_step + ep
+            for ep in range(epochs_per_step):
+                global_epoch = step_i * epochs_per_step + ep
                 train_loss = train_one_epoch(
                     train_model, train_loader, train_sampler,
                     optimizer, scheduler, device, global_epoch, args,
@@ -814,8 +818,14 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
                 if is_main():
                     eval_model = train_model.module if isinstance(train_model, DDP) else train_model
                     acc_ft, loss_ft = validate(eval_model, val_loader, device, args.model_type)
-                    log_info(f"PAT-{step_i+1} ep {ep+1}/{args.pat_epochs_per_step}: "
+                    log_info(f"PAT-{step_i+1} ep {ep+1}/{epochs_per_step}: "
                              f"train_loss={train_loss:.4f}, val_acc={acc_ft:.4f}")
+
+                    if acc_ft > best_acc:
+                        best_acc = acc_ft
+                        save_path = os.path.join(args.save_dir, "vbp_best.pth")
+                        torch.save(eval_model.state_dict(), save_path)
+                        log_info(f"New best! Saved to {save_path}")
 
                 if use_ddp:
                     dist.barrier()
@@ -827,16 +837,30 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
             if use_ddp:
                 del train_model
 
-    # Final evaluation
+    # Final evaluation and summary
     if is_main():
-        acc_final, loss_final = validate(model, val_loader, device, args.model_type)
+        acc_final, _ = validate(model, val_loader, device, args.model_type)
         pruned_macs, pruned_params = tp.utils.count_ops_and_params(model, example_inputs)
-        log_info(f"\nPAT complete — final acc={acc_final:.4f}, "
-                 f"MACs={pruned_macs / 1e9:.2f}G, params={pruned_params / 1e6:.2f}M")
 
-        save_path = os.path.join(args.save_dir, "vbp_pat_final.pth")
+        log_info("=" * 60)
+        log_info("Summary")
+        log_info("=" * 60)
+        if base_macs is not None:
+            log_info(f"Base MACs:    {base_macs / 1e9:.2f}G -> Pruned: {pruned_macs / 1e9:.2f}G "
+                     f"({pruned_macs / base_macs * 100:.1f}%)")
+            log_info(f"Base Params:  {base_params / 1e6:.2f}M -> Pruned: {pruned_params / 1e6:.2f}M "
+                     f"({pruned_params / base_params * 100:.1f}%)")
+        else:
+            log_info(f"Pruned: {pruned_macs / 1e9:.2f}G MACs, {pruned_params / 1e6:.2f}M params")
+        if acc_orig is not None:
+            log_info(f"Original Acc: {acc_orig:.4f}")
+        log_info(f"Final Acc:    {acc_final:.4f}")
+        if best_acc > 0:
+            log_info(f"Best Acc:     {best_acc:.4f}")
+
+        save_path = os.path.join(args.save_dir, "vbp_final.pth")
         torch.save(model.state_dict(), save_path)
-        log_info(f"PAT model saved to {save_path}")
+        log_info(f"Final model saved to {save_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -903,104 +927,15 @@ def main(argv):
         run_sparse_pretraining(model, teacher, train_loader, train_sampler,
                                val_loader, device, args)
 
-    # --- PAT mode vs one-shot mode ---
-    if args.pat:
-        run_pat(model, teacher, train_loader, train_sampler, val_loader,
-                device, example_inputs, args)
-    else:
-        # One-shot VBP flow (unchanged default behavior)
+    # --- Pruning: PAT (iterative) or one-shot (pat_steps=1) ---
+    if not args.pat:
+        # One-shot mode: override PAT args to single step
+        args.pat_steps = 1
+        args.pat_epochs_per_step = args.epochs_ft
 
-        # Create importance scorer
-        imp = tp.importance.VarianceImportance(norm_per_layer=args.norm_per_layer)
-
-        # Collect and sync statistics across ranks
-        collect_and_sync_stats(model, train_loader, device, imp, args)
-
-        # Log variance distribution metrics
-        if is_main():
-            var_metrics = compute_variance_entropy(imp)
-            log_info(f"Variance distribution — entropy={var_metrics['entropy']:.4f}, "
-                     f"cv={var_metrics['cv']:.4f}, gini={var_metrics['gini']:.4f}, "
-                     f"top10%={var_metrics['top10_pct']:.4f}")
-
-        # Create pruner
-        pruner = create_pruner(model, example_inputs, imp, args)
-
-        # Prune with VBP importance + bias compensation
-        log_info(f"Pruning with keep_ratio={args.keep_ratio}, global={args.global_pruning}")
-        prune_model(model, pruner, device, example_inputs)
-
-        # Retention accuracy (before fine-tuning)
-        if is_main():
-            log_info("Evaluating retention accuracy (before fine-tuning)...")
-            acc_ret, loss_ret = validate(model, val_loader, device, args.model_type)
-            log_info(f"Retention accuracy: {acc_ret:.4f}, loss: {loss_ret:.4f}")
-
-            pruned_macs, pruned_params = tp.utils.count_ops_and_params(model, example_inputs)
-            log_info(f"Pruned: {pruned_macs / 1e9:.2f}G MACs, {pruned_params / 1e6:.2f}M params")
-            log_info(f"Reduction: {(1 - pruned_macs / base_macs) * 100:.1f}% MACs, "
-                     f"{(1 - pruned_params / base_params) * 100:.1f}% params")
-
-        # Wrap in DDP for fine-tuning
-        if not args.disable_ddp:
-            model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
-            dist.barrier()
-
-        # Fine-tuning
-        if args.epochs_ft > 0:
-            log_info(f"Fine-tuning for {args.epochs_ft} epochs...")
-
-            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr_ft, weight_decay=0.01)
-            scheduler, step_per_batch = build_ft_scheduler(
-                optimizer, args.epochs_ft, len(train_loader)
-            )
-
-            best_acc = 0.0
-            for epoch in range(args.epochs_ft):
-                train_loss = train_one_epoch(
-                    model, train_loader, train_sampler,
-                    optimizer, scheduler, device, epoch, args,
-                    teacher=teacher, step_per_batch=step_per_batch,
-                )
-
-                if is_main():
-                    eval_model = model.module if isinstance(model, DDP) else model
-                    acc_ft, loss_ft = validate(eval_model, val_loader, device, args.model_type)
-                    log_info(f"Epoch {epoch + 1}/{args.epochs_ft}: "
-                             f"train_loss={train_loss:.4f}, val_acc={acc_ft:.4f}, val_loss={loss_ft:.4f}")
-
-                    if acc_ft > best_acc:
-                        best_acc = acc_ft
-                        save_path = os.path.join(args.save_dir, "vbp_best.pth")
-                        torch.save(eval_model.state_dict(), save_path)
-                        log_info(f"New best! Saved to {save_path}")
-
-                if not args.disable_ddp:
-                    dist.barrier()
-
-        # Final evaluation and summary
-        if is_main():
-            eval_model = model.module if isinstance(model, DDP) else model
-            acc_final, loss_final = validate(eval_model, val_loader, device, args.model_type)
-            pruned_macs, pruned_params = tp.utils.count_ops_and_params(eval_model, example_inputs)
-
-            log_info("=" * 60)
-            log_info("Summary")
-            log_info("=" * 60)
-            log_info(f"Base MACs:    {base_macs / 1e9:.2f}G -> Pruned: {pruned_macs / 1e9:.2f}G "
-                     f"({pruned_macs / base_macs * 100:.1f}%)")
-            log_info(f"Base Params:  {base_params / 1e6:.2f}M -> Pruned: {pruned_params / 1e6:.2f}M "
-                     f"({pruned_params / base_params * 100:.1f}%)")
-            log_info(f"Original Acc: {acc_orig:.4f}")
-            log_info(f"Retention Acc: {acc_ret:.4f} (before fine-tuning)")
-            log_info(f"Final Acc:    {acc_final:.4f}")
-            if args.epochs_ft > 0:
-                log_info(f"Best Acc:     {best_acc:.4f}")
-
-            # Save final model
-            save_path = os.path.join(args.save_dir, "vbp_final.pth")
-            torch.save(eval_model.state_dict(), save_path)
-            log_info(f"Final model saved to {save_path}")
+    run_pat(model, teacher, train_loader, train_sampler, val_loader,
+            device, example_inputs, args,
+            base_macs=base_macs, base_params=base_params, acc_orig=acc_orig)
 
     # Cleanup
     if not args.disable_ddp:
