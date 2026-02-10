@@ -254,18 +254,17 @@ def _render_computational_edges(
     for (id1, id2), info in edge_registry.items():
         if not info['computational']:
             continue
-        bidir = len(info['computational']) == 2
         if visible:
             attrs = {"color": "#757575", "style": "solid", "constraint": "true"}
         else:
             attrs = {"style": "invis", "constraint": "true"}
-        if bidir:
-            attrs.update({"dir": "both", "arrowhead": "normal", "arrowtail": "normal"})
-        elif True in info['computational']:
+        # Forward arrow: id1 → id2 if forward direction exists, else reverse
+        if True in info['computational']:
             attrs["arrowhead"] = "normal"
+            dot.edge(id1, id2, **attrs)
         else:
-            attrs.update({"dir": "back", "arrowtail": "normal"})
-        dot.edge(id1, id2, **attrs)
+            attrs["arrowhead"] = "normal"
+            dot.edge(id2, id1, **attrs)
 
 
 def _render_dependency_edges(
@@ -296,26 +295,16 @@ def _render_dependency_edges(
 
         for dt, dirs in type_dirs.items():
             dep = type_dep[dt]
-            bidir = len(dirs) == 2
             if differentiate:
                 if dt == "direct":
                     attrs = {"color": "#2E7D32", "style": "dashed", "penwidth": "1.5", "constraint": "false"}
-                    arrow = "vee"
                 else:
                     attrs = {"color": "#C62828", "style": "dotted", "penwidth": "2", "constraint": "false"}
-                    arrow = "diamond"
             else:
                 attrs = {"color": "#E53935", "style": "dashed", "constraint": "false"}
-                arrow = "vee"
 
-            if bidir:
-                attrs.update({"dir": "both", "arrowhead": arrow, "arrowtail": arrow})
-            else:
-                is_fwd = True in dirs
-                if is_fwd:
-                    attrs["arrowhead"] = arrow
-                else:
-                    attrs.update({"dir": "back", "arrowtail": arrow})
+            # Undirected: no arrowheads, just a line showing coupling
+            attrs.update({"dir": "none", "arrowhead": "none", "arrowtail": "none"})
 
             if show_labels:
                 attrs["xlabel"] = f"{_get_short_fn_name(dep.trigger)}→{_get_short_fn_name(dep.handler)}"
@@ -382,7 +371,7 @@ def visualize_graph(
         format=format,
         graph_attr={
             "rankdir": rankdir,
-            "splines": "ortho",
+            "splines": "spline",
             "nodesep": "0.5",
             "ranksep": "0.5",
             "compound": "true",
