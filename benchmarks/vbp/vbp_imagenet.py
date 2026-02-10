@@ -310,6 +310,74 @@ def _make_post_gelu_nchw(act_fn):
 
 
 # ---------------------------------------------------------------------------
+# Variance concentration loss for PAT
+# ---------------------------------------------------------------------------
+class VarianceConcentrationHooks:
+    """Register hooks on target layers, compute entropy of per-channel variance.
+
+    During PAT fine-tuning, this penalizes flat variance distributions,
+    encouraging the model to concentrate variance in fewer channels
+    (improving the VBP pruning signal for subsequent steps).
+    """
+
+    def __init__(self, model, model_type):
+        self.hooks = []
+        self.activations = {}
+        self._register(model, model_type)
+
+    def _register(self, model, model_type):
+        if model_type == "vit":
+            for block in model.vit.encoder.layer:
+                mod = block.intermediate.dense
+                act_fn = block.intermediate.intermediate_act_fn
+                self.hooks.append(mod.register_forward_hook(
+                    self._make_hook(mod, act_fn)))
+        elif model_type == "convnext":
+            for stage in model.stages:
+                for block in stage:
+                    mod = block.pwconv1
+                    act_fn = block.act
+                    self.hooks.append(mod.register_forward_hook(
+                        self._make_hook(mod, act_fn)))
+
+    def _make_hook(self, mod, act_fn):
+        def hook(module, inp, out):
+            x = out.detach()
+            if act_fn is not None:
+                x = act_fn(x)
+            self.activations[mod] = x
+        return hook
+
+    def compute_loss(self):
+        """Compute entropy of normalized per-channel variance across hooked layers."""
+        total_entropy = torch.tensor(0.0)
+        for mod, act in self.activations.items():
+            total_entropy = total_entropy.to(act.device)
+            # Flatten spatial/sequence dims, keep channel last
+            if act.dim() == 4:
+                # Conv: [B, C, H, W] or NHWC -> per-channel over B,H,W
+                var = act.var(dim=(0, 2, 3))
+            elif act.dim() == 3:
+                # Transformer: [B, T, C] -> per-channel over B,T
+                var = act.var(dim=(0, 1))
+            elif act.dim() == 2:
+                var = act.var(dim=0)
+            else:
+                continue
+            p = var / (var.sum() + 1e-8)
+            entropy = -(p * torch.log(p + 1e-8)).sum()
+            total_entropy = total_entropy + entropy
+        self.activations.clear()
+        return total_entropy
+
+    def remove(self):
+        for h in self.hooks:
+            h.remove()
+        self.hooks.clear()
+        self.activations.clear()
+
+
+# ---------------------------------------------------------------------------
 # Sparse pre-training
 # ---------------------------------------------------------------------------
 def run_sparse_pretraining(model, teacher, train_loader, train_sampler,
@@ -551,14 +619,17 @@ def build_ft_scheduler(optimizer, epochs, steps_per_epoch):
 def train_one_epoch(model, train_loader, train_sampler, optimizer,
                     scheduler, device, epoch, args,
                     teacher=None, fc1_modules=None,
-                    step_per_batch=True, phase="Epoch"):
-    """Unified training epoch: optional KD + optional L2,1 regularization.
+                    step_per_batch=True, phase="Epoch",
+                    var_hooks=None):
+    """Unified training epoch: optional KD + optional L2,1 regularization + optional var loss.
 
     Args:
         teacher: If not None and args.use_kd, apply knowledge distillation.
         fc1_modules: If not None and args.sparse_mode == "l1_group",
             add L2,1 group regularization.
         phase: Log prefix ("Epoch" for fine-tuning, "Sparse" for sparse phase).
+        var_hooks: If not None and args.var_loss_weight > 0, compute variance
+            concentration loss from hooked activations.
     """
     model.train()
     if train_sampler is not None:
@@ -566,9 +637,11 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
 
     use_kd = args.use_kd and teacher is not None
     use_l21 = fc1_modules is not None and args.sparse_mode == "l1_group"
+    use_var_loss = var_hooks is not None and getattr(args, 'var_loss_weight', 0) > 0
 
     total_loss = 0.0
     total_reg = 0.0
+    total_var = 0.0
     num_batches = 0
 
     total = len(train_loader)
@@ -599,6 +672,12 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
             loss = loss + args.l1_lambda * reg_loss
             total_reg += reg_loss.item()
 
+        # Variance concentration loss
+        if use_var_loss:
+            var_loss = var_hooks.compute_loss()
+            loss = loss + args.var_loss_weight * var_loss
+            total_var += var_loss.item()
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -613,6 +692,8 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
             parts = [f"loss={avg_loss:.4f}"]
             if use_l21:
                 parts.append(f"L21={total_reg / num_batches:.2f}")
+            if use_var_loss:
+                parts.append(f"var={total_var / num_batches:.4f}")
             log_info(f"{phase} {epoch+1} [{batch_idx+1}/{total}] {' '.join(parts)}")
 
     if not step_per_batch:
@@ -645,6 +726,117 @@ def validate(model, val_loader, device, model_type: str):
     acc = correct / total
     avg_loss = loss_sum / total
     return acc, avg_loss
+
+
+# ---------------------------------------------------------------------------
+# Pruning-Aware Training (PAT)
+# ---------------------------------------------------------------------------
+def run_pat(model, teacher, train_loader, train_sampler, val_loader,
+            device, example_inputs, args):
+    """Iterative pruning-aware training: prune in multiple steps with fine-tuning.
+
+    Each step: collect fresh stats -> prune a fraction -> fine-tune.
+    Geometric schedule: per_step_keep^pat_steps = keep_ratio.
+    """
+    pat_steps = args.pat_steps
+    per_step_keep = args.keep_ratio ** (1.0 / pat_steps)
+    per_step_prune = 1.0 - per_step_keep
+
+    log_info(f"PAT: {pat_steps} steps, per_step_keep={per_step_keep:.4f}, "
+             f"target_keep={args.keep_ratio}")
+
+    use_ddp = not args.disable_ddp and dist.is_initialized()
+
+    # Track cumulative keep ratio for logging
+    cumulative_keep = 1.0
+
+    for step_i in range(pat_steps):
+        log_info(f"\n{'='*60}")
+        log_info(f"PAT Step {step_i+1}/{pat_steps}")
+        log_info(f"{'='*60}")
+
+        # 1. Collect fresh VBP stats on current model
+        imp = tp.importance.VarianceImportance(norm_per_layer=args.norm_per_layer)
+        collect_and_sync_stats(model, train_loader, device, imp, args)
+
+        if is_main():
+            var_metrics = compute_variance_entropy(imp)
+            log_info(f"Variance — entropy={var_metrics['entropy']:.4f}, "
+                     f"cv={var_metrics['cv']:.4f}, gini={var_metrics['gini']:.4f}")
+
+        # 2. Create pruner with per-step ratio
+        step_args = argparse.Namespace(**vars(args))
+        step_args.keep_ratio = per_step_keep
+        pruner = create_pruner(model, example_inputs, imp, step_args)
+
+        # 3. Prune with compensation
+        log_info(f"Pruning: per_step_prune={per_step_prune:.4f}")
+        prune_model(model, pruner, device, example_inputs)
+
+        cumulative_keep *= per_step_keep
+
+        # 4. Evaluate retention
+        if is_main():
+            acc_ret, loss_ret = validate(model, val_loader, device, args.model_type)
+            pruned_macs, pruned_params = tp.utils.count_ops_and_params(model, example_inputs)
+            log_info(f"Step {step_i+1} retention: acc={acc_ret:.4f}, loss={loss_ret:.4f}")
+            log_info(f"  cumulative_keep={cumulative_keep:.4f}, "
+                     f"MACs={pruned_macs / 1e9:.2f}G, params={pruned_params / 1e6:.2f}M")
+
+        # 5. Fine-tune for pat_epochs_per_step epochs
+        if args.pat_epochs_per_step > 0:
+            # Wrap in DDP for fine-tuning
+            train_model = model
+            if use_ddp:
+                train_model = DDP(model, device_ids=[args.local_rank],
+                                  output_device=args.local_rank)
+                dist.barrier()
+
+            optimizer = torch.optim.AdamW(train_model.parameters(),
+                                          lr=args.lr_ft, weight_decay=0.01)
+            scheduler, step_per_batch = build_ft_scheduler(
+                optimizer, args.pat_epochs_per_step, len(train_loader))
+
+            # Optional variance concentration hooks
+            var_hooks = None
+            if args.var_loss_weight > 0:
+                var_hooks = VarianceConcentrationHooks(model, args.model_type)
+
+            for ep in range(args.pat_epochs_per_step):
+                global_epoch = step_i * args.pat_epochs_per_step + ep
+                train_loss = train_one_epoch(
+                    train_model, train_loader, train_sampler,
+                    optimizer, scheduler, device, global_epoch, args,
+                    teacher=teacher, step_per_batch=step_per_batch,
+                    phase=f"PAT-{step_i+1}", var_hooks=var_hooks,
+                )
+
+                if is_main():
+                    eval_model = train_model.module if isinstance(train_model, DDP) else train_model
+                    acc_ft, loss_ft = validate(eval_model, val_loader, device, args.model_type)
+                    log_info(f"PAT-{step_i+1} ep {ep+1}/{args.pat_epochs_per_step}: "
+                             f"train_loss={train_loss:.4f}, val_acc={acc_ft:.4f}")
+
+                if use_ddp:
+                    dist.barrier()
+
+            if var_hooks is not None:
+                var_hooks.remove()
+
+            # Unwrap DDP
+            if use_ddp:
+                del train_model
+
+    # Final evaluation
+    if is_main():
+        acc_final, loss_final = validate(model, val_loader, device, args.model_type)
+        pruned_macs, pruned_params = tp.utils.count_ops_and_params(model, example_inputs)
+        log_info(f"\nPAT complete — final acc={acc_final:.4f}, "
+                 f"MACs={pruned_macs / 1e9:.2f}G, params={pruned_params / 1e6:.2f}M")
+
+        save_path = os.path.join(args.save_dir, "vbp_pat_final.pth")
+        torch.save(model.state_dict(), save_path)
+        log_info(f"PAT model saved to {save_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -711,98 +903,104 @@ def main(argv):
         run_sparse_pretraining(model, teacher, train_loader, train_sampler,
                                val_loader, device, args)
 
-    # Create importance scorer
-    imp = tp.importance.VarianceImportance(norm_per_layer=args.norm_per_layer)
+    # --- PAT mode vs one-shot mode ---
+    if args.pat:
+        run_pat(model, teacher, train_loader, train_sampler, val_loader,
+                device, example_inputs, args)
+    else:
+        # One-shot VBP flow (unchanged default behavior)
 
-    # Collect and sync statistics across ranks
-    collect_and_sync_stats(model, train_loader, device, imp, args)
+        # Create importance scorer
+        imp = tp.importance.VarianceImportance(norm_per_layer=args.norm_per_layer)
 
-    # Log variance distribution metrics
-    if is_main():
-        var_metrics = compute_variance_entropy(imp)
-        log_info(f"Variance distribution — entropy={var_metrics['entropy']:.4f}, "
-                 f"cv={var_metrics['cv']:.4f}, gini={var_metrics['gini']:.4f}, "
-                 f"top10%={var_metrics['top10_pct']:.4f}")
+        # Collect and sync statistics across ranks
+        collect_and_sync_stats(model, train_loader, device, imp, args)
 
-    # Create pruner
-    pruner = create_pruner(model, example_inputs, imp, args)
+        # Log variance distribution metrics
+        if is_main():
+            var_metrics = compute_variance_entropy(imp)
+            log_info(f"Variance distribution — entropy={var_metrics['entropy']:.4f}, "
+                     f"cv={var_metrics['cv']:.4f}, gini={var_metrics['gini']:.4f}, "
+                     f"top10%={var_metrics['top10_pct']:.4f}")
 
-    # Prune with VBP importance + bias compensation
-    log_info(f"Pruning with keep_ratio={args.keep_ratio}, global={args.global_pruning}")
-    prune_model(model, pruner, device, example_inputs)
+        # Create pruner
+        pruner = create_pruner(model, example_inputs, imp, args)
 
-    # Retention accuracy (before fine-tuning)
-    if is_main():
-        log_info("Evaluating retention accuracy (before fine-tuning)...")
-        acc_ret, loss_ret = validate(model, val_loader, device, args.model_type)
-        log_info(f"Retention accuracy: {acc_ret:.4f}, loss: {loss_ret:.4f}")
+        # Prune with VBP importance + bias compensation
+        log_info(f"Pruning with keep_ratio={args.keep_ratio}, global={args.global_pruning}")
+        prune_model(model, pruner, device, example_inputs)
 
-        pruned_macs, pruned_params = tp.utils.count_ops_and_params(model, example_inputs)
-        log_info(f"Pruned: {pruned_macs / 1e9:.2f}G MACs, {pruned_params / 1e6:.2f}M params")
-        log_info(f"Reduction: {(1 - pruned_macs / base_macs) * 100:.1f}% MACs, "
-                 f"{(1 - pruned_params / base_params) * 100:.1f}% params")
+        # Retention accuracy (before fine-tuning)
+        if is_main():
+            log_info("Evaluating retention accuracy (before fine-tuning)...")
+            acc_ret, loss_ret = validate(model, val_loader, device, args.model_type)
+            log_info(f"Retention accuracy: {acc_ret:.4f}, loss: {loss_ret:.4f}")
 
-    # Wrap in DDP for fine-tuning
-    if not args.disable_ddp:
-        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
+            pruned_macs, pruned_params = tp.utils.count_ops_and_params(model, example_inputs)
+            log_info(f"Pruned: {pruned_macs / 1e9:.2f}G MACs, {pruned_params / 1e6:.2f}M params")
+            log_info(f"Reduction: {(1 - pruned_macs / base_macs) * 100:.1f}% MACs, "
+                     f"{(1 - pruned_params / base_params) * 100:.1f}% params")
+
+        # Wrap in DDP for fine-tuning
         if not args.disable_ddp:
+            model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
             dist.barrier()
 
-    # Fine-tuning
-    if args.epochs_ft > 0:
-        log_info(f"Fine-tuning for {args.epochs_ft} epochs...")
+        # Fine-tuning
+        if args.epochs_ft > 0:
+            log_info(f"Fine-tuning for {args.epochs_ft} epochs...")
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr_ft, weight_decay=0.01)
-        scheduler, step_per_batch = build_ft_scheduler(
-            optimizer, args.epochs_ft, len(train_loader)
-        )
-
-        best_acc = 0.0
-        for epoch in range(args.epochs_ft):
-            train_loss = train_one_epoch(
-                model, train_loader, train_sampler,
-                optimizer, scheduler, device, epoch, args,
-                teacher=teacher, step_per_batch=step_per_batch,
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr_ft, weight_decay=0.01)
+            scheduler, step_per_batch = build_ft_scheduler(
+                optimizer, args.epochs_ft, len(train_loader)
             )
 
-            if is_main():
-                eval_model = model.module if isinstance(model, DDP) else model
-                acc_ft, loss_ft = validate(eval_model, val_loader, device, args.model_type)
-                log_info(f"Epoch {epoch + 1}/{args.epochs_ft}: "
-                         f"train_loss={train_loss:.4f}, val_acc={acc_ft:.4f}, val_loss={loss_ft:.4f}")
+            best_acc = 0.0
+            for epoch in range(args.epochs_ft):
+                train_loss = train_one_epoch(
+                    model, train_loader, train_sampler,
+                    optimizer, scheduler, device, epoch, args,
+                    teacher=teacher, step_per_batch=step_per_batch,
+                )
 
-                if acc_ft > best_acc:
-                    best_acc = acc_ft
-                    save_path = os.path.join(args.save_dir, "vbp_best.pth")
-                    torch.save(eval_model.state_dict(), save_path)
-                    log_info(f"New best! Saved to {save_path}")
+                if is_main():
+                    eval_model = model.module if isinstance(model, DDP) else model
+                    acc_ft, loss_ft = validate(eval_model, val_loader, device, args.model_type)
+                    log_info(f"Epoch {epoch + 1}/{args.epochs_ft}: "
+                             f"train_loss={train_loss:.4f}, val_acc={acc_ft:.4f}, val_loss={loss_ft:.4f}")
 
-            if not args.disable_ddp:
-                dist.barrier()
+                    if acc_ft > best_acc:
+                        best_acc = acc_ft
+                        save_path = os.path.join(args.save_dir, "vbp_best.pth")
+                        torch.save(eval_model.state_dict(), save_path)
+                        log_info(f"New best! Saved to {save_path}")
 
-    # Final evaluation and summary
-    if is_main():
-        eval_model = model.module if isinstance(model, DDP) else model
-        acc_final, loss_final = validate(eval_model, val_loader, device, args.model_type)
-        pruned_macs, pruned_params = tp.utils.count_ops_and_params(eval_model, example_inputs)
+                if not args.disable_ddp:
+                    dist.barrier()
 
-        log_info("=" * 60)
-        log_info("Summary")
-        log_info("=" * 60)
-        log_info(f"Base MACs:    {base_macs / 1e9:.2f}G -> Pruned: {pruned_macs / 1e9:.2f}G "
-                 f"({pruned_macs / base_macs * 100:.1f}%)")
-        log_info(f"Base Params:  {base_params / 1e6:.2f}M -> Pruned: {pruned_params / 1e6:.2f}M "
-                 f"({pruned_params / base_params * 100:.1f}%)")
-        log_info(f"Original Acc: {acc_orig:.4f}")
-        log_info(f"Retention Acc: {acc_ret:.4f} (before fine-tuning)")
-        log_info(f"Final Acc:    {acc_final:.4f}")
-        if args.epochs_ft > 0:
-            log_info(f"Best Acc:     {best_acc:.4f}")
+        # Final evaluation and summary
+        if is_main():
+            eval_model = model.module if isinstance(model, DDP) else model
+            acc_final, loss_final = validate(eval_model, val_loader, device, args.model_type)
+            pruned_macs, pruned_params = tp.utils.count_ops_and_params(eval_model, example_inputs)
 
-        # Save final model
-        save_path = os.path.join(args.save_dir, "vbp_final.pth")
-        torch.save(eval_model.state_dict(), save_path)
-        log_info(f"Final model saved to {save_path}")
+            log_info("=" * 60)
+            log_info("Summary")
+            log_info("=" * 60)
+            log_info(f"Base MACs:    {base_macs / 1e9:.2f}G -> Pruned: {pruned_macs / 1e9:.2f}G "
+                     f"({pruned_macs / base_macs * 100:.1f}%)")
+            log_info(f"Base Params:  {base_params / 1e6:.2f}M -> Pruned: {pruned_params / 1e6:.2f}M "
+                     f"({pruned_params / base_params * 100:.1f}%)")
+            log_info(f"Original Acc: {acc_orig:.4f}")
+            log_info(f"Retention Acc: {acc_ret:.4f} (before fine-tuning)")
+            log_info(f"Final Acc:    {acc_final:.4f}")
+            if args.epochs_ft > 0:
+                log_info(f"Best Acc:     {best_acc:.4f}")
+
+            # Save final model
+            save_path = os.path.join(args.save_dir, "vbp_final.pth")
+            torch.save(eval_model.state_dict(), save_path)
+            log_info(f"Final model saved to {save_path}")
 
     # Cleanup
     if not args.disable_ddp:
@@ -859,6 +1057,17 @@ def parse_args():
                           help="Weight for CE loss in KD")
     kd_group.add_argument("--kd_T", type=float, default=2.0,
                           help="Temperature for KD softmax")
+
+    # Pruning-Aware Training (PAT)
+    pat_group = parser.add_argument_group("Pruning-Aware Training")
+    pat_group.add_argument("--pat", action="store_true",
+                           help="Enable iterative pruning-aware training mode")
+    pat_group.add_argument("--pat_steps", type=int, default=5,
+                           help="Number of iterative prune-then-train cycles")
+    pat_group.add_argument("--pat_epochs_per_step", type=int, default=3,
+                           help="Fine-tuning epochs between prune steps")
+    pat_group.add_argument("--var_loss_weight", type=float, default=0.0,
+                           help="Weight for variance concentration loss (0 = disabled)")
 
     # Sparse pre-training (optional, default: none = skip)
     sparse_group = parser.add_argument_group("Sparse Pre-training")

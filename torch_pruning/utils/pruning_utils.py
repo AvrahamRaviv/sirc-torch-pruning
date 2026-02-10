@@ -136,6 +136,15 @@ class channel_pruning:
         self.prune_at_target = self.channel_sparsity_args.get("prune_at_target", False)
         self.reset_optimizer = False
         self.verbose = self.channel_sparsity_args.get("verbose", 1)
+
+        # VBP-specific state
+        self.vbp_importance = None
+        self.train_loader = None  # set externally for VBP stats collection
+        self._vbp_model_type = self.channel_sparsity_args.get("model_type", None)
+        self._vbp_max_batches = self.channel_sparsity_args.get("max_batches", 200)
+        self._vbp_var_loss_weight = self.channel_sparsity_args.get("var_loss_weight", 0.0)
+        self._vbp_norm_per_layer = self.channel_sparsity_args.get("norm_per_layer", False)
+
         self.init_channel_pruner(model, log, print_layers=True)
 
     def init_channel_pruner(self, model, log=None, print_layers=False):
@@ -155,6 +164,18 @@ class channel_pruning:
                                      params=self.channels_pruner_args["MAC_params"],
                                      current_max=self.max_imp_current_step)
             pruner_entry = partial(tp.pruner.GroupNormPruner)
+        elif self.channels_pruner_args['pruning_method'] == 'VBP':
+            imp = tp.importance.VarianceImportance(
+                norm_per_layer=self._vbp_norm_per_layer)
+            # Collect stats if train_loader is available and stats not yet collected
+            if self.train_loader is not None and len(imp.variance) == 0:
+                target_layers = self._build_target_layers(model)
+                imp.collect_statistics(
+                    model, self.train_loader, self.device,
+                    target_layers=target_layers,
+                    max_batches=self._vbp_max_batches)
+            self.vbp_importance = imp
+            pruner_entry = partial(tp.pruner.VBPPruner, mean_dict=imp.means)
         else:
             raise NameError(f'Unsupported pruner method. {self.channels_pruner_args["pruning_method"]}')
 
@@ -162,8 +183,7 @@ class channel_pruning:
         grad_d = {}
         for n, m in model.named_parameters():
             grad_d[n] = m.requires_grad
-        self.pruner = pruner_entry(
-            model,
+        pruner_kwargs = dict(
             example_inputs=self.example_inputs,
             importance=imp,
             ignored_layers=self.ignored_layers,
@@ -171,11 +191,16 @@ class channel_pruning:
             pruning_ratio_dict=pruning_ratio_dict if not self.channels_pruner_args["global_pruning"] else None,
             global_pruning=self.channels_pruner_args["global_pruning"],
             round_to=self.channels_pruner_args["current_round_to"],
-            reg=self.channels_pruner_args["reg"],
             max_pruning_ratio=self.channels_pruner_args["max_pruning_rate"],
             forward_fn=self.model_forward_fn,
-            isomorphic=self.channels_pruner_args["isomorphic"]
+            isomorphic=self.channels_pruner_args["isomorphic"],
         )
+        # VBPPruner/BasePruner doesn't accept reg; only pass for regularization-based pruners
+        if self.channels_pruner_args['pruning_method'] == 'VBP':
+            pruner_kwargs["verbose"] = self.verbose > 0
+        else:
+            pruner_kwargs["reg"] = self.channels_pruner_args["reg"]
+        self.pruner = pruner_entry(model, **pruner_kwargs)
         for n, m in model.named_parameters():
             m.requires_grad = grad_d[n]
 
@@ -255,38 +280,58 @@ class channel_pruning:
             return
         self.current_epoch = epoch
         self.log_str = ""
-        if self.start_epoch <= epoch:
+        is_vbp = self.channels_pruner_args['pruning_method'] == 'VBP'
+        if self.start_epoch <= epoch and (not is_vbp or epoch % self.epoch_rate == 0):
             self.current_step = step
             self.init_channel_pruner(model, log)
             self.update_max_imp()
-            for group in self.pruner.step(interactive=True):
-                # print(group)
-                dep, idxs = group[0]
-                dep_str = str(dep)
-                if len(idxs) > 0:
-                    mask_only = mask_only and not self.prune_channels_at_init and not self.reach_mac_target
-                    pom = ["Mask", "masked"] if mask_only else ["Prune", "pruned"]
-                    idxs_ratio_str = f"{len(idxs)} / {dep.target.module.weight.shape[0]}"
-                    log_str = f"{pom[0]} {idxs_ratio_str} channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}."
-                    if self.verbose > 1:
-                        log_str += f" Indices of {pom[1]} channels are: {idxs}."
-                    if log is not None:
-                        log.info(f" {log_str}")
-                    else:
-                        print(f" {log_str}")
-                    self.log_str += f"{log_str}\n"
 
-                    if mask_only:
-                        self.mask_group(group)
-                    else:
-                        group.prune(idxs[:len(idxs) - (len(idxs) % self.slice_block_size)])
+            if is_vbp:
+                # VBP: use VBPPruner.step() which handles compensation internally
+                self.pruner.enable_meancheck(model)
+                model.eval()
+                with torch.no_grad():
+                    model(self.example_inputs)
+                self.pruner.step(interactive=False, enable_compensation=True)
+                self.pruner.disable_meancheck()
+                self.log_str += "VBP pruning with compensation applied\n"
+                if log is not None:
+                    log.info(" VBP pruning with compensation applied")
+                else:
+                    print(" VBP pruning with compensation applied")
+            else:
+                for group in self.pruner.step(interactive=True):
+                    dep, idxs = group[0]
+                    dep_str = str(dep)
+                    if len(idxs) > 0:
+                        mask_only = mask_only and not self.prune_channels_at_init and not self.reach_mac_target
+                        pom = ["Mask", "masked"] if mask_only else ["Prune", "pruned"]
+                        idxs_ratio_str = f"{len(idxs)} / {dep.target.module.weight.shape[0]}"
+                        log_str = f"{pom[0]} {idxs_ratio_str} channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}."
+                        if self.verbose > 1:
+                            log_str += f" Indices of {pom[1]} channels are: {idxs}."
+                        if log is not None:
+                            log.info(f" {log_str}")
+                        else:
+                            print(f" {log_str}")
+                        self.log_str += f"{log_str}\n"
+
+                        if mask_only:
+                            self.mask_group(group)
+                        else:
+                            group.prune(idxs[:len(idxs) - (len(idxs) % self.slice_block_size)])
         elif self.verbose > 0 and self.channels_pruner_args["reg"] > 0:
             if log is not None:
                 log.info(f" Epoch {self.current_epoch}, regularization phase with alpha = {self.channels_pruner_args['reg']}")
             else:
                 print(f" Epoch {self.current_epoch}, regularization phase with alpha = {self.channels_pruner_args['reg']}")
 
-        if self.prune_channels_at_init or not mask_only or self.reach_mac_target:
+        if is_vbp:
+            # VBP physically prunes but supports iterative PAT — only stop after
+            # all scheduled epochs are done (current_epoch >= end_epoch)
+            if self.current_epoch >= self.end_epoch:
+                self.prune_channels = False
+        elif self.prune_channels_at_init or not mask_only or self.reach_mac_target:
             self.prune_channels = False
 
         self.update_channel_mask_dict(model)
@@ -321,6 +366,9 @@ class channel_pruning:
                 print(f" Model already reach {self.mac_target} MACs reduction")
 
     def regularize(self, model):
+        # VBP does not use traditional regularization; var loss is handled externally
+        if self.channels_pruner_args['pruning_method'] == 'VBP':
+            return
         if not self.prune_channels or self.channels_pruner_args["reg"] == 0 or self.current_epoch > self.end_epoch:
             return
         self.update_max_imp()
@@ -382,9 +430,12 @@ class channel_pruning:
             if isinstance(m, torch.nn.PixelShuffle):
                 self.ignored_layers.append(m)
                 continue
-            # Ignore Linear layers, such as classification head
+            # Linear layers: VBP prunes specific Linears, others ignore all
             if isinstance(m, torch.nn.Linear):
-                self.ignored_layers.append(m)
+                if self.channels_pruner_args['pruning_method'] == 'VBP' and name in ltp:
+                    pruning_ratio_dict[m] = self.current_pr
+                else:
+                    self.ignored_layers.append(m)
                 continue
             # Pruning only Conv2d (MHA is currently not supported)
             if not isinstance(m, torch.nn.Conv2d):
@@ -482,6 +533,35 @@ class channel_pruning:
         if total_macs == 0:
             total_adjusted_macs, total_macs = 1., 1.
         return total_adjusted_macs, total_macs
+
+    def _build_target_layers(self, model):
+        """Auto-detect target layers for VBP stats collection based on model_type."""
+        model_type = self._vbp_model_type
+        if model_type == "vit":
+            # HuggingFace ViT: block.intermediate.dense + block.intermediate.intermediate_act_fn
+            target_layers = []
+            for name, m in model.named_modules():
+                if name.endswith(".intermediate.dense"):
+                    # Navigate to parent block to get act fn
+                    parts = name.split(".")
+                    # intermediate.dense -> go up to block level
+                    block = model
+                    for p in parts[:-1]:  # up to "intermediate"
+                        block = getattr(block, p)
+                    act_fn = getattr(block, "intermediate_act_fn", None)
+                    target_layers.append((m, act_fn))
+            return target_layers if target_layers else None
+        elif model_type == "convnext":
+            target_layers = []
+            for name, m in model.named_modules():
+                if hasattr(m, "pwconv1") and hasattr(m, "act"):
+                    def _make_post_gelu_nchw(act_fn):
+                        def fn(x):
+                            return act_fn(x).permute(0, 3, 1, 2)
+                        return fn
+                    target_layers.append((m.pwconv1, _make_post_gelu_nchw(m.act)))
+            return target_layers if target_layers else None
+        return None
 
     def update_max_imp(self):
         if self.channels_pruner_args['pruning_method'] != 'MACAwareImportance':
