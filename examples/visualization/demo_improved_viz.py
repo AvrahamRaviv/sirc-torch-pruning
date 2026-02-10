@@ -95,6 +95,23 @@ def main():
 
     output_dir = "./demo_viz"
 
+    # Log groups (same 0-based indexing as the PNG group boxes)
+    _prunable = (nn.Conv2d, nn.Linear)
+    groups = list(DG.get_all_groups(root_module_types=_prunable))
+    print(f"\n{'=' * 55}")
+    print(f"Pruning groups ({len(groups)} total):")
+    print(f"{'=' * 55}")
+    for idx, group in enumerate(groups):
+        root_name = group[0].dep.source.name
+        print(f"  Group {idx}: root = {root_name}")
+        for item in group:
+            layer = item.dep.target.module
+            if isinstance(layer, _prunable):
+                dep_str = str(item.dep)
+                fn_info = dep_str[dep_str.index("=>") + 2:].strip() if "=>" in dep_str else str(item.dep)
+                print(f"    {fn_info}")
+    print(f"{'=' * 55}")
+
     print(f"\nGenerating all 3 views ({args.format})...")
     tp.utils.visualize_all_views(
         DG,
