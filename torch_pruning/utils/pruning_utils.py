@@ -217,20 +217,21 @@ class channel_pruning:
                 if print_layers:
                     num_groups = 0
                     source_convs = []
+                    _prunable = (torch.nn.Conv2d, torch.nn.Linear)
                     log.info("*************")
                     for group in self.pruner.DG.get_all_groups(ignored_layers=self.pruner.ignored_layers,
                                                                root_module_types=self.pruner.root_module_types):
                         log.info(f"group number {num_groups + 1}:")
-                        log.info(f"Source conv: {group[0].dep.source.name}")
+                        log.info(f"Source layer: {group[0].dep.source.name}")
                         source_convs.append(group[0].dep.source.name.split(" ")[0])
-                        if any([isinstance(_gt.dep.layer, torch.nn.Conv2d) for _gt in group]):
+                        if any([isinstance(_gt.dep.layer, _prunable) for _gt in group]):
                             log.info(f"Dependencies:")
                             for _g in group:
-                                if isinstance(_g.dep.layer, torch.nn.Conv2d):
+                                if isinstance(_g.dep.layer, _prunable):
                                     log.info(str(_g.dep)[str(_g.dep).index("=>") + 2:].strip())
                         log.info("*************\n")
                         num_groups += 1
-                    log.info(f"There are {num_groups} groups of layers, with the following source convs:\n{source_convs}")
+                    log.info(f"There are {num_groups} groups of layers, with the following source layers:\n{source_convs}")
             else:
                 print(f"Epoch {self.current_epoch}, pruning progress:")
                 print(f"Pruning from epoch {self.start_epoch} to epoch {self.end_epoch}, with a current pruning rate of {self.current_pr:.3f}.")
@@ -240,20 +241,21 @@ class channel_pruning:
                 if print_layers:
                     num_groups = 0
                     source_convs = []
+                    _prunable = (torch.nn.Conv2d, torch.nn.Linear)
                     print("*************")
                     for group in self.pruner.DG.get_all_groups(ignored_layers=self.pruner.ignored_layers,
                                                                root_module_types=self.pruner.root_module_types):
                         print(f"group number {num_groups + 1}:")
-                        print(f"Source conv: {group[0].dep.source.name}")
+                        print(f"Source layer: {group[0].dep.source.name}")
                         source_convs.append(group[0].dep.source.name.split(" ")[0])
-                        if any([isinstance(_gt.dep.layer, torch.nn.Conv2d) for _gt in group]):
+                        if any([isinstance(_gt.dep.layer, _prunable) for _gt in group]):
                             print(f"Dependencies:")
                             for _g in group:
-                                if isinstance(_g.dep.layer, torch.nn.Conv2d):
+                                if isinstance(_g.dep.layer, _prunable):
                                     print(str(_g.dep)[str(_g.dep).index("=>") + 2:].strip())
                         print("*************\n")
                         num_groups += 1
-                    print(f"There are {num_groups} groups of layers, with the following source convs:\n{source_convs}")
+                    print(f"There are {num_groups} groups of layers, with the following source layers:\n{source_convs}")
 
             # Viz graph
             tp.utils.visualize_graph(self.pruner.DG, self.config_folder)
@@ -456,7 +458,9 @@ class channel_pruning:
         for dep, idxs in group:
             target_layer = dep.target.module
             pruning_fn = dep.handler
-            if not isinstance(target_layer, (torch.nn.Conv2d, torch.nn.ReLU, torch.nn.PReLU, torch.nn.BatchNorm2d)):
+            if not isinstance(target_layer, (torch.nn.Conv2d, torch.nn.Linear,
+                                              torch.nn.ReLU, torch.nn.PReLU,
+                                              torch.nn.BatchNorm2d, torch.nn.LayerNorm)):
                 continue
             mask = torch.ones_like(dep.target.module.weight)
             has_bias = False
@@ -470,7 +474,7 @@ class channel_pruning:
                 target_layer.weight.data[idxs] *= 0
                 if target_layer.bias is not None:
                     target_layer.bias.data[idxs] *= 0
-            elif pruning_fn in [tp.prune_batchnorm_out_channels]:
+            elif pruning_fn in [tp.prune_batchnorm_out_channels, tp.prune_layernorm_out_channels]:
                 mask[idxs] = 0
                 if target_layer.bias is not None:
                     has_bias = True
@@ -503,15 +507,20 @@ class channel_pruning:
 
         for name, module in model.named_modules():
             name = name.replace("module.", "")
-            if module in macs_dict and isinstance(module, torch.nn.Conv2d) and module in ltp:
+            if module in macs_dict and isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)) and module in ltp:
                 macs_layer = macs_dict[module]
                 weight = module.weight
-                out_channels, in_channels, _, _ = weight.shape
 
-                # Count fully-zeroed input channels:
-                zeros_input = (torch.sum(weight, dim=(0, 2, 3)) == 0).sum().item()
-                # Count fully-zeroed output channels:
-                zeros_output = (torch.sum(weight, dim=(1, 2, 3)) == 0).sum().item()
+                if isinstance(module, torch.nn.Conv2d):
+                    out_channels, in_channels, _, _ = weight.shape
+                    zeros_input = (torch.sum(weight, dim=(0, 2, 3)) == 0).sum().item()
+                    zeros_output = (torch.sum(weight, dim=(1, 2, 3)) == 0).sum().item()
+                elif isinstance(module, torch.nn.Linear):
+                    out_channels, in_channels = weight.shape
+                    zeros_input = (torch.sum(weight, dim=0) == 0).sum().item()
+                    zeros_output = (torch.sum(weight, dim=1) == 0).sum().item()
+                else:
+                    continue
 
                 active_in_ratio = (in_channels - zeros_input) / in_channels
                 active_out_ratio = (out_channels - zeros_output) / out_channels
