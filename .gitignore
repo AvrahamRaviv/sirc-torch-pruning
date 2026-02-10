@@ -32,3 +32,8 @@ pretrained
 data
 
 cache/
+
+# Local project management (not pushed to remote)
+CLAUDE.md
+STATUS.md
+.claude/
