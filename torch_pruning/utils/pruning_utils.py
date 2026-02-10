@@ -221,7 +221,7 @@ class channel_pruning:
                     log.info("*************")
                     for group in self.pruner.DG.get_all_groups(ignored_layers=self.pruner.ignored_layers,
                                                                root_module_types=self.pruner.root_module_types):
-                        log.info(f"group number {num_groups + 1}:")
+                        log.info(f"Group {num_groups}:")
                         log.info(f"Source layer: {group[0].dep.source.name}")
                         source_convs.append(group[0].dep.source.name.split(" ")[0])
                         if any([isinstance(_gt.dep.layer, _prunable) for _gt in group]):
@@ -245,7 +245,7 @@ class channel_pruning:
                     print("*************")
                     for group in self.pruner.DG.get_all_groups(ignored_layers=self.pruner.ignored_layers,
                                                                root_module_types=self.pruner.root_module_types):
-                        print(f"group number {num_groups + 1}:")
+                        print(f"Group {num_groups}:")
                         print(f"Source layer: {group[0].dep.source.name}")
                         source_convs.append(group[0].dep.source.name.split(" ")[0])
                         if any([isinstance(_gt.dep.layer, _prunable) for _gt in group]):
@@ -258,7 +258,7 @@ class channel_pruning:
                     print(f"There are {num_groups} groups of layers, with the following source layers:\n{source_convs}")
 
             # Viz graph
-            tp.utils.visualize_graph(self.pruner.DG, self.config_folder)
+            tp.utils.visualize_graph(self.pruner.DG, self.config_folder, show_groups=True)
 
     def prune(self, model, epoch, log=None, mask_only=True, step=None):
         """
