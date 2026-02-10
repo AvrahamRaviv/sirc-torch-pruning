@@ -1,16 +1,20 @@
 """Demo: Improved dependency graph visualization.
 
 Features demonstrated:
-1. Differentiated dependency edges (direct=green vs force-shape-match=red)
-2. Bidirectional edges merged into single edge with arrows on both ends
-3. Group clustering for pruning groups
-4. Human-readable ElementOps names (Add, ReLU, etc.)
+1. Consistent layout across all 3 views (computational edges as layout backbone)
+2. Group boxes (graphviz cluster subgraphs) wrapping pruning groups
+3. Differentiated dependency edges (direct=green vs force-shape-match=red)
+4. Double-border nodes for multi-group membership (residual connections)
+5. Human-readable ElementOps names (Add, ReLU, etc.)
 
 Run:
     python examples/visualization/demo_improved_viz.py
 
 For ResNet18 visualization (requires torchvision):
     python examples/visualization/demo_improved_viz.py --resnet
+
+Output as SVG:
+    python examples/visualization/demo_improved_viz.py --format svg
 """
 import argparse
 import os
@@ -80,6 +84,8 @@ def get_model(use_resnet):
 def main():
     parser = argparse.ArgumentParser(description="Demo improved visualization")
     parser.add_argument("--resnet", action="store_true", help="Use ResNet18 (requires torchvision)")
+    parser.add_argument("--format", default="png", choices=["png", "svg", "pdf"],
+                        help="Output format (default: png)")
     args = parser.parse_args()
 
     model, example_inputs = get_model(args.resnet)
@@ -87,61 +93,36 @@ def main():
     print("Building dependency graph...")
     DG = tp.DependencyGraph().build_dependency(model, example_inputs)
 
-    # Output directory
     output_dir = "./demo_viz"
-    os.makedirs(output_dir, exist_ok=True)
 
-    # Generate visualizations (both SVG and PNG)
-    for fmt in ["svg", "png"]:
-        # 1. Dependency graph with groups
-        print(f"\nGenerating dependency graph ({fmt})...")
-        tp.utils.visualize_graph(
-            DG,
-            output_path=f"{output_dir}/dependency_graph",
-            view="dependency",
-            show_groups=True,
-            differentiate_dependencies=True,
-            format=fmt,
-        )
-
-        # 2. Computational graph
-        print(f"Generating computational graph ({fmt})...")
-        tp.utils.visualize_graph(
-            DG,
-            output_path=f"{output_dir}/computational_graph",
-            view="computational",
-            show_groups=True,
-            format=fmt,
-        )
-
-        # 3. Combined view
-        print(f"Generating combined graph ({fmt})...")
-        tp.utils.visualize_graph(
-            DG,
-            output_path=f"{output_dir}/combined_graph",
-            view="both",
-            show_groups=True,
-            differentiate_dependencies=True,
-            hide_redundant_computational=True,
-            format=fmt,
-        )
+    print(f"\nGenerating all 3 views ({args.format})...")
+    tp.utils.visualize_all_views(
+        DG,
+        output_dir=output_dir,
+        basename="graph",
+        format=args.format,
+        differentiate_dependencies=True,
+    )
 
     print(f"\nSaved all files to: {output_dir}/")
-    print("  - dependency_graph.svg/png")
-    print("  - computational_graph.svg/png")
-    print("  - combined_graph.svg/png")
+    print(f"  - graph_computational.{args.format}")
+    print(f"  - graph_dependency.{args.format}")
+    print(f"  - graph_both.{args.format}")
 
-    # Print legend
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 55)
     print("Legend:")
     print("  Edges:")
     print("    Green dashed (vee): Direct dependency")
     print("    Red dotted (diamond): Force-shape-match")
     print("    Gray solid: Computational flow")
-    print("  Node borders (groups):")
-    print("    Colored thick border = nodes in same pruning group")
-    print("    Same border color = same group")
-    print("=" * 50)
+    print("    Invisible (dep view): Computational backbone (constrains layout)")
+    print("  Nodes:")
+    print("    Double border: Node belongs to multiple pruning groups")
+    print("  Group boxes:")
+    print("    Light gray rectangles: Pruning group clusters")
+    print("    Visible in dependency and combined views")
+    print("    Same cluster = nodes pruned together")
+    print("=" * 55)
 
 
 if __name__ == "__main__":
