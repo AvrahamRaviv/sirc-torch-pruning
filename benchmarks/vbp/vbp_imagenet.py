@@ -731,14 +731,74 @@ def validate(model, val_loader, device, model_type: str):
 # ---------------------------------------------------------------------------
 # Pruning-Aware Training (PAT)
 # ---------------------------------------------------------------------------
+def finetune(model, teacher, train_loader, train_sampler, val_loader,
+             device, args, epochs, epoch_offset=0, phase="FT",
+             use_var_loss=False):
+    """Fine-tune model for a given number of epochs.
+
+    Returns:
+        best_acc achieved during fine-tuning (0.0 if epochs=0).
+    """
+    if epochs <= 0:
+        return 0.0
+
+    use_ddp = not args.disable_ddp and dist.is_initialized()
+
+    train_model = model
+    if use_ddp:
+        train_model = DDP(model, device_ids=[args.local_rank],
+                          output_device=args.local_rank)
+        dist.barrier()
+
+    optimizer = torch.optim.AdamW(train_model.parameters(),
+                                  lr=args.lr_ft, weight_decay=0.01)
+    scheduler, step_per_batch = build_ft_scheduler(
+        optimizer, epochs, len(train_loader))
+
+    var_hooks = None
+    if use_var_loss and args.var_loss_weight > 0:
+        var_hooks = VarianceConcentrationHooks(model, args.model_type)
+
+    best_acc = 0.0
+    for ep in range(epochs):
+        global_epoch = epoch_offset + ep
+        train_loss = train_one_epoch(
+            train_model, train_loader, train_sampler,
+            optimizer, scheduler, device, global_epoch, args,
+            teacher=teacher, step_per_batch=step_per_batch,
+            phase=phase, var_hooks=var_hooks,
+        )
+
+        if is_main():
+            eval_model = train_model.module if isinstance(train_model, DDP) else train_model
+            acc_ft, loss_ft = validate(eval_model, val_loader, device, args.model_type)
+            log_info(f"{phase} ep {ep+1}/{epochs}: "
+                     f"train_loss={train_loss:.4f}, val_acc={acc_ft:.4f}")
+
+            if acc_ft > best_acc:
+                best_acc = acc_ft
+                save_path = os.path.join(args.save_dir, "vbp_best.pth")
+                torch.save(eval_model.state_dict(), save_path)
+                log_info(f"New best! Saved to {save_path}")
+
+        if use_ddp:
+            dist.barrier()
+
+    if var_hooks is not None:
+        var_hooks.remove()
+    if use_ddp:
+        del train_model
+
+    return best_acc
+
+
 def run_pat(model, teacher, train_loader, train_sampler, val_loader,
             device, example_inputs, args,
             base_macs=None, base_params=None, acc_orig=None):
-    """Iterative pruning-aware training: prune in multiple steps with fine-tuning.
+    """Prune (one-shot or iterative) then optionally fine-tune.
 
-    Each step: collect fresh stats -> prune a fraction -> fine-tune.
+    Pipeline: [pat_steps x (collect stats -> prune -> per-step FT)] -> post-prune FT
     Geometric schedule: per_step_keep^pat_steps = keep_ratio.
-    Also used for one-shot pruning (pat_steps=1).
     """
     pat_steps = args.pat_steps
     epochs_per_step = args.pat_epochs_per_step
@@ -747,8 +807,6 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
 
     log_info(f"PAT: {pat_steps} steps, per_step_keep={per_step_keep:.4f}, "
              f"epochs_per_step={epochs_per_step}, target_keep={args.keep_ratio}")
-
-    use_ddp = not args.disable_ddp and dist.is_initialized()
 
     # Track cumulative keep ratio for logging
     cumulative_keep = 1.0
@@ -787,55 +845,25 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
             log_info(f"  cumulative_keep={cumulative_keep:.4f}, "
                      f"MACs={pruned_macs / 1e9:.2f}G, params={pruned_params / 1e6:.2f}M")
 
-        # 5. Fine-tune for epochs_per_step epochs
-        if epochs_per_step > 0:
-            # Wrap in DDP for fine-tuning
-            train_model = model
-            if use_ddp:
-                train_model = DDP(model, device_ids=[args.local_rank],
-                                  output_device=args.local_rank)
-                dist.barrier()
+        # 5. Per-step fine-tuning
+        epoch_offset = step_i * epochs_per_step
+        step_best = finetune(
+            model, teacher, train_loader, train_sampler, val_loader,
+            device, args, epochs=epochs_per_step, epoch_offset=epoch_offset,
+            phase=f"PAT-{step_i+1}", use_var_loss=True,
+        )
+        best_acc = max(best_acc, step_best)
 
-            optimizer = torch.optim.AdamW(train_model.parameters(),
-                                          lr=args.lr_ft, weight_decay=0.01)
-            scheduler, step_per_batch = build_ft_scheduler(
-                optimizer, epochs_per_step, len(train_loader))
-
-            # Optional variance concentration hooks
-            var_hooks = None
-            if args.var_loss_weight > 0:
-                var_hooks = VarianceConcentrationHooks(model, args.model_type)
-
-            for ep in range(epochs_per_step):
-                global_epoch = step_i * epochs_per_step + ep
-                train_loss = train_one_epoch(
-                    train_model, train_loader, train_sampler,
-                    optimizer, scheduler, device, global_epoch, args,
-                    teacher=teacher, step_per_batch=step_per_batch,
-                    phase=f"PAT-{step_i+1}", var_hooks=var_hooks,
-                )
-
-                if is_main():
-                    eval_model = train_model.module if isinstance(train_model, DDP) else train_model
-                    acc_ft, loss_ft = validate(eval_model, val_loader, device, args.model_type)
-                    log_info(f"PAT-{step_i+1} ep {ep+1}/{epochs_per_step}: "
-                             f"train_loss={train_loss:.4f}, val_acc={acc_ft:.4f}")
-
-                    if acc_ft > best_acc:
-                        best_acc = acc_ft
-                        save_path = os.path.join(args.save_dir, "vbp_best.pth")
-                        torch.save(eval_model.state_dict(), save_path)
-                        log_info(f"New best! Saved to {save_path}")
-
-                if use_ddp:
-                    dist.barrier()
-
-            if var_hooks is not None:
-                var_hooks.remove()
-
-            # Unwrap DDP
-            if use_ddp:
-                del train_model
+    # 6. Post-prune fine-tuning
+    if args.epochs_ft > 0:
+        log_info(f"\nPost-prune fine-tuning for {args.epochs_ft} epochs...")
+        epoch_offset = pat_steps * epochs_per_step
+        ft_best = finetune(
+            model, teacher, train_loader, train_sampler, val_loader,
+            device, args, epochs=args.epochs_ft, epoch_offset=epoch_offset,
+            phase="FT",
+        )
+        best_acc = max(best_acc, ft_best)
 
     # Final evaluation and summary
     if is_main():
@@ -929,9 +957,8 @@ def main(argv):
 
     # --- Pruning: PAT (iterative) or one-shot (pat_steps=1) ---
     if not args.pat:
-        # One-shot mode: override PAT args to single step
         args.pat_steps = 1
-        args.pat_epochs_per_step = args.epochs_ft
+        args.pat_epochs_per_step = 0  # all FT via epochs_ft
 
     run_pat(model, teacher, train_loader, train_sampler, val_loader,
             device, example_inputs, args,
