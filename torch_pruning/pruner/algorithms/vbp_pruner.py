@@ -129,6 +129,16 @@ class VBPPruner(BasePruner):
 
     @torch.no_grad()
     def _apply_compensation(self, group, idx_to_prune):
+        """Compensate consumer biases for pruned channels using calibration means.
+
+        NOTE on residual stream pruning (e.g. ResNet conv3 -> add -> next block):
+        When pruning channels that feed through a residual add, the compensation
+        uses the post-BN+ReLU mean of the pruned conv's output. This is an
+        approximation — the true input to the consumer is (residual + conv_output),
+        but we only have the conv_output mean. Fine-tuning recovers this gap.
+        Interior block pruning (conv1/conv2 in Bottleneck) is exact since there
+        is no add node between the pruned conv and its consumer.
+        """
         dep0, _ = group[0]
         root = dep0.target.module  # pruned Conv / Linear
 

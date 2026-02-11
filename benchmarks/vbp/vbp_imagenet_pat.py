@@ -63,8 +63,8 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Config generation
 # ---------------------------------------------------------------------------
-def build_vbp_layers_to_prune(model, model_type):
-    """Return list of module names that VBP should prune (fc1 / pwconv1)."""
+def build_vbp_layers_to_prune(model, model_type, architecture=None, interior_only=True):
+    """Return list of module names that VBP should prune (fc1 / pwconv1 / interior convs)."""
     layers = []
     if model_type == "vit":
         for name, m in model.named_modules():
@@ -74,12 +74,22 @@ def build_vbp_layers_to_prune(model, model_type):
         for name, m in model.named_modules():
             if hasattr(m, "pwconv1"):
                 layers.append(name + ".pwconv1")
+    elif model_type == "cnn":
+        from torch_pruning.pruner.importance import build_cnn_ignored_layers
+        import torch.nn as nn
+        ignored = build_cnn_ignored_layers(model, architecture, interior_only)
+        for name, m in model.named_modules():
+            if isinstance(m, nn.Conv2d) and m not in ignored:
+                layers.append(name)
     return layers
 
 
 def build_pruning_config(args, model, config_dir):
     """Programmatically create pruning_config.json for the Pruning class."""
-    layers = build_vbp_layers_to_prune(model, args.model_type)
+    layers = build_vbp_layers_to_prune(
+        model, args.model_type,
+        architecture=getattr(args, 'cnn_arch', None),
+        interior_only=getattr(args, 'interior_only', True))
     epochs_per_step = max(1, args.epochs // args.pat_steps)
     # epoch_rate: prune every N epochs (maps pat_steps to epoch schedule)
     epoch_rate = epochs_per_step
@@ -186,7 +196,7 @@ def main():
     output_transform = None
     if args.model_type == "vit":
         output_transform = lambda out: out.logits.sum()
-    elif args.model_type == "convnext":
+    elif args.model_type in ("convnext", "cnn"):
         output_transform = lambda out: out.sum()
 
     pruner = Pruning(model, config_dir, forward_fn=output_transform, device=device)
@@ -196,7 +206,13 @@ def main():
     # Variance concentration hooks (optional)
     var_hooks = None
     if args.var_loss_weight > 0:
-        var_hooks = VarianceConcentrationHooks(model, args.model_type)
+        cnn_target_layers = None
+        if args.model_type == "cnn":
+            from torch_pruning.pruner.importance import build_cnn_target_layers
+            temp_DG = tp.DependencyGraph().build_dependency(model, example_inputs=example_inputs)
+            cnn_target_layers = build_cnn_target_layers(model, temp_DG)
+        var_hooks = VarianceConcentrationHooks(model, args.model_type,
+                                               target_layers=cnn_target_layers)
 
     # Training loop with epoch-based pruning
     use_ddp = not args.disable_ddp and dist.is_initialized()
@@ -291,8 +307,12 @@ def parse_args():
     )
 
     # Model
-    parser.add_argument("--model_type", default="vit", choices=["vit", "convnext"])
+    parser.add_argument("--model_type", default="vit", choices=["vit", "convnext", "cnn"])
     parser.add_argument("--model_name", default="/algo/NetOptimization/outputs/VBP/DeiT_tiny")
+    parser.add_argument("--cnn_arch", default="resnet50",
+                        choices=["resnet18", "resnet34", "resnet50", "resnet101", "mobilenet_v2"])
+    parser.add_argument("--pretrained", action="store_true", default=True)
+    parser.add_argument("--interior_only", action="store_true", default=True)
 
     # Data
     parser.add_argument("--data_path", default="/algo/NetOptimization/outputs/VBP/")
