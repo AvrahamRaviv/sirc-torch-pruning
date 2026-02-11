@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from functools import partial
 from typing import Any, Dict, Optional, List
 import torch
@@ -11,7 +12,6 @@ try:
 except Exception:
     spyq = None
 
-from torch_pruning.pruner.importance import *
 from torch_pruning.utils import count_ops_and_params
 
 """
@@ -159,7 +159,7 @@ class channel_pruning:
             pruner_entry = partial(tp.pruner.GroupNormPruner)
         elif self.channels_pruner_args['pruning_method'] == 'MACAwareImportance':
             L_MACs = {k: v[0] for k, v in self.MACs_per_layer.items()}
-            imp = MACAwareImportance(p=2, layers_mac=L_MACs,
+            imp = tp.importance.MACAwareImportance(p=2, layers_mac=L_MACs,
                                      params=self.channels_pruner_args["MAC_params"],
                                      current_max=self.max_imp_current_step)
             pruner_entry = partial(tp.pruner.GroupNormPruner)
@@ -307,7 +307,6 @@ class channel_pruning:
                 config_path = os.path.join(self.config_folder, "pruning_config.json")
                 with open(config_path, "r") as f:
                     sparsity_args = json.load(f)
-                    import time
                     time.sleep(5)
                 sparsity_args['channel_sparsity_args']['reach_mac_target'] = True
                 if self.prune_at_target:
