@@ -607,7 +607,7 @@ class SlicePruning:
 
     def regularize(self, model):
         if not self.prune_slices:
-            return torch.tensor(0).to('cuda')
+            return torch.tensor(0.0)
         assert self.slice_sparsity_args["pruning_mode"] == "Prune", "sparsity loss is available only on pruned stage"
         SP_loss = 0
         # run over the relevant layers, as defined in the config
