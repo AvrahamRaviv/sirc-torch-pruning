@@ -211,6 +211,20 @@ class ChannelPruning:
         else:
             pruner_kwargs["reg"] = self.channels_pruner_args["reg"]
         self.pruner = pruner_entry(model, **pruner_kwargs)
+
+        # CNN VBP: collect stats after pruner creation (needs DG for graph-walking)
+        if (self.pruning_method == PruningMethod.VBP
+                and self._vbp_model_type == "cnn"
+                and self.train_loader is not None
+                and len(imp.variance) == 0):
+            target_layers = self._build_target_layers_from_dg(model, self.pruner.DG)
+            imp.collect_statistics(
+                model, self.train_loader, self.device,
+                target_layers=target_layers,
+                max_batches=self._vbp_max_batches)
+            # Update mean_dict on the pruner after stats are collected
+            self.pruner.set_mean_dict(imp.means)
+
         for n, m in model.named_parameters():
             m.requires_grad = grad_d[n]
 
@@ -534,7 +548,17 @@ class ChannelPruning:
                         return fn
                     target_layers.append((m.pwconv1, _make_post_gelu_nchw(m.act)))
             return target_layers if target_layers else None
+        elif model_type == "cnn":
+            # CNN target layers require a DependencyGraph for graph-walking.
+            # Return None here; caller should use _build_target_layers_from_dg() after
+            # building the pruner (which creates the DG).
+            return None
         return None
+
+    def _build_target_layers_from_dg(self, model, DG):
+        """Build CNN target layers using DG graph-walking (post-pruner creation)."""
+        from torch_pruning.pruner.importance import build_cnn_target_layers
+        return build_cnn_target_layers(model, DG)
 
     def update_max_imp(self):
         if self.pruning_method != PruningMethod.MAC_AWARE:

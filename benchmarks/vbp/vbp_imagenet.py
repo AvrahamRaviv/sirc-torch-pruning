@@ -285,6 +285,20 @@ def load_model(args, device):
 
         model = model.to(device)
 
+    elif args.model_type == "cnn":
+        import torchvision.models as tv_models
+        model_map = {
+            "resnet18": tv_models.resnet18,
+            "resnet34": tv_models.resnet34,
+            "resnet50": tv_models.resnet50,
+            "resnet101": tv_models.resnet101,
+            "mobilenet_v2": tv_models.mobilenet_v2,
+        }
+        model_fn = model_map[args.cnn_arch]
+        weights = "DEFAULT" if args.pretrained else None
+        model = model_fn(weights=weights).to(device)
+        log_info(f"Loaded {args.cnn_arch} (pretrained={args.pretrained})")
+
     else:
         raise ValueError(f"Unsupported model_type: {args.model_type}")
 
@@ -320,13 +334,18 @@ class VarianceConcentrationHooks:
     (improving the VBP pruning signal for subsequent steps).
     """
 
-    def __init__(self, model, model_type):
+    def __init__(self, model, model_type, target_layers=None):
         self.hooks = []
         self.activations = {}
-        self._register(model, model_type)
+        self._register(model, model_type, target_layers)
 
-    def _register(self, model, model_type):
-        if model_type == "vit":
+    def _register(self, model, model_type, target_layers=None):
+        if target_layers is not None:
+            # Generic path: use provided (module, act_fn) pairs
+            for mod, act_fn in target_layers:
+                self.hooks.append(mod.register_forward_hook(
+                    self._make_hook(mod, act_fn)))
+        elif model_type == "vit":
             for block in model.vit.encoder.layer:
                 mod = block.intermediate.dense
                 act_fn = block.intermediate.intermediate_act_fn
@@ -491,6 +510,12 @@ def create_pruner(model, example_inputs, imp, args):
                 ignored_layers.append(block.pwconv2)
         output_transform = lambda out: out.sum()
 
+    elif args.model_type == "cnn":
+        from torch_pruning.pruner.importance import build_cnn_ignored_layers
+        ignored_layers = build_cnn_ignored_layers(
+            model, args.cnn_arch, interior_only=args.interior_only)
+        output_transform = lambda out: out.sum()
+
     else:
         output_transform = lambda out: out.sum()
 
@@ -556,6 +581,12 @@ def collect_and_sync_stats(model, train_loader, device, imp, args):
                 (block.pwconv1, _make_post_gelu_nchw(block.act))
                 for stage in model.stages for block in stage
             ]
+        elif args.model_type == "cnn":
+            from torch_pruning.pruner.importance import build_cnn_target_layers
+            example = torch.randn(1, 3, 224, 224).to(device)
+            temp_DG = tp.DependencyGraph().build_dependency(model, example_inputs=example)
+            target_layers = build_cnn_target_layers(model, temp_DG)
+            log_info(f"Auto-detected {len(target_layers)} CNN target layers for stats")
         log_info("Collecting activation variance statistics...")
         imp.collect_statistics(model, train_loader, device, target_layers=target_layers, max_batches=args.max_batches)
         log_info(f"Statistics collected for {len(imp.variance)} layers")
@@ -757,7 +788,14 @@ def finetune(model, teacher, train_loader, train_sampler, val_loader,
 
     var_hooks = None
     if use_var_loss and args.var_loss_weight > 0:
-        var_hooks = VarianceConcentrationHooks(model, args.model_type)
+        cnn_target_layers = None
+        if args.model_type == "cnn":
+            from torch_pruning.pruner.importance import build_cnn_target_layers
+            example = torch.randn(1, 3, 224, 224).to(device)
+            temp_DG = tp.DependencyGraph().build_dependency(model, example_inputs=example)
+            cnn_target_layers = build_cnn_target_layers(model, temp_DG)
+        var_hooks = VarianceConcentrationHooks(model, args.model_type,
+                                               target_layers=cnn_target_layers)
 
     best_acc = 0.0
     for ep in range(epochs):
@@ -977,10 +1015,17 @@ def parse_args():
 
     # Model
     model_group = parser.add_argument_group("Model")
-    model_group.add_argument("--model_type", default="vit", choices=["vit", "convnext"],
+    model_group.add_argument("--model_type", default="vit", choices=["vit", "convnext", "cnn"],
                              help="Model architecture type")
     model_group.add_argument("--model_name", default="/algo/NetOptimization/outputs/VBP/DeiT_tiny",
                              help="Model name/path (HF model ID or ConvNeXt .pth path)")
+    model_group.add_argument("--cnn_arch", default="resnet50",
+                             choices=["resnet18", "resnet34", "resnet50", "resnet101", "mobilenet_v2"],
+                             help="CNN architecture (only used when model_type=cnn)")
+    model_group.add_argument("--pretrained", action="store_true", default=True,
+                             help="Use pretrained weights for CNN models")
+    model_group.add_argument("--interior_only", action="store_true", default=True,
+                             help="Only prune block-interior channels (not residual stream)")
 
     # Data
     data_group = parser.add_argument_group("Data")

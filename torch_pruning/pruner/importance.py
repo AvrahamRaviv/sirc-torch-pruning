@@ -35,6 +35,10 @@ __all__ = [
     "RandomImportance",
     "MACAwareImportance",
     "VarianceImportance",
+
+    # CNN VBP helpers
+    "build_cnn_target_layers",
+    "build_cnn_ignored_layers",
 ]
 
 class Importance(abc.ABC):
@@ -1176,3 +1180,214 @@ class VarianceImportance(Importance):
         scores = var[idxs].clone()
 
         return scores
+
+
+# ---------------------------------------------------------------------------
+# CNN VBP helpers: auto-detect target_layers and ignored_layers
+# ---------------------------------------------------------------------------
+
+def _grad_fn_to_activation(grad_fn_str):
+    """Map a grad_fn name to a functional activation, or None."""
+    import torch.nn.functional as _F
+    _mapping = {
+        "relu": _F.relu,
+        "silu": _F.silu,
+        "gelu": _F.gelu,
+        "relu6": _F.relu6,
+        "hardswish": _F.hardswish,
+        "hardsigmoid": _F.hardsigmoid,
+    }
+    grad_fn_lower = grad_fn_str.lower()
+    for key, fn in _mapping.items():
+        if key in grad_fn_lower:
+            return fn
+    return None
+
+
+def _compose_post_act(conv_node):
+    """Walk forward from conv node to find BN + activation, return composed callable or None.
+
+    Returns:
+        (post_act_fn, description_str) or (None, None)
+    """
+    from ..ops import _ElementWiseOp
+
+    bn_module = None
+    act_fn = None
+
+    # Walk immediate outputs of conv node
+    for out_node in conv_node.outputs:
+        mod = out_node.module
+        # Check for BatchNorm
+        if isinstance(mod, nn.modules.batchnorm._BatchNorm):
+            bn_module = mod
+            # Walk further from BN to find activation
+            for bn_out in out_node.outputs:
+                bn_out_mod = bn_out.module
+                if isinstance(bn_out_mod, _ElementWiseOp):
+                    act_fn = _grad_fn_to_activation(bn_out_mod._grad_fn)
+                    if act_fn is not None:
+                        break
+            break
+        # Check for direct activation (no BN)
+        if isinstance(mod, _ElementWiseOp):
+            act_fn = _grad_fn_to_activation(mod._grad_fn)
+            if act_fn is not None:
+                break
+
+    # Compose
+    if bn_module is not None and act_fn is not None:
+        def _composed(x, _bn=bn_module, _act=act_fn):
+            return _act(_bn(x))
+        return _composed
+    elif bn_module is not None:
+        return bn_module
+    elif act_fn is not None:
+        return act_fn
+    return None
+
+
+def build_cnn_target_layers(model, DG):
+    """Auto-detect target_layers for CNN VBP stats collection.
+
+    Walks DG forward from each Conv2d to find BN + activation,
+    composes them into post_act_fn for correct mean collection.
+
+    Args:
+        model: CNN model (e.g. torchvision ResNet, MobileNetV2)
+        DG: Built DependencyGraph with module2node populated
+
+    Returns:
+        list of (conv_module, post_act_fn) tuples
+    """
+    target_layers = []
+    for module, node in DG.module2node.items():
+        if not isinstance(module, nn.Conv2d):
+            continue
+        # Skip depthwise convolutions
+        if module.groups == module.out_channels and module.out_channels > 1:
+            continue
+        # Skip 1-channel convs (stems with groups=1 are fine, but 1-output is degenerate)
+        if module.out_channels == 1:
+            continue
+
+        post_act_fn = _compose_post_act(node)
+        target_layers.append((module, post_act_fn))
+
+    return target_layers
+
+
+def _is_bottleneck_resnet(model):
+    """Check if model uses Bottleneck blocks (ResNet-50/101/152)."""
+    try:
+        from torchvision.models.resnet import Bottleneck
+        return any(isinstance(m, Bottleneck) for m in model.modules())
+    except ImportError:
+        return False
+
+
+def _find_classifier(model):
+    """Find the classifier layer in a torchvision model."""
+    if hasattr(model, "fc") and isinstance(model.fc, nn.Linear):
+        return model.fc
+    if hasattr(model, "classifier"):
+        clf = model.classifier
+        if isinstance(clf, nn.Linear):
+            return clf
+        # MobileNetV2 classifier is nn.Sequential
+        if isinstance(clf, nn.Sequential):
+            return clf
+    return None
+
+
+def build_cnn_ignored_layers(model, architecture, interior_only=True):
+    """Build ignored_layers list for CNN VBP pruning.
+
+    Args:
+        model: torchvision model
+        architecture: e.g. "resnet50", "resnet18", "mobilenet_v2"
+        interior_only: If True, only prune interior block channels
+            (conv1/conv2 in Bottleneck, expand conv in MobileNetV2).
+            If False, prune all convs except stem+classifier.
+
+    Returns:
+        list of modules to ignore during pruning
+    """
+    ignored = []
+
+    # Always ignore classifier
+    clf = _find_classifier(model)
+    if clf is not None:
+        if isinstance(clf, nn.Sequential):
+            for m in clf.modules():
+                ignored.append(m)
+        else:
+            ignored.append(clf)
+
+    if architecture.startswith("resnet"):
+        # Stem conv
+        if hasattr(model, "conv1"):
+            ignored.append(model.conv1)
+
+        is_bottleneck = _is_bottleneck_resnet(model)
+
+        if interior_only and is_bottleneck:
+            # Bottleneck: ignore conv3 (output to residual stream) + all downsamples
+            from torchvision.models.resnet import Bottleneck
+            for m in model.modules():
+                if isinstance(m, Bottleneck):
+                    ignored.append(m.conv3)
+                    if m.downsample is not None:
+                        for sub in m.downsample.modules():
+                            if isinstance(sub, nn.Conv2d):
+                                ignored.append(sub)
+        elif interior_only and not is_bottleneck:
+            # BasicBlock: no true interior — same as full pruning but with downsample ignored
+            from torchvision.models.resnet import BasicBlock
+            for m in model.modules():
+                if isinstance(m, BasicBlock):
+                    if m.downsample is not None:
+                        for sub in m.downsample.modules():
+                            if isinstance(sub, nn.Conv2d):
+                                ignored.append(sub)
+        else:
+            # interior_only=False: only ignore stem+classifier+downsample convs
+            for name, m in model.named_modules():
+                if "downsample" in name and isinstance(m, nn.Conv2d):
+                    ignored.append(m)
+
+    elif architecture == "mobilenet_v2":
+        # Stem conv (first conv in features[0])
+        if hasattr(model, "features"):
+            for m in model.features[0].modules():
+                if isinstance(m, nn.Conv2d):
+                    ignored.append(m)
+
+        if interior_only:
+            # Ignore: projection convs (1x1 reduce) and DW convs
+            # In InvertedResidual, the conv sequence is:
+            #   expand 1x1 -> DW 3x3 -> project 1x1
+            # We want to keep only the expand conv
+            try:
+                from torchvision.models.mobilenetv2 import InvertedResidual
+            except ImportError:
+                from torchvision.models.mobilenet import InvertedResidual
+
+            for m in model.modules():
+                if isinstance(m, InvertedResidual):
+                    convs = [sub for sub in m.conv.modules() if isinstance(sub, nn.Conv2d)]
+                    for conv in convs:
+                        # DW conv: groups == out_channels
+                        if conv.groups == conv.out_channels and conv.out_channels > 1:
+                            ignored.append(conv)
+                        # Projection conv: last 1x1 (pointwise, groups=1, not the expand)
+                        elif conv.kernel_size == (1, 1) and conv == convs[-1]:
+                            ignored.append(conv)
+        else:
+            # Only ignore DW convs (can't resize them independently)
+            for m in model.modules():
+                if isinstance(m, nn.Conv2d):
+                    if m.groups == m.out_channels and m.out_channels > 1:
+                        ignored.append(m)
+
+    return ignored
