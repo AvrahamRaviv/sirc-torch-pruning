@@ -636,7 +636,7 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
         train_sampler.set_epoch(epoch)
 
     use_kd = args.use_kd and teacher is not None
-    use_l21 = fc1_modules is not None and args.sparse_mode == "l1_group"
+    use_l21 = fc1_modules is not None and getattr(args, 'sparse_mode', 'none') == "l1_group"
     use_var_loss = var_hooks is not None and getattr(args, 'var_loss_weight', 0) > 0
 
     total_loss = 0.0

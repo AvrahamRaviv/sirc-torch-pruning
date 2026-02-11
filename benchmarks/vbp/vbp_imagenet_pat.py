@@ -31,17 +31,12 @@ Usage:
 
 import argparse
 import copy
-import datetime
 import json
-import logging
 import os
 import sys
-import tempfile
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import torch_pruning as tp
@@ -52,14 +47,16 @@ try:
     from .vbp_imagenet import (
         build_dataloaders, load_model, forward_logits, validate,
         setup_distributed, cleanup, is_main, log_info, setup_logging,
-        build_ft_scheduler, VarianceConcentrationHooks, logger,
+        build_ft_scheduler, VarianceConcentrationHooks, train_one_epoch,
+        logger,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from vbp_imagenet import (
         build_dataloaders, load_model, forward_logits, validate,
         setup_distributed, cleanup, is_main, log_info, setup_logging,
-        build_ft_scheduler, VarianceConcentrationHooks, logger,
+        build_ft_scheduler, VarianceConcentrationHooks, train_one_epoch,
+        logger,
     )
 
 
@@ -124,72 +121,6 @@ def build_pruning_config(args, model, config_dir):
     log_info(f"  VBP layers: {len(layers)}, epoch_rate={epoch_rate}, "
              f"total_prune_rate={1.0 - args.keep_ratio:.3f}")
     return config_dir
-
-
-# ---------------------------------------------------------------------------
-# Training loop (simplified, with var loss support)
-# ---------------------------------------------------------------------------
-def train_one_epoch_pat(model, train_loader, train_sampler, optimizer,
-                        scheduler, device, epoch, args,
-                        teacher=None, step_per_batch=True,
-                        var_hooks=None):
-    """Training epoch with optional KD and variance concentration loss."""
-    model.train()
-    if train_sampler is not None:
-        train_sampler.set_epoch(epoch)
-
-    use_kd = args.use_kd and teacher is not None
-    use_var_loss = var_hooks is not None and args.var_loss_weight > 0
-
-    total_loss = 0.0
-    total_var = 0.0
-    num_batches = 0
-    total = len(train_loader)
-    log_interval = max(total // 20, 1)
-
-    for batch_idx, (images, labels) in enumerate(train_loader):
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        logits = forward_logits(model, images, args.model_type)
-        ce_loss = F.cross_entropy(logits, labels)
-
-        if use_kd:
-            with torch.no_grad():
-                teacher_logits = forward_logits(teacher, images, args.model_type)
-            kd_loss = F.kl_div(
-                F.log_softmax(logits / args.kd_T, dim=1),
-                F.softmax(teacher_logits / args.kd_T, dim=1),
-                reduction="batchmean"
-            ) * (args.kd_T ** 2)
-            loss = args.kd_alpha * ce_loss + (1 - args.kd_alpha) * kd_loss
-        else:
-            loss = ce_loss
-
-        if use_var_loss:
-            var_loss = var_hooks.compute_loss()
-            loss = loss + args.var_loss_weight * var_loss
-            total_var += var_loss.item()
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        if step_per_batch:
-            scheduler.step()
-
-        total_loss += loss.item()
-        num_batches += 1
-
-        if is_main() and (batch_idx % log_interval == 0 or batch_idx == total - 1):
-            avg_loss = total_loss / num_batches
-            parts = [f"loss={avg_loss:.4f}"]
-            if use_var_loss:
-                parts.append(f"var={total_var / num_batches:.4f}")
-            log_info(f"Epoch {epoch+1} [{batch_idx+1}/{total}] {' '.join(parts)}")
-
-    if not step_per_batch:
-        scheduler.step()
-    return total_loss / max(num_batches, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -300,11 +231,11 @@ def main():
             pruner.channel_pruner.reset_optimizer = False
 
         # Train
-        train_loss = train_one_epoch_pat(
+        train_loss = train_one_epoch(
             train_model, train_loader, train_sampler,
             optimizer, scheduler, device, epoch, args,
             teacher=teacher, step_per_batch=step_per_batch,
-            var_hooks=var_hooks,
+            phase="PAT", var_hooks=var_hooks,
         )
 
         # Validate
