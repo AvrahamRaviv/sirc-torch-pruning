@@ -361,6 +361,7 @@ class ChannelPruning:
             As of now it is kind of hard coded, will be replaced by self.channel_sparsity_args['cp_layers'] style (as in Slice Pruning)
         """
         self.calc_prune_rate()
+        self.ignored_layers = []  # Reset to prevent accumulation across calls
         ltp = self.layers_to_prune
         pruning_ratio_dict = {}
 
