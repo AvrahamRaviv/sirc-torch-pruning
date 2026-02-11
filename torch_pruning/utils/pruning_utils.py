@@ -20,6 +20,14 @@ Owners: Avraham Raviv, Ishay Goldin.
 """
 
 
+def _log(log, msg: str) -> None:
+    """Dispatch a message to a logger or stdout."""
+    if log is not None:
+        log.info(msg)
+    else:
+        print(msg)
+
+
 class Pruning:
     """
     High-level pruning interface combining channel and slice pruning.
@@ -33,10 +41,7 @@ class Pruning:
                 sparsity_args = json.load(f)
             channel_sa = sparsity_args['channel_sparsity_args']
             slice_sa = sparsity_args['slice_sparsity_args']
-            if log is not None:
-                log.info("=> Init pruner module")
-            else:
-                print("=> Init pruner module")
+            _log(log, "=> Init pruner module")
         except Exception as e:
             if os.path.exists(os.path.join(config_folder, "pruning_config.json")):
                 print("There is pruning_config.json in output folder, but it is failed with the following error:")
@@ -44,10 +49,7 @@ class Pruning:
             else:
                 print("There is no pruning_config.json in output folder")
             channel_sa, slice_sa = None, None
-            if log is not None:
-                log.info("=> Unable to find a valid pruning configuration.")
-            else:
-                print("=> Unable to find a valid pruning configuration.")
+            _log(log, "=> Unable to find a valid pruning configuration.")
 
         self.channel_pruner = channel_pruning(channel_sa, model, config_folder, forward_fn, log, device)
         self.slice_pruner = slice_pruning(slice_sa, model, log)
@@ -79,10 +81,7 @@ class channel_pruning:
                  device: Optional[torch.device] = None) -> None:
         self.channel_mask_dict: Dict[str, torch.Tensor] = {}
         if channel_sparsity_args is None:
-            if log is not None:
-                log.info("=> Unable to find a valid channel pruning configuration.")
-            else:
-                print("=> Unable to find a valid channel pruning configuration.")
+            _log(log, "=> Unable to find a valid channel pruning configuration.")
             self.prune_channels = False
             self.prune_channels_at_init = False
             self.reach_mac_target = False
@@ -208,54 +207,29 @@ class channel_pruning:
         self.pruner.update_regularizer()
 
         if self.verbose > 0:
-            if log is not None:
-                log.info(f"Epoch {self.current_epoch}, pruning progress:")
-                log.info(f"Pruning from epoch {self.start_epoch} to epoch {self.end_epoch}, with a current pruning rate of {self.current_pr:.3f}.")
-                log.info(f"Total target: {self.global_prune_rate}, Pruning algorithm: {self.channels_pruner_args['pruning_method']}.")
-                if self.channels_pruner_args["round_to"] > 1:
-                    log.info(f"Target round_to: {self.channels_pruner_args['round_to']}, Current round_to: {self.channels_pruner_args['current_round_to']}")
-                if print_layers:
-                    num_groups = 0
-                    source_convs = []
-                    _prunable = (torch.nn.Conv2d, torch.nn.Linear)
-                    log.info("*************")
-                    for group in self.pruner.DG.get_all_groups(ignored_layers=self.pruner.ignored_layers,
-                                                               root_module_types=self.pruner.root_module_types):
-                        log.info(f"Group {num_groups}:")
-                        log.info(f"Source layer: {group[0].dep.source.name}")
-                        source_convs.append(group[0].dep.source.name.split(" ")[0])
-                        if any([isinstance(_gt.dep.layer, _prunable) for _gt in group]):
-                            log.info(f"Dependencies:")
-                            for _g in group:
-                                if isinstance(_g.dep.layer, _prunable):
-                                    log.info(str(_g.dep)[str(_g.dep).index("=>") + 2:].strip())
-                        log.info("*************\n")
-                        num_groups += 1
-                    log.info(f"There are {num_groups} groups of layers, with the following source layers:\n{source_convs}")
-            else:
-                print(f"Epoch {self.current_epoch}, pruning progress:")
-                print(f"Pruning from epoch {self.start_epoch} to epoch {self.end_epoch}, with a current pruning rate of {self.current_pr:.3f}.")
-                print(f"Total target: {self.global_prune_rate}, Pruning algorithm: {self.channels_pruner_args['pruning_method']}.")
-                if self.channels_pruner_args["round_to"] > 1:
-                    print(f"Target round_to: {self.channels_pruner_args['round_to']}, Current round_to: {self.channels_pruner_args['current_round_to']}")
-                if print_layers:
-                    num_groups = 0
-                    source_convs = []
-                    _prunable = (torch.nn.Conv2d, torch.nn.Linear)
-                    print("*************")
-                    for group in self.pruner.DG.get_all_groups(ignored_layers=self.pruner.ignored_layers,
-                                                               root_module_types=self.pruner.root_module_types):
-                        print(f"Group {num_groups}:")
-                        print(f"Source layer: {group[0].dep.source.name}")
-                        source_convs.append(group[0].dep.source.name.split(" ")[0])
-                        if any([isinstance(_gt.dep.layer, _prunable) for _gt in group]):
-                            print(f"Dependencies:")
-                            for _g in group:
-                                if isinstance(_g.dep.layer, _prunable):
-                                    print(str(_g.dep)[str(_g.dep).index("=>") + 2:].strip())
-                        print("*************\n")
-                        num_groups += 1
-                    print(f"There are {num_groups} groups of layers, with the following source layers:\n{source_convs}")
+            _log(log, f"Epoch {self.current_epoch}, pruning progress:")
+            _log(log, f"Pruning from epoch {self.start_epoch} to epoch {self.end_epoch}, with a current pruning rate of {self.current_pr:.3f}.")
+            _log(log, f"Total target: {self.global_prune_rate}, Pruning algorithm: {self.channels_pruner_args['pruning_method']}.")
+            if self.channels_pruner_args["round_to"] > 1:
+                _log(log, f"Target round_to: {self.channels_pruner_args['round_to']}, Current round_to: {self.channels_pruner_args['current_round_to']}")
+            if print_layers:
+                num_groups = 0
+                source_convs = []
+                _prunable = (torch.nn.Conv2d, torch.nn.Linear)
+                _log(log, "*************")
+                for group in self.pruner.DG.get_all_groups(ignored_layers=self.pruner.ignored_layers,
+                                                           root_module_types=self.pruner.root_module_types):
+                    _log(log, f"Group {num_groups}:")
+                    _log(log, f"Source layer: {group[0].dep.source.name}")
+                    source_convs.append(group[0].dep.source.name.split(" ")[0])
+                    if any([isinstance(_gt.dep.layer, _prunable) for _gt in group]):
+                        _log(log, "Dependencies:")
+                        for _g in group:
+                            if isinstance(_g.dep.layer, _prunable):
+                                _log(log, str(_g.dep)[str(_g.dep).index("=>") + 2:].strip())
+                    _log(log, "*************\n")
+                    num_groups += 1
+                _log(log, f"There are {num_groups} groups of layers, with the following source layers:\n{source_convs}")
 
             # Viz graph
             tp.utils.visualize_graph(self.pruner.DG, self.config_folder, show_groups=True)
@@ -269,16 +243,10 @@ class channel_pruning:
         if not self.prune_channels:
             self.update_channel_mask_dict(model)
             if self.reach_mac_target and self.verbose > 0:
-                if log is not None:
-                    log.info(f" Model already reach {self.mac_target} MACs reduction")
-                    log.info(f" Pruning statistics:")
-                    for line in self.log_str.split("\n")[:-1]:
-                        log.info(f" {line}")
-                else:
-                    print(f" Model already reach {self.mac_target} MACs reduction")
-                    print(f" Pruning statistics:")
-                    for line in self.log_str.split("\n")[:-1]:
-                        print(f" {line}")
+                _log(log, f" Model already reach {self.mac_target} MACs reduction")
+                _log(log, " Pruning statistics:")
+                for line in self.log_str.split("\n")[:-1]:
+                    _log(log, f" {line}")
             return
         self.current_epoch = epoch
         self.log_str = ""
@@ -297,10 +265,7 @@ class channel_pruning:
                 self.pruner.step(interactive=False, enable_compensation=True)
                 self.pruner.disable_meancheck()
                 self.log_str += "VBP pruning with compensation applied\n"
-                if log is not None:
-                    log.info(" VBP pruning with compensation applied")
-                else:
-                    print(" VBP pruning with compensation applied")
+                _log(log, " VBP pruning with compensation applied")
             else:
                 for group in self.pruner.step(interactive=True):
                     dep, idxs = group[0]
@@ -312,10 +277,7 @@ class channel_pruning:
                         log_str = f"{pom[0]} {idxs_ratio_str} channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}."
                         if self.verbose > 1:
                             log_str += f" Indices of {pom[1]} channels are: {idxs}."
-                        if log is not None:
-                            log.info(f" {log_str}")
-                        else:
-                            print(f" {log_str}")
+                        _log(log, f" {log_str}")
                         self.log_str += f"{log_str}\n"
 
                         if mask_only:
@@ -323,10 +285,7 @@ class channel_pruning:
                         else:
                             group.prune(idxs[:len(idxs) - (len(idxs) % self.slice_block_size)])
         elif self.verbose > 0 and self.channels_pruner_args["reg"] > 0:
-            if log is not None:
-                log.info(f" Epoch {self.current_epoch}, regularization phase with alpha = {self.channels_pruner_args['reg']}")
-            else:
-                print(f" Epoch {self.current_epoch}, regularization phase with alpha = {self.channels_pruner_args['reg']}")
+            _log(log, f" Epoch {self.current_epoch}, regularization phase with alpha = {self.channels_pruner_args['reg']}")
 
         if is_vbp:
             # VBP physically prunes but supports iterative PAT — only stop after
@@ -341,10 +300,7 @@ class channel_pruning:
         # log MACs
         current_macs, total_macs = self.measure_macs_masked_model(model)
         if mask_only or self.prune_channels_at_init:
-            if log is not None:
-                log.info(f" Current MACs are {current_macs / total_macs:.3f}% of original model")
-            else:
-                print(f" Current MACs are {current_macs / total_macs:.3f}% of original model")
+            _log(log, f" Current MACs are {current_macs / total_macs:.3f}% of original model")
             if current_macs / total_macs < self.mac_target and self.prune_at_target:
                 self.reach_mac_target = True
                 # update the config file: 1. reach_mac_target, 2. logs of pruning
@@ -362,10 +318,7 @@ class channel_pruning:
                     json.dump(sparsity_args, file, indent=4)
 
         else:
-            if log is not None:
-                log.info(f" Model already reach {self.mac_target} MACs reduction")
-            else:
-                print(f" Model already reach {self.mac_target} MACs reduction")
+            _log(log, f" Model already reach {self.mac_target} MACs reduction")
 
     def regularize(self, model):
         # VBP does not use traditional regularization; var loss is handled externally
@@ -586,10 +539,7 @@ class channel_pruning:
 class slice_pruning:
     def __init__(self, slice_sparsity_args, model, log=None):
         if slice_sparsity_args is None:
-            if log is not None:
-                log.info("=> Unable to find a valid slice pruning configuration.")
-            else:
-                print("=> Unable to find a valid slice pruning configuration.")
+            _log(log, "=> Unable to find a valid slice pruning configuration.")
             self.prune_slices = False
             self.prune_slices_at_init = False
             self.block_size = 8
@@ -689,22 +639,19 @@ class slice_pruning:
         if not self.prune_slices:
             return
         if self.slice_sparsity_args["pruning_mode"] == "Unprune":
-            if log is not None:
-                log.info("Slice pruning disabled in Unprune mode")
+            _log(log, "Slice pruning disabled in Unprune mode")
             return
 
         pruning = (self.start_epoch <= self.current_epoch and self.current_epoch % self.epoch_rate == 0) or self.current_epoch >= self.end_epoch
 
         if not pruning:
-            if log is not None:
-                log.info("Slice pruning disabled in current epoch")
+            _log(log, "Slice pruning disabled in current epoch")
             return
         else:
             self.calc_prune_rate()
-            if log is not None:
-                log.info(f"Epoch {self.current_epoch}, slice pruning progress:")
-                log.info(f"Pruning from epoch {self.start_epoch} to epoch {self.end_epoch}, with a current pruning rate of {self.current_pr}.")
-                log.info(f"Total target: {self.prune_rate}.")
+            _log(log, f"Epoch {self.current_epoch}, slice pruning progress:")
+            _log(log, f"Pruning from epoch {self.start_epoch} to epoch {self.end_epoch}, with a current pruning rate of {self.current_pr}.")
+            _log(log, f"Total target: {self.prune_rate}.")
             # loop over layers and pruned them
             for name, param in model.named_parameters():
                 name = name.replace("module.", "")
@@ -736,12 +683,9 @@ class slice_pruning:
                     # revert ordering of filters
                     pruned_layer = pruned_layer.view(c_out, c_in, 3, 3)[revert_indices]
                     param.data = pruned_layer
-                    if log is not None:
-                        log_str = f"Mask {slices_mask.sum()} / {Slices.shape[0]} slices on {name}"
-                        log.info(f" {log_str}")
+                    _log(log, f" Mask {slices_mask.sum()} / {Slices.shape[0]} slices on {name}")
 
-        if log is not None:
-            log.info(f" Current slice sparsity: {self.calc_current_sparsity(model)}")
+        _log(log, f" Current slice sparsity: {self.calc_current_sparsity(model)}")
 
     def calc_current_sparsity(self, model):
         with torch.no_grad():
