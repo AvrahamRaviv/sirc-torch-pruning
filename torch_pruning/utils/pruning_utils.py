@@ -1,6 +1,5 @@
 import os
 import json
-import time
 from functools import partial
 from typing import Any, Dict, Optional, List
 import torch
@@ -307,7 +306,6 @@ class ChannelPruning:
                 config_path = os.path.join(self.config_folder, "pruning_config.json")
                 with open(config_path, "r") as f:
                     sparsity_args = json.load(f)
-                    time.sleep(5)
                 sparsity_args['channel_sparsity_args']['reach_mac_target'] = True
                 if self.prune_at_target:
                     self.log_str = self.log_str.replace("Mask", "Prune")
