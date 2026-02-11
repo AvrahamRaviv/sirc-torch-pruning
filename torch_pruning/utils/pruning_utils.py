@@ -88,8 +88,9 @@ class ChannelPruning:
                  config_folder: str, forward_fn: Any, log: Optional[Any] = None,
                  device: Optional[torch.device] = None) -> None:
         self.channel_mask_dict: Dict[str, torch.Tensor] = {}
+        self.log = log
         if channel_sparsity_args is None:
-            _log(log, "=> Unable to find a valid channel pruning configuration.")
+            _log(self.log, "=> Unable to find a valid channel pruning configuration.")
             self.prune_channels = False
             self.prune_channels_at_init = False
             self.reach_mac_target = False
@@ -156,6 +157,7 @@ class ChannelPruning:
         self.init_channel_pruner(model, log, print_layers=True)
 
     def init_channel_pruner(self, model, log=None, print_layers=False):
+        log = log or self.log
         # set layers to pruned and their pruning rate
         pruning_ratio_dict = self.set_layers_to_prune(model)
 
@@ -247,8 +249,9 @@ class ChannelPruning:
         """
             Prune the model
             We are supporting two modes: 1. Physically prune channels. 2. Mask with zeros.
-            It is handaled by mask_only flag.
+            It is handled by mask_only flag.
         """
+        log = log or self.log
         if not self.prune_channels:
             self.update_channel_mask_dict(model)
             if self.reach_mac_target and self.verbose > 0:
@@ -546,8 +549,9 @@ class ChannelPruning:
 
 class SlicePruning:
     def __init__(self, slice_sparsity_args, model, log=None):
+        self.log = log
         if slice_sparsity_args is None:
-            _log(log, "=> Unable to find a valid slice pruning configuration.")
+            _log(self.log, "=> Unable to find a valid slice pruning configuration.")
             self.prune_slices = False
             self.prune_slices_at_init = False
             self.block_size = 8
@@ -643,6 +647,7 @@ class SlicePruning:
         return SP_loss * self.reg  # * self.current_pr / self.prune_rate
 
     def prune(self, model, epoch, log=None):
+        log = log or self.log
         self.current_epoch = epoch
         if not self.prune_slices:
             return
