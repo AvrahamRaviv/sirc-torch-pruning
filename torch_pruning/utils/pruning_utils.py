@@ -1,5 +1,6 @@
 import os
 import json
+from enum import Enum
 from functools import partial
 from typing import Any, Dict, Optional, List
 import torch
@@ -25,6 +26,14 @@ def _log(log, msg: str) -> None:
         log.info(msg)
     else:
         print(msg)
+
+
+class PruningMethod(str, Enum):
+    """Supported channel-pruning methods (str mixin for JSON compat)."""
+    BN_SCALE = "BNScalePruner"
+    GROUP_NORM = "GroupNormPruner"
+    MAC_AWARE = "MACAwareImportance"
+    VBP = "VBP"
 
 
 class Pruning:
@@ -109,8 +118,9 @@ class ChannelPruning:
         self.log_str = self.channel_sparsity_args.get("log_str", None)
         self.prune_channels_at_init = self.channel_sparsity_args['prune_channels_at_init'] or self.infer
 
+        self.pruning_method = PruningMethod(self.channel_sparsity_args['pruning_method'])
         self.channels_pruner_args = {
-            "pruning_method": self.channel_sparsity_args['pruning_method'],
+            "pruning_method": self.pruning_method,
             "global_pruning": self.channel_sparsity_args['global_pruning'],
             "round_to": self.channel_sparsity_args['block_size'],
             "reg": self.channel_sparsity_args['regularize']['reg'],
@@ -150,19 +160,19 @@ class ChannelPruning:
         pruning_ratio_dict = self.set_layers_to_prune(model)
 
         # set pruning method
-        if self.channels_pruner_args['pruning_method'] == 'BNScalePruner':
+        if self.pruning_method == PruningMethod.BN_SCALE:
             imp = tp.importance.BNScaleImportance()
             pruner_entry = partial(tp.pruner.BNScalePruner, group_lasso=True)
-        elif self.channels_pruner_args['pruning_method'] == 'GroupNormPruner':
+        elif self.pruning_method == PruningMethod.GROUP_NORM:
             imp = tp.importance.GroupNormImportance(p=2, gamma=self.channels_pruner_args["gamma_reg"])
             pruner_entry = partial(tp.pruner.GroupNormPruner)
-        elif self.channels_pruner_args['pruning_method'] == 'MACAwareImportance':
+        elif self.pruning_method == PruningMethod.MAC_AWARE:
             L_MACs = {k: v[0] for k, v in self.MACs_per_layer.items()}
             imp = tp.importance.MACAwareImportance(p=2, layers_mac=L_MACs,
                                      params=self.channels_pruner_args["MAC_params"],
                                      current_max=self.max_imp_current_step)
             pruner_entry = partial(tp.pruner.GroupNormPruner)
-        elif self.channels_pruner_args['pruning_method'] == 'VBP':
+        elif self.pruning_method == PruningMethod.VBP:
             imp = tp.importance.VarianceImportance(
                 norm_per_layer=self._vbp_norm_per_layer)
             # Collect stats if train_loader is available and stats not yet collected
@@ -194,7 +204,7 @@ class ChannelPruning:
             isomorphic=self.channels_pruner_args["isomorphic"],
         )
         # VBPPruner/BasePruner doesn't accept reg; only pass for regularization-based pruners
-        if self.channels_pruner_args['pruning_method'] == 'VBP':
+        if self.pruning_method == PruningMethod.VBP:
             pruner_kwargs["verbose"] = self.verbose > 0
         else:
             pruner_kwargs["reg"] = self.channels_pruner_args["reg"]
@@ -249,7 +259,7 @@ class ChannelPruning:
             return
         self.current_epoch = epoch
         self.log_str = ""
-        is_vbp = self.channels_pruner_args['pruning_method'] == 'VBP'
+        is_vbp = self.pruning_method == PruningMethod.VBP
         if self.start_epoch <= epoch and (not is_vbp or epoch % self.epoch_rate == 0):
             self.current_step = step
             self.init_channel_pruner(model, log)
@@ -319,7 +329,7 @@ class ChannelPruning:
 
     def regularize(self, model):
         # VBP does not use traditional regularization; var loss is handled externally
-        if self.channels_pruner_args['pruning_method'] == 'VBP':
+        if self.pruning_method == PruningMethod.VBP:
             return
         if not self.prune_channels or self.channels_pruner_args["reg"] == 0 or self.current_epoch > self.end_epoch:
             return
@@ -385,7 +395,7 @@ class ChannelPruning:
                 continue
             # Linear layers: VBP prunes specific Linears, others ignore all
             if isinstance(m, torch.nn.Linear):
-                if self.channels_pruner_args['pruning_method'] == 'VBP' and name in ltp:
+                if self.pruning_method == PruningMethod.VBP and name in ltp:
                     pruning_ratio_dict[m] = self.current_pr
                 else:
                     self.ignored_layers.append(m)
@@ -524,7 +534,7 @@ class ChannelPruning:
         return None
 
     def update_max_imp(self):
-        if self.channels_pruner_args['pruning_method'] != 'MACAwareImportance':
+        if self.pruning_method != PruningMethod.MAC_AWARE:
             return
         self.pruner.importance.current_max = torch.ones_like(self.pruner.importance.current_max)
         for group in self.pruner.DG.get_all_groups(ignored_layers=self.pruner.ignored_layers,
