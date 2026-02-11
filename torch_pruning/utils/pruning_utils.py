@@ -51,8 +51,8 @@ class Pruning:
             channel_sa, slice_sa = None, None
             _log(log, "=> Unable to find a valid pruning configuration.")
 
-        self.channel_pruner = channel_pruning(channel_sa, model, config_folder, forward_fn, log, device)
-        self.slice_pruner = slice_pruning(slice_sa, model, log)
+        self.channel_pruner = ChannelPruning(channel_sa, model, config_folder, forward_fn, log, device)
+        self.slice_pruner = SlicePruning(slice_sa, model, log)
         # Synchronize slice block size and channel mask dictionary between pruners.
         self.channel_pruner.slice_block_size = self.slice_pruner.block_size
         self.slice_pruner.channel_mask_dict = self.channel_pruner.channel_mask_dict
@@ -72,7 +72,7 @@ class Pruning:
         self.slice_pruner.prune(model, epoch, log=log)
 
 
-class channel_pruning:
+class ChannelPruning:
     """
     Implements channel pruning using a chosen pruning method.
     """
@@ -535,7 +535,7 @@ class channel_pruning:
                 self.pruner.importance.current_max = torch.max(self.pruner.importance.current_max, imp.max())
 
 
-class slice_pruning:
+class SlicePruning:
     def __init__(self, slice_sparsity_args, model, log=None):
         if slice_sparsity_args is None:
             _log(log, "=> Unable to find a valid slice pruning configuration.")
@@ -741,3 +741,8 @@ def build_inputs(cfg, device):
     raise ValueError(
         "'inputs' must be [B,C,H,W] or a list of such shapes; "
         "use 'container': 'tuple' to return a tuple.")
+
+
+# Backward-compatible aliases (PEP 8: classes should use CapWords)
+channel_pruning = ChannelPruning
+slice_pruning = SlicePruning
