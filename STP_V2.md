@@ -206,6 +206,28 @@ Key challenges solved:
 - **Sparse pre-training** modes: `l1_group` (L2,1), `gmp` (Gradual Magnitude Pruning)
 - **Sweep mode**: Collect stats once, then test multiple keep ratios via `deepcopy` + `remap_importance()`
 
+### 2.5 Graph Visualization
+
+5 commits (`c9ce4fd` → `09661c7`) adding Graphviz-based visualization of the DependencyGraph and pruning groups.
+
+`torch_pruning/utils/visualization.py` provides 3 views via `visualize_all_views()`:
+
+- **Computational graph (CG)** — Data flow through the model (gray solid edges)
+- **Dependency graph (DG)** — Pruning coupling between layers (green dashed = direct, red dotted = force-shape-match)
+- **Combined** — Both overlaid with consistent node layout
+
+Key features:
+- **Group cluster boxes** — Nodes belonging to the same pruning group are wrapped in Graphviz `subgraph cluster` containers (`eafd5a7`)
+- **Color-coded nodes** — 12+ OPTYPE categories: Conv (blue), Linear (red), BN (green), ElementWise (yellow), etc.
+- **Multi-group detection** — Nodes appearing in multiple groups get double borders
+- **Consistent layout backbone** — All 3 views share the same computational edge layout (`constraint=true`) so node positions are stable across views
+- **ElementWise naming** — Maps `grad_fn` names to readable labels (Add, ReLU, GELU, etc.)
+- **Output formats:** PNG, SVG, PDF
+
+Legacy matplotlib heatmap functions (`draw_computational_graph`, `draw_groups`, `draw_dependency_graph`) remain in `torch_pruning/utils/utils.py`.
+
+Demo: `python examples/visualization/demo_improved_viz.py [--resnet] [--format svg]`
+
 ---
 
 ## 3. Key Source Files
@@ -217,6 +239,7 @@ Key challenges solved:
 | `torch_pruning/pruner/algorithms/vbp_pruner.py` | VBPPruner: bias compensation, BN variance update |
 | `torch_pruning/pruner/importance.py` | All importance criteria + `build_cnn_target_layers/ignored_layers` |
 | `torch_pruning/utils/pruning_utils.py` | `ChannelPruning`, `SlicePruning`, `PruningMethod` enum |
+| `torch_pruning/utils/visualization.py` | Graphviz-based DG/CG visualization with group clusters |
 | `benchmarks/vbp/vbp_imagenet.py` | Full PAT pipeline: sparse → PAT → FT, DDP, KD |
 | `benchmarks/vbp/sparse_utils.py` | `l21_regularization()`, `gmp_sparsity_schedule()`, `apply_unstructured_pruning()` |
 | `benchmarks/vbp/vbp_imagenet_pat.py` | Thin PAT demo via Pruning class |
