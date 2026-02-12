@@ -3,11 +3,12 @@ VBP (Variance-Based Pruning) ImageNet Reproduction Script
 
 This script reproduces results from the VBP paper using the integrated
 VarianceImportance class in Torch-Pruning, with DDP support.
+Supports multiple importance criteria for comparison (VBP, magnitude, LAMP, random).
 
 Reference: https://arxiv.org/pdf/2507.12988
 
 Usage:
-    # Single GPU (debug)
+    # Single GPU — VBP (default)
     python benchmarks/vbp/vbp_imagenet.py \
         --model_type vit \
         --model_name google/vit-base-patch16-224 \
@@ -15,6 +16,16 @@ Usage:
         --keep_ratio 0.65 \
         --global_pruning \
         --disable_ddp
+
+    # Single GPU — magnitude baseline
+    python benchmarks/vbp/vbp_imagenet.py \
+        --model_type vit \
+        --model_name google/vit-base-patch16-224 \
+        --data_path /path/to/imagenet \
+        --keep_ratio 0.65 \
+        --global_pruning \
+        --disable_ddp \
+        --criterion magnitude
 
     # Multi-GPU (DDP)
     torchrun --nproc_per_node=4 benchmarks/vbp/vbp_imagenet.py \
@@ -477,8 +488,22 @@ def run_sparse_pretraining(model, teacher, train_loader, train_sampler,
 # ---------------------------------------------------------------------------
 # Pruner setup
 # ---------------------------------------------------------------------------
+def build_importance(criterion, norm_per_layer=False):
+    """Map criterion string to importance object."""
+    if criterion == "variance":
+        return tp.importance.VarianceImportance(norm_per_layer=norm_per_layer)
+    elif criterion == "magnitude":
+        return tp.importance.MagnitudeImportance(p=2)
+    elif criterion == "lamp":
+        return tp.importance.LAMPImportance(p=2)
+    elif criterion == "random":
+        return tp.importance.RandomImportance()
+    else:
+        raise ValueError(f"Unknown criterion: {criterion}")
+
+
 def create_pruner(model, example_inputs, imp, args):
-    """Create VBPPruner with VarianceImportance and bias compensation."""
+    """Create pruner: VBPPruner for variance criterion, BasePruner for others."""
     ignored_layers = []
 
     if args.model_type == "vit":
@@ -519,18 +544,32 @@ def create_pruner(model, example_inputs, imp, args):
     else:
         output_transform = lambda out: out.sum()
 
-    pruner = tp.pruner.VBPPruner(
-        model,
-        example_inputs,
-        importance=imp,
-        global_pruning=args.global_pruning,
-        pruning_ratio=1.0 - args.keep_ratio,
-        max_pruning_ratio=getattr(args, 'max_pruning_ratio', 1.0),
-        ignored_layers=ignored_layers,
-        output_transform=output_transform,
-        mean_dict=imp.means,
-        verbose=is_main(),
-    )
+    is_vbp = getattr(args, 'criterion', 'variance') == 'variance'
+    if is_vbp:
+        pruner = tp.pruner.VBPPruner(
+            model,
+            example_inputs,
+            importance=imp,
+            global_pruning=args.global_pruning,
+            pruning_ratio=1.0 - args.keep_ratio,
+            max_pruning_ratio=getattr(args, 'max_pruning_ratio', 1.0),
+            ignored_layers=ignored_layers,
+            output_transform=output_transform,
+            mean_dict=imp.means,
+            verbose=is_main(),
+        )
+    else:
+        pruner = tp.pruner.BasePruner(
+            model,
+            example_inputs,
+            importance=imp,
+            global_pruning=args.global_pruning,
+            pruning_ratio=1.0 - args.keep_ratio,
+            max_pruning_ratio=getattr(args, 'max_pruning_ratio', 1.0),
+            ignored_layers=ignored_layers,
+            output_transform=output_transform,
+            verbose=is_main(),
+        )
 
     return pruner
 
@@ -554,27 +593,28 @@ def recalibrate_bn(model, loader, device):
     model.eval()
 
 
-def prune_model(model, pruner, device, example_inputs, enable_compensation=True):
+def prune_model(model, pruner, device, example_inputs,
+                enable_compensation=True, is_vbp=True):
     """
-    Apply VBP pruning with bias compensation.
-
-    VBPPruner.step() handles compensation internally:
-    1. Caches consumer inputs via forward hooks
-    2. For each group: compensates consumer bias, then prunes
+    Apply pruning. For VBP (is_vbp=True), uses bias compensation via VBPPruner.
+    For other criteria (is_vbp=False), uses BasePruner without compensation.
     """
-    if enable_compensation:
+    if is_vbp and enable_compensation:
         # Cache consumer inputs for compensation
         pruner.enable_meancheck(model)
         model.eval()
         with torch.no_grad():
             model(example_inputs)
 
-    # VBPPruner.step(interactive=False) applies compensation + prune per group
-    pruner.step(interactive=False, enable_compensation=enable_compensation)
+    if is_vbp:
+        pruner.step(interactive=False, enable_compensation=enable_compensation)
+    else:
+        pruner.step(interactive=False)
 
-    if enable_compensation:
+    if is_vbp and enable_compensation:
         pruner.disable_meancheck()
-    log_info(f"Pruning complete (compensation={'on' if enable_compensation else 'off'})")
+    log_info(f"Pruning complete (criterion={'VBP' if is_vbp else 'non-VBP'}, "
+             f"compensation={'on' if is_vbp and enable_compensation else 'off'})")
 
 
 # ---------------------------------------------------------------------------
@@ -862,8 +902,10 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
     per_step_keep = args.keep_ratio ** (1.0 / pat_steps)
     per_step_prune = 1.0 - per_step_keep
 
+    is_vbp = args.criterion == "variance"
     log_info(f"PAT: {pat_steps} steps, per_step_keep={per_step_keep:.4f}, "
-             f"epochs_per_step={epochs_per_step}, target_keep={args.keep_ratio}")
+             f"epochs_per_step={epochs_per_step}, target_keep={args.keep_ratio}, "
+             f"criterion={args.criterion}")
 
     # Track cumulative keep ratio for logging
     cumulative_keep = 1.0
@@ -874,25 +916,26 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
         log_info(f"PAT Step {step_i+1}/{pat_steps}")
         log_info(f"{'='*60}")
 
-        # 1. Collect fresh VBP stats on current model
-        imp = tp.importance.VarianceImportance(norm_per_layer=args.norm_per_layer)
-        collect_and_sync_stats(model, train_loader, device, imp, args)
+        # 1. Create importance and collect stats (VBP only)
+        imp = build_importance(args.criterion, norm_per_layer=args.norm_per_layer)
+        if is_vbp:
+            collect_and_sync_stats(model, train_loader, device, imp, args)
 
-        if is_main():
-            var_metrics = compute_variance_entropy(imp)
-            log_info(f"Variance — entropy={var_metrics['entropy']:.4f}, "
-                     f"cv={var_metrics['cv']:.4f}, gini={var_metrics['gini']:.4f}")
+            if is_main():
+                var_metrics = compute_variance_entropy(imp)
+                log_info(f"Variance — entropy={var_metrics['entropy']:.4f}, "
+                         f"cv={var_metrics['cv']:.4f}, gini={var_metrics['gini']:.4f}")
 
         # 2. Create pruner with per-step ratio
         step_args = argparse.Namespace(**vars(args))
         step_args.keep_ratio = per_step_keep
         pruner = create_pruner(model, example_inputs, imp, step_args)
 
-        # 3. Prune with compensation
-        enable_comp = not getattr(args, 'no_compensation', False)
+        # 3. Prune (compensation only for VBP)
+        enable_comp = is_vbp and not getattr(args, 'no_compensation', False)
         log_info(f"Pruning: per_step_prune={per_step_prune:.4f}")
         prune_model(model, pruner, device, example_inputs,
-                    enable_compensation=enable_comp)
+                    enable_compensation=enable_comp, is_vbp=is_vbp)
 
         # 3b. BN recalibration for CNNs (essential after structured pruning)
         if args.model_type == "cnn" and not getattr(args, 'no_recalib', False):
@@ -909,12 +952,12 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
             log_info(f"  cumulative_keep={cumulative_keep:.4f}, "
                      f"MACs={pruned_macs / 1e9:.2f}G, params={pruned_params / 1e6:.2f}M")
 
-        # 5. Per-step fine-tuning
+        # 5. Per-step fine-tuning (var_loss only for VBP)
         epoch_offset = step_i * epochs_per_step
         step_best = finetune(
             model, teacher, train_loader, train_sampler, val_loader,
             device, args, epochs=epochs_per_step, epoch_offset=epoch_offset,
-            phase=f"PAT-{step_i+1}", use_var_loss=True,
+            phase=f"PAT-{step_i+1}", use_var_loss=is_vbp,
         )
         best_acc = max(best_acc, step_best)
 
@@ -1080,6 +1123,9 @@ def parse_args():
                              help="Disable VBP bias compensation")
     prune_group.add_argument("--no_recalib", action="store_true",
                              help="Skip BN recalibration after pruning (CNN mode only)")
+    prune_group.add_argument("--criterion", default="variance",
+                             choices=["variance", "magnitude", "lamp", "random"],
+                             help="Importance criterion (variance=VBP, others use BasePruner)")
 
     # Fine-tuning
     ft_group = parser.add_argument_group("Fine-tuning")
