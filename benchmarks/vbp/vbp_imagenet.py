@@ -577,20 +577,30 @@ def create_pruner(model, example_inputs, imp, args):
 # ---------------------------------------------------------------------------
 # Pruning with VBP compensation
 # ---------------------------------------------------------------------------
-def recalibrate_bn(model, loader, device):
+def recalibrate_bn(model, loader, device, max_batches=100):
     """Reset and recalibrate BN running stats on the pruned model.
 
     Essential for CNNs after structured pruning. Needs 1000+ samples
     (MobileNetV2 needs ~5000 for full recovery).
+
+    Args:
+        max_batches: Max batches to use (default 100 ≈ 6400 samples at bs=64).
     """
     for m in model.modules():
         if isinstance(m, nn.BatchNorm2d):
             m.reset_running_stats()
     model.train()
+    total = min(max_batches, len(loader))
+    log_interval = max(total // 20, 1)
     with torch.no_grad():
-        for images, _ in loader:
+        for batch_idx, (images, _) in enumerate(loader):
+            if batch_idx >= max_batches:
+                break
             model(images.to(device, non_blocking=True))
+            if is_main() and (batch_idx % log_interval == 0 or batch_idx == total - 1):
+                log_info(f"BN recalib [{batch_idx+1}/{total}]")
     model.eval()
+    log_info(f"BN recalibration done ({total} batches)")
 
 
 def prune_model(model, pruner, device, example_inputs,
