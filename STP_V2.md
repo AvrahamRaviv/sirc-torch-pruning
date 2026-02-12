@@ -80,28 +80,42 @@ The **Pruner** (`BasePruner`) is the central class. Everything flows through it.
 
 ### 1.2 PAT (Pruning-Aware Training)
 
-PAT is a thin loop that calls the Pruner's methods. Sparse pre-training, pruning, and fine-tuning are all the same train loop — what happens each epoch is controlled by config.
+`ChannelPruning` wraps the Pruner and exposes two calls: `regularize()` and `prune()`. The IP's train loop is **unchanged** — just add these two calls, and the wrapper decides internally what to do based on current epoch and config (`start_epoch`, `end_epoch`, `epoch_rate`).
 
 ```
- PAT Loop (controlled by config: pat_steps, epochs_per_step, epochs_ft, ...)
- ===========================================================================
- |                                                                         |
- |  for step_i in range(pat_steps):                                        |
- |     |                                                                   |
- |     |  pruner.regularize(model, loss)   <-- during training if sparse   |
- |     |  train(epochs_per_step)           <-- same train loop always      |
- |     |  pruner.step()                    <-- structural pruning          |
- |     |                                                                   |
- |     +----> next step                                                    |
- |                                                                         |
- |  train(epochs_ft)                       <-- same train loop, post-prune |
- |                                                                         |
- ===========================================================================
+ IP's train loop (transparent — same loop for all epochs)
+ =========================================================
+
+ pruner = ChannelPruning(config, model, ...)      # init once
+
+ for epoch in range(total_epochs):
+     for batch in train_loader:
+         loss = model(batch)
+         loss.backward()
+         pruner.regularize(model)                  # <-- call 1
+         optimizer.step()
+
+     pruner.prune(model, epoch)                    # <-- call 2
+
+ =========================================================
+
+ What happens inside (decided by ChannelPruning based on epoch + config):
+
+ epoch < start_epoch          --> regularize: applies reg loss (L2,1 / GMP)
+                                  prune: no-op
+
+ epoch in pruning epochs      --> regularize: applies reg loss
+ (start..end, every epoch_rate)   prune: collect stats, pruner.step(),
+                                         structural channel removal
+
+ epoch > end_epoch            --> regularize: no-op
+                                  prune: no-op
+                                  (model trains normally = fine-tuning)
 ```
 
-**Geometric schedule:** each step keeps `per_step_keep = keep_ratio^(1/N)` channels, so after N steps the cumulative ratio equals the target.
+**Geometric schedule:** each pruning step keeps `per_step_keep = keep_ratio^(1/N)` channels, so after N steps the cumulative ratio equals the target.
 
-**One-shot** = `pat_steps=1`, `epochs_per_step=0`, `epochs_ft=N`.
+**One-shot** = `start_epoch == end_epoch`, single pruning step + remaining epochs as fine-tuning.
 
 ---
 

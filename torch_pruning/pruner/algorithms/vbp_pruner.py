@@ -11,11 +11,10 @@ from .. import function
 
 
 class VBPPruner(BasePruner):
-    def __init__(self, model, example_inputs, *args, mean_dict=None, var_dict=None, verbose=True, **kwargs):
+    def __init__(self, model, example_inputs, *args, mean_dict=None, verbose=True, **kwargs):
         super().__init__(model, example_inputs, *args, **kwargs)
         self.example_inputs = example_inputs
         self.mean_dict = mean_dict
-        self.var_dict = var_dict  # reserved for future BN variance correction
         self.verbose = verbose
 
         # mean-check state
@@ -25,10 +24,6 @@ class VBPPruner(BasePruner):
     @torch.no_grad()
     def set_mean_dict(self, mean_dict):
         self.mean_dict = mean_dict
-
-    @torch.no_grad()
-    def set_var_dict(self, var_dict):
-        self.var_dict = var_dict
 
     @torch.no_grad()
     def enable_meancheck(self, model):
@@ -139,7 +134,7 @@ class VBPPruner(BasePruner):
         NOTE on residual stream pruning (e.g. ResNet conv3 -> add -> next block):
         When pruning channels that feed through a residual add, the compensation
         uses the post-BN+ReLU mean of the pruned conv's output. This is an
-        approximation -- the true input to the consumer is (residual + conv_output),
+        approximation — the true input to the consumer is (residual + conv_output),
         but we only have the conv_output mean. Fine-tuning recovers this gap.
         Interior block pruning (conv1/conv2 in Bottleneck) is exact since there
         is no add node between the pruned conv and its consumer.
