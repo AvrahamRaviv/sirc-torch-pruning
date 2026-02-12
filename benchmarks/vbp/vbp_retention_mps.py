@@ -1,25 +1,17 @@
-"""VBP retention accuracy sweep on MPS / CPU / CUDA.
+"""VBP retention accuracy test for CNNs on MPS / CPU / CUDA.
 
-Tests the Torch-Pruning 1.6 integrated VBPPruner + VarianceImportance.
-
-Collects stats once, then sweeps pruning ratios 5%..50% (step 5%),
-reloading the original model for each ratio. Prints a running table
-and saves a comparison plot against paper Table 10 (DeiT-T).
+Tests VBPPruner + VarianceImportance on standard CNNs (ResNet, MobileNetV2).
+Uses validation data for both stats collection and evaluation (no train set needed).
 
 Usage:
-    # Sweep mode (default: 5% to 50%)
-    python benchmarks/vbp/vbp_retention_mps.py \
-        --model facebook/deit-tiny-patch16-224 --global_pruning --sweep
+    # ResNet-50 single ratio
+    python benchmarks/vbp/vbp_retention_mps.py --cnn_arch resnet50 --keep_ratio 0.65 --global_pruning
 
-    # Single ratio (original behavior)
-    python benchmarks/vbp/vbp_retention_mps.py \
-        --model facebook/deit-tiny-patch16-224 \
-        --keep_ratio 0.65 --global_pruning
+    # MobileNetV2 sweep
+    python benchmarks/vbp/vbp_retention_mps.py --cnn_arch mobilenet_v2 --global_pruning --sweep
 
-    # Quick debug sweep (500 images)
-    python benchmarks/vbp/vbp_retention_mps.py \
-        --model facebook/deit-tiny-patch16-224 --global_pruning --sweep \
-        --eval_samples 500 --stat_samples 500
+    # Quick debug (500 images)
+    python benchmarks/vbp/vbp_retention_mps.py --cnn_arch resnet50 --global_pruning --sweep --eval_samples 500 --stat_samples 500
 """
 
 import argparse
@@ -34,28 +26,9 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 import torch_pruning as tp
-from torch_pruning.pruner.importance import VarianceImportance
-from transformers import ViTForImageClassification
-from transformers.models.vit.modeling_vit import ViTSelfAttention
-
-
-# ---------------------------------------------------------------------------
-# Paper reference data: Table 10, DeiT-T (arxiv 2507.12988)
-# ---------------------------------------------------------------------------
-PAPER_DEIT_T = {
-    # prune_pct: (retention_acc, macs_G, params_M)
-    0:  (72.02, 1.26, 5.72),
-    5:  (71.67, 1.22, 5.54),
-    10: (70.95, 1.19, 5.36),
-    15: (70.05, 1.15, 5.18),
-    20: (68.87, 1.12, 5.01),
-    25: (67.37, 1.08, 4.83),
-    30: (64.76, 1.05, 4.65),
-    35: (61.12, 1.01, 4.48),
-    40: (55.64, 0.98, 4.30),
-    45: (49.77, 0.94, 4.12),
-    50: (39.58, 0.91, 3.94),
-}
+from torch_pruning.pruner.importance import (
+    VarianceImportance, build_cnn_ignored_layers, build_cnn_target_layers,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +45,7 @@ def get_device(force_cpu=False):
 
 
 # ---------------------------------------------------------------------------
-# Data loading
+# Data loading (val only)
 # ---------------------------------------------------------------------------
 def load_imagenet_val(args):
     import torchvision.transforms as T
@@ -85,26 +58,30 @@ def load_imagenet_val(args):
     ])
 
     if args.data_path and os.path.isdir(args.data_path):
-        from datasets import load_dataset
+        # Check for parquet files first
         parquets = [f for f in os.listdir(args.data_path)
                     if f.startswith("validation") and f.endswith(".parquet")]
         if parquets:
+            from datasets import load_dataset
             print(f"Loading {len(parquets)} validation parquet files from {args.data_path}")
             parquet_paths = [os.path.join(args.data_path, f) for f in sorted(parquets)]
             hf_ds = load_dataset("parquet", data_files=parquet_paths, split="train")
             dataset = HFImageNetDataset(hf_ds, transform=val_transform)
-            print(f"Loaded {len(dataset)} validation images")
         else:
+            # ImageFolder — look for val/ subdir or use as-is
             from torchvision.datasets import ImageFolder
-            print(f"Loading from local ImageFolder: {args.data_path}")
-            dataset = ImageFolder(args.data_path, transform=val_transform)
+            val_dir = os.path.join(args.data_path, "val")
+            if os.path.isdir(val_dir):
+                print(f"Loading from ImageFolder: {val_dir}")
+                dataset = ImageFolder(val_dir, transform=val_transform)
+            else:
+                print(f"Loading from ImageFolder: {args.data_path}")
+                dataset = ImageFolder(args.data_path, transform=val_transform)
     else:
-        print("Loading ImageNet-1k validation from HuggingFace...")
-        from datasets import load_dataset
-        hf_ds = load_dataset("ILSVRC/imagenet-1k", split="validation",
-                             trust_remote_code=True)
-        dataset = HFImageNetDataset(hf_ds, transform=val_transform)
-        print(f"Loaded {len(dataset)} validation images from HuggingFace")
+        raise ValueError(f"Data path not found: {args.data_path}. "
+                         "Provide --data_path to a dir with validation parquets or ImageFolder.")
+
+    print(f"Loaded {len(dataset)} validation images")
     return dataset
 
 
@@ -129,46 +106,41 @@ class HFImageNetDataset(torch.utils.data.Dataset):
 # Model loading
 # ---------------------------------------------------------------------------
 def load_model(args, device):
-    if args.model_type == "vit":
-        model = ViTForImageClassification.from_pretrained(args.model, local_files_only=True)
-        return model.to(device)
-    raise ValueError(f"Unknown model_type: {args.model_type}")
-
-
-def forward_logits(model, images):
-    out = model(images)
-    return out.logits if hasattr(out, "logits") else out
+    import torchvision.models as tv_models
+    model_map = {
+        "resnet18": tv_models.resnet18,
+        "resnet34": tv_models.resnet34,
+        "resnet50": tv_models.resnet50,
+        "resnet101": tv_models.resnet101,
+        "mobilenet_v2": tv_models.mobilenet_v2,
+    }
+    model_fn = model_map[args.cnn_arch]
+    weights = "DEFAULT" if args.pretrained else None
+    model = model_fn(weights=weights).to(device)
+    print(f"Loaded {args.cnn_arch} (pretrained={args.pretrained})")
+    return model
 
 
 # ---------------------------------------------------------------------------
-# ViT helpers for tp.pruner.VBPPruner
+# Evaluation
 # ---------------------------------------------------------------------------
-def build_vit_target_layers(model):
-    """Build (module, post_act_fn) pairs for post-GELU stats on fc1."""
-    blocks = model.vit.encoder.layer
-    return [
-        (block.intermediate.dense, block.intermediate.intermediate_act_fn)
-        for block in blocks
-    ]
+@torch.no_grad()
+def validate(model, loader, device):
+    model.eval()
+    correct = total = 0
+    for images, labels in tqdm(loader, desc="Evaluating", leave=False):
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        logits = model(images)
+        correct += (logits.argmax(1) == labels).sum().item()
+        total += images.size(0)
+    return correct / total
 
 
-def build_vit_ignored_layers(model):
-    """Ignore everything except fc1 (intermediate.dense) for MLP-only pruning."""
-    ignored = [model.classifier,
-               model.vit.embeddings.patch_embeddings.projection]
-    for block in model.vit.encoder.layer:
-        # Attention layers
-        ignored.append(block.attention.attention.query)
-        ignored.append(block.attention.attention.key)
-        ignored.append(block.attention.attention.value)
-        ignored.append(block.attention.output.dense)
-        # fc2 output channels are the residual stream — don't prune
-        ignored.append(block.output.dense)
-    return ignored
-
-
+# ---------------------------------------------------------------------------
+# Remap importance for deepcopy
+# ---------------------------------------------------------------------------
 def remap_importance(imp, orig_model, new_model):
-    """Remap VarianceImportance stats from orig_model modules to new_model modules."""
     orig_to_name = {m: n for n, m in orig_model.named_modules()}
     name_to_new = {n: m for n, m in new_model.named_modules()}
 
@@ -184,100 +156,31 @@ def remap_importance(imp, orig_model, new_model):
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Single-ratio prune
 # ---------------------------------------------------------------------------
-@torch.no_grad()
-def validate(model, loader, device):
+def recalibrate_bn(model, loader, device):
+    """Reset and recalibrate BN running stats on the pruned model.
+
+    Essential for CNNs after structured pruning. Needs 1000+ samples
+    (MobileNetV2 needs ~5000 for full recovery).
+    """
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.reset_running_stats()
+    model.train()
+    with torch.no_grad():
+        for images, _ in loader:
+            model(images.to(device, non_blocking=True))
     model.eval()
-    correct = total = 0
-    for images, labels in tqdm(loader, desc="Evaluating", leave=False):
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        logits = forward_logits(model, images)
-        correct += (logits.argmax(1) == labels).sum().item()
-        total += images.size(0)
-    return correct / total
 
 
-# ---------------------------------------------------------------------------
-# Table printing
-# ---------------------------------------------------------------------------
-def print_table(results, acc_orig):
-    header = (f"{'Prune%':>7} | {'Keep':>5} | {'Ours Ret%':>9} | "
-              f"{'Paper Ret%':>10} | {'Delta':>6} | "
-              f"{'MACs(G)':>7} | {'Paper':>6} | {'Params(M)':>9} | {'Paper':>6}")
-    sep = "-" * len(header)
-    print(f"\n{sep}")
-    print(f"  Original accuracy: {acc_orig*100:.2f}%")
-    print(f"  Paper baseline:    {PAPER_DEIT_T[0][0]:.2f}%")
-    print(sep)
-    print(header)
-    print(sep)
-    for pr, ret, macs, params in results:
-        paper = PAPER_DEIT_T.get(pr)
-        paper_ret = paper[0] if paper else None
-        paper_macs = paper[1] if paper else None
-        paper_params = paper[2] if paper else None
-        paper_str = f"{paper_ret:.2f}" if paper_ret is not None else "  —"
-        delta = f"{ret - paper_ret:+.2f}" if paper_ret is not None else "  —"
-        p_macs = f"{paper_macs:.2f}" if paper_macs is not None else "  —"
-        p_params = f"{paper_params:.2f}" if paper_params is not None else "  —"
-        print(f"  {pr:5d}% | {1-pr/100:.2f} | {ret:8.2f}% | "
-              f"{paper_str:>9}% | {delta:>6} | "
-              f"{macs:6.2f}G | {p_macs:>5}G | {params:7.2f}M | {p_params:>5}M")
-    print(sep)
-
-
-# ---------------------------------------------------------------------------
-# Plot generation
-# ---------------------------------------------------------------------------
-def save_plot(results, acc_orig, save_path):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    paper_prs = sorted(PAPER_DEIT_T.keys())
-    paper_rets = [PAPER_DEIT_T[pr][0] for pr in paper_prs]
-    ax.plot(paper_prs, paper_rets, "s--", color="#2196F3", linewidth=2,
-            markersize=7, label="Paper (Table 10)", zorder=3)
-
-    our_prs = [r[0] for r in results]
-    our_rets = [r[1] for r in results]
-    ax.plot(our_prs, our_rets, "o-", color="#FF5722", linewidth=2,
-            markersize=7, label="Ours (TP 1.6 VBPPruner)", zorder=4)
-
-    ax.axhline(y=acc_orig * 100, color="gray", linestyle=":", linewidth=1,
-               label=f"Original ({acc_orig*100:.1f}%)")
-
-    ax.set_xlabel("Pruning Ratio (%)", fontsize=13)
-    ax.set_ylabel("Retention Accuracy (%)", fontsize=13)
-    ax.set_title("VBP Retention — DeiT-T (TP 1.6 VBPPruner vs paper Table 10)", fontsize=14)
-    ax.set_xticks(range(0, 55, 5))
-    ax.set_ylim(30, 80)
-    ax.legend(fontsize=11, loc="lower left")
-    ax.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150)
-    plt.close(fig)
-    print(f"\nPlot saved to {save_path}")
-
-
-# ---------------------------------------------------------------------------
-# Single-ratio prune using tp.pruner.VBPPruner
-# ---------------------------------------------------------------------------
-def run_single(model, val_loader, device, args, imp, keep_ratio):
-    """Prune a fresh copy at keep_ratio using tp.pruner.VBPPruner."""
+def run_single(model, val_loader, stat_loader, device, args, imp, keep_ratio):
     model_copy = copy.deepcopy(model)
     example_inputs = torch.randn(1, 3, 224, 224).to(device)
 
-    # Remap importance stats to copy's module objects
     imp_mapped = remap_importance(imp, model, model_copy)
-
-    # Build pruner (MLP-only: ignore attention + embeddings + classifier)
-    ignored_layers = build_vit_ignored_layers(model_copy)
+    ignored_layers = build_cnn_ignored_layers(
+        model_copy, args.cnn_arch, interior_only=args.interior_only)
 
     pruner = tp.pruner.VBPPruner(
         model_copy,
@@ -285,14 +188,25 @@ def run_single(model, val_loader, device, args, imp, keep_ratio):
         importance=imp_mapped,
         global_pruning=args.global_pruning,
         pruning_ratio=1.0 - keep_ratio,
+        max_pruning_ratio=args.max_pruning_ratio,
         ignored_layers=ignored_layers,
-        output_transform=lambda out: out.logits.sum(),
-        mean_dict=imp_mapped.means,  # calibration means enable compensation
+        output_transform=lambda out: out.sum(),
+        mean_dict=imp_mapped.means,
     )
 
-    # Prune with compensation (uses calibration means directly, no hooks needed)
     model_copy.eval()
-    pruner.step(interactive=False, enable_compensation=True)
+    if not args.no_compensation:
+        pruner.enable_meancheck(model_copy)
+        with torch.no_grad():
+            model_copy(example_inputs)
+
+    pruner.step(interactive=False, enable_compensation=not args.no_compensation)
+
+    if not args.no_compensation:
+        pruner.disable_meancheck()
+
+    # Recalibrate BN running stats after pruning
+    recalibrate_bn(model_copy, stat_loader, device)
 
     pruned_macs, pruned_params = tp.utils.count_ops_and_params(model_copy, example_inputs)
     acc_ret = validate(model_copy, val_loader, device)
@@ -302,14 +216,33 @@ def run_single(model, val_loader, device, args, imp, keep_ratio):
 
 
 # ---------------------------------------------------------------------------
+# Table printing
+# ---------------------------------------------------------------------------
+def print_table(results, acc_orig):
+    header = (f"{'Prune%':>7} | {'Keep':>5} | {'Ret%':>9} | "
+              f"{'MACs(G)':>7} | {'Params(M)':>9}")
+    sep = "-" * len(header)
+    print(f"\n{sep}")
+    print(f"  Original accuracy: {acc_orig*100:.2f}%")
+    print(sep)
+    print(header)
+    print(sep)
+    for pr, ret, macs, params in results:
+        print(f"  {pr:5d}% | {1-pr/100:.2f} | {ret:8.2f}% | "
+              f"{macs:6.2f}G | {params:7.2f}M")
+    print(sep)
+
+
+# ---------------------------------------------------------------------------
 # Main logic
 # ---------------------------------------------------------------------------
 def run_vbp(model, val_dataset, device, args):
     example_inputs = torch.randn(1, 3, 224, 224).to(device)
 
     use_pin = (device.type == "cuda")
-    workers = args.num_workers if device.type != "mps" else 0
+    workers = 0 if device.type == "mps" else args.num_workers
 
+    # Split val data: first N for stats, rest (or all) for eval
     n_stat = min(args.stat_samples, len(val_dataset))
     stat_dataset = Subset(val_dataset, range(n_stat))
     stat_loader = DataLoader(
@@ -335,11 +268,12 @@ def run_vbp(model, val_dataset, device, args):
     acc_orig = validate(model, val_loader, device)
     print(f"Original accuracy: {acc_orig*100:.2f}%  ({time.time()-t0:.0f}s)")
 
-    # --- Collect post-GELU stats ONCE using tp.importance.VarianceImportance ---
+    # --- Collect stats using val data ---
     imp = VarianceImportance()
-    target_layers = build_vit_target_layers(model)
-    print(f"\nCollecting post-GELU activation statistics on {n_stat} samples "
-          f"({len(target_layers)} fc1 layers)...")
+    temp_DG = tp.DependencyGraph().build_dependency(model, example_inputs=example_inputs)
+    target_layers = build_cnn_target_layers(model, temp_DG)
+    print(f"\nCollecting activation statistics on {n_stat} val samples "
+          f"({len(target_layers)} target layers)...")
     t0 = time.time()
     imp.collect_statistics(model, stat_loader, device, target_layers=target_layers)
     print(f"Statistics collected for {len(imp.variance)} layers  ({time.time()-t0:.0f}s)")
@@ -354,7 +288,7 @@ def run_vbp(model, val_dataset, device, args):
             print(f"\n--- Pruning {pr}% (keep={keep_ratio:.2f}) ---")
             t0 = time.time()
             acc_ret, macs_g, params_m = run_single(
-                model, val_loader, device, args, imp, keep_ratio,
+                model, val_loader, stat_loader, device, args, imp, keep_ratio,
             )
             print(f"  Retention: {acc_ret*100:.2f}%  "
                   f"MACs: {macs_g:.2f}G  Params: {params_m:.2f}M  "
@@ -362,20 +296,17 @@ def run_vbp(model, val_dataset, device, args):
             results.append((pr, acc_ret * 100, macs_g, params_m))
             print_table(results, acc_orig)
 
-        plot_path = os.path.join(os.path.dirname(__file__), "vbp_sweep_deit_t.png")
-        save_plot(results, acc_orig, plot_path)
-
     else:
         # --- Single ratio mode ---
         prune_mode = "global" if args.global_pruning else "per_layer"
         print(f"\nPruning with keep_ratio={args.keep_ratio}, mode={prune_mode}...")
         acc_ret, macs_g, params_m = run_single(
-            model, val_loader, device, args, imp, args.keep_ratio,
+            model, val_loader, stat_loader, device, args, imp, args.keep_ratio,
         )
 
         print()
         print("=" * 62)
-        print(f"  Model:       {args.model}")
+        print(f"  Model:       {args.cnn_arch}")
         print(f"  Device:      {device}")
         print(f"  Keep ratio:  {args.keep_ratio}")
         print(f"  Mode:        {prune_mode}")
@@ -397,39 +328,43 @@ def run_vbp(model, val_dataset, device, args):
 # ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(
-        description="VBP retention accuracy test (MPS/CPU/CUDA) — uses tp.pruner.VBPPruner",
+        description="VBP retention test for CNNs (MPS/CPU/CUDA)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--model", default="/algo/NetOptimization/outputs/VBP/DeiT_tiny",
-                   help="HuggingFace model name")
-    p.add_argument("--model_type", default="vit", choices=["vit"])
-    p.add_argument("--data_path", default="../imagenet-1k-test/data",
-                   help="Path to parquet dir or ImageFolder")
-    p.add_argument("--keep_ratio", type=float, default=0.65,
-                   help="Keep ratio for single-ratio mode")
+    p.add_argument("--cnn_arch", default="resnet50",
+                   choices=["resnet18", "resnet34", "resnet50", "resnet101", "mobilenet_v2"])
+    p.add_argument("--pretrained", action="store_true", default=True)
+    p.add_argument("--interior_only", action="store_true", default=True)
+    p.add_argument("--data_path",
+                   default=os.path.expanduser("~/PycharmProjects/imagenet-1k-test/data"),
+                   help="Path to ImageNet val (parquet dir or ImageFolder)")
+    p.add_argument("--keep_ratio", type=float, default=0.65)
     p.add_argument("--global_pruning", action="store_true")
+    p.add_argument("--max_pruning_ratio", type=float, default=1.0,
+                   help="Max fraction of channels to prune per layer (e.g. 0.8 = keep at least 20%%)")
     p.add_argument("--sweep", action="store_true",
                    help="Sweep pruning ratios 5%%..50%% (step 5%%)")
     p.add_argument("--stat_samples", type=int, default=5000,
-                   help="Number of images for variance statistics")
+                   help="Number of val images for variance statistics")
     p.add_argument("--eval_samples", type=int, default=None,
                    help="Limit eval to N images (default: all)")
-    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--no_compensation", action="store_true",
+                   help="Disable VBP bias compensation (useful when DW convs lack calibration means)")
     p.add_argument("--cpu", action="store_true", help="Force CPU")
     return p.parse_args()
 
 
-def main(argv):
+def main():
     args = parse_args()
     device = get_device(force_cpu=args.cpu)
     print(f"Device: {device}")
 
     val_dataset = load_imagenet_val(args)
     model = load_model(args, device)
-    print(f"Loaded: {args.model}")
     run_vbp(model, val_dataset, device, args)
 
 
-if __name__ == '__main__':
-    main(sys.argv[1:])
+if __name__ == "__main__":
+    main()

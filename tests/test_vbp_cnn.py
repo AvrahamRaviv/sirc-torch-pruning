@@ -191,8 +191,9 @@ class TestIgnoredLayersResNet50All:
 
 
 class TestIgnoredLayersMobileNetV2:
-    def test_projection_and_dw_ignored(self, mobilenetv2_model):
-        """Projection convs and DW convs should be ignored, expand should not."""
+    def test_projection_ignored_dw_not(self, mobilenetv2_model):
+        """Projection convs should be ignored; DW convs must NOT be (they
+        participate in expand groups and would cause group rejection)."""
         ignored = build_cnn_ignored_layers(mobilenetv2_model, "mobilenet_v2", interior_only=True)
 
         try:
@@ -205,7 +206,9 @@ class TestIgnoredLayersMobileNetV2:
                 convs = [sub for sub in m.conv.modules() if isinstance(sub, nn.Conv2d)]
                 for conv in convs:
                     if conv.groups == conv.out_channels and conv.out_channels > 1:
-                        assert conv in ignored, "DW conv should be ignored"
+                        assert conv not in ignored, "DW conv must NOT be ignored"
+                    elif conv.kernel_size == (1, 1) and conv == convs[-1]:
+                        assert conv in ignored, "Projection conv should be ignored"
 
 
 # ---------------------------------------------------------------------------
