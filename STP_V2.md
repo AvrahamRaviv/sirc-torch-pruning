@@ -20,35 +20,59 @@ Torch-Pruning is built on four abstractions:
 | **BasePruner** | Orchestrates the pruning loop: `step()` → `_prune()` → iterate groups → compute importance → apply scope/threshold → `group.prune()`. Handles local/global ranking, iterative schedules, ignored layers, attention heads. | `torch_pruning/pruner/algorithms/base_pruner.py` |
 | **Group** | A list of `(Dependency, indices)` pairs representing coupled layers (e.g., Conv → BN → next Conv input channels). `group.prune()` applies the structural modification atomically. | `torch_pruning/dependency/graph.py` |
 
-<!-- TODO: Replace with hand-drawn diagram
-     Diagram 1: TP Core Flow
-     model + example_inputs → DG.build_dependency() → DG.get_all_groups()
-       → Importance(group) → 1-D scores → Scope/Threshold (local or global)
-       → group.prune() → Pruned Model
--->
-![TP Core Flow](docs/diagrams/tp_core_flow.png)
-
 **Key detail:** `_prune()` is a *generator*. It yields groups one at a time, allowing subclasses (e.g., `VBPPruner`) to apply corrections *before* calling `group.prune()` on each group.
 
 ### 1.2 PAT Pipeline
 
-The benchmark script (`benchmarks/vbp/vbp_imagenet.py`) wraps **any pruner + importance** in a three-phase pipeline:
-
-1. **Sparse Pre-training** *(optional)* — L2,1 group regularization or GMP (Gradual Magnitude Pruning) to induce structured sparsity before pruning.
-2. **Iterative PAT Loop** — `pat_steps` iterations of: collect importance stats → create pruner → `pruner.step()` → per-step fine-tune. The importance criterion and pruner type are configurable (Magnitude, Taylor, Variance, etc.).
-3. **Post-Prune Fine-Tuning** — Standard training to recover accuracy after all pruning steps.
+The benchmark script (`benchmarks/vbp/vbp_imagenet.py`) wraps **any pruner + importance** in a three-phase pipeline. The importance criterion and pruner type are configurable (Magnitude, Taylor, Variance, etc.).
 
 **Geometric schedule:** each step keeps `per_step_keep = keep_ratio^(1/N)` channels, so after N steps the cumulative ratio equals the target.
 
 **One-shot** = special case with `pat_steps=1`, `pat_epochs_per_step=0`, `epochs_ft=N`.
 
-<!-- TODO: Replace with hand-drawn diagram
-     Diagram 2: PAT Pipeline
-     Phase 1 (optional): Sparse pre-training (L2,1 / GMP) → train for epochs_sparse
-     Phase 2 (loop × pat_steps): Collect stats → Create pruner (per_step_keep) → pruner.step() → Per-step fine-tune → [loop back]
-     Phase 3: Fine-tune for epochs_ft → Final eval + save
--->
-![PAT Pipeline](docs/diagrams/pat_pipeline.png)
+```
+ PAT Pipeline
+ ============================================================================
+ |                                                                          |
+ |  Phase 1 (optional): Sparse Pre-training                                |
+ |  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~                                |
+ |    reg(model, imp)          # L2,1 / GMP regularization                  |
+ |    train(epochs_sparse)                                                  |
+ |                                                                          |
+ |  Phase 2: PAT Loop  (× pat_steps)                                       |
+ |  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~                                    |
+ |  for step_i in range(pat_steps):                                         |
+ |   |                                                                      |
+ |   |  1. Collect importance stats (forward hooks on calibration data)      |
+ |   |                                                                      |
+ |   |  2. Init Pruner                                                      |
+ |   |     +----------------------------------------------------------+     |
+ |   |     | Pruner (BasePruner / VBPPruner / ...)                    |     |
+ |   |     |                                                          |     |
+ |   |     |  __init__:                                               |     |
+ |   |     |    Build DG  (model + example_inputs --> dependency graph)|     |
+ |   |     |    Set schedule (per_step_keep, ignored_layers, scope)   |     |
+ |   |     |                                                          |     |
+ |   |     |  step() --> _prune():                                    |     |
+ |   |     |    for group in DG.get_all_groups():                     |     |
+ |   |     |      |                                                   |     |
+ |   |     |      +--> imp_criteria(group) --> 1-D scores             |     |
+ |   |     |      +--> scope / threshold (local or global)            |     |
+ |   |     |      +--> [VBP: bias compensation + BN var update]       |     |
+ |   |     |      +--> group.prune()                                  |     |
+ |   |     +----------------------------------------------------------+     |
+ |   |                                                                      |
+ |   |  3. Fine-tune (epochs_per_step)                                      |
+ |   |                                                                      |
+ |   +----> next step                                                       |
+ |                                                                          |
+ |  Phase 3: Post-Prune Fine-Tuning                                        |
+ |  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~                                        |
+ |    train(epochs_ft)                                                      |
+ |    eval --> save                                                         |
+ |                                                                          |
+ ============================================================================
+```
 
 ---
 
@@ -120,16 +144,6 @@ Extends `BasePruner` with three post-prune corrections applied *per group before
 1. **Bias compensation** — For each pruned channel, compute `delta_b = W[:, pruned] @ mu[pruned]` and add to consumer's bias. Handles Linear, Conv2d, and depthwise Conv2d consumers.
 2. **BN variance update** — Analytically corrects `running_var` of downstream BatchNorm using stored activation variances, avoiding the need for full recalibration.
 3. **Mean-check diagnostics** *(optional)* — Forward hooks measure per-channel mean shift before/after compensation for validation.
-
-<!-- TODO: Replace with hand-drawn diagram
-     Diagram 3: VBPPruner.step() — per group
-     _prune() yields group → mean_dict provided?
-       yes → _apply_compensation() (δb = W·μ) → var_dict provided?
-         yes → _update_consumer_bn_var() (analytical BN correction) → group.prune()
-         no  → group.prune()
-       no  → group.prune()
--->
-![VBPPruner Compensation Flow](docs/diagrams/vbp_compensation.png)
 
 #### CNN Support
 
