@@ -93,7 +93,6 @@ class ChannelPruning:
             _log(self.log, "=> Unable to find a valid channel pruning configuration.")
             self.prune_channels = False
             self.prune_channels_at_init = False
-            self.reach_mac_target = False
             return
 
         self.prune_channels = channel_sparsity_args.get('is_prune', True)
@@ -106,17 +105,13 @@ class ChannelPruning:
         if self.infer:
             self.example_inputs = (self.example_inputs[0][:, :1], self.example_inputs[0][:, :1])
         self.current_epoch: int = 0
-        self.current_step = None
-        self.current_pr: float = 0.0
         self.ignored_layers: List[Any] = []
         self.start_epoch: int = self.channel_sparsity_args['start_epoch']
         self.end_epoch: int = self.channel_sparsity_args['end_epoch']
         self.epoch_rate: int = self.channel_sparsity_args['epoch_rate']
-        self.global_prune_rate: float = self.channel_sparsity_args['global_prune_rate']
+        self.global_prune_rate: float = self.channel_sparsity_args.get('global_prune_rate', 0.0)
         self.layers_to_prune = self.channel_sparsity_args['layers']
         self.mac_target: float = self.channel_sparsity_args.get('mac_target', 0.0)
-        self.reach_mac_target = self.channel_sparsity_args.get("reach_mac_target", False)
-        self.log_str = self.channel_sparsity_args.get("log_str", None)
         self.prune_channels_at_init = self.channel_sparsity_args['prune_channels_at_init'] or self.infer
 
         self.pruning_method = PruningMethod(self.channel_sparsity_args['pruning_method'])
@@ -138,12 +133,9 @@ class ChannelPruning:
         self.init_channel_mask: Dict[Any, Any] = {}
         self.MACs_per_layer: Dict[str, List[float]] = {}
         self.channels_pruner_args["current_round_to"] = 1
-        _ = self.measure_macs_masked_model(model)
         self.config_folder = config_folder
         self.max_imp_current_step = torch.tensor(0.0, device=device)
         self.slice_block_size = None
-        self.prune_at_target = self.channel_sparsity_args.get("prune_at_target", False)
-        self.reset_optimizer = False
         self.verbose = self.channel_sparsity_args.get("verbose", 1)
 
         # VBP-specific state
@@ -153,6 +145,20 @@ class ChannelPruning:
         self._vbp_max_batches = self.channel_sparsity_args.get("max_batches", 200)
         self._vbp_var_loss_weight = self.channel_sparsity_args.get("var_loss_weight", 0.0)
         self._vbp_norm_per_layer = self.channel_sparsity_args.get("norm_per_layer", False)
+
+        # Build ignored_layers (needed before MAC estimation)
+        self.set_layers_to_prune(model)
+
+        # Compute iterative_steps from epoch schedule
+        self.iterative_steps = (self.end_epoch - self.start_epoch) // self.epoch_rate + 1
+
+        # If mac_target is set, compute channel ratio analytically
+        if self.mac_target > 0:
+            self.global_prune_rate = self._estimate_channel_ratio(model)
+            _log(log, f"MAC target {self.mac_target:.3f} -> channel prune rate {self.global_prune_rate:.4f}")
+
+        # Initial MAC measurement
+        _ = self.measure_macs_masked_model(model)
 
         self.init_channel_pruner(model, log, print_layers=True)
 
@@ -197,13 +203,14 @@ class ChannelPruning:
             example_inputs=self.example_inputs,
             importance=imp,
             ignored_layers=self.ignored_layers,
-            pruning_ratio=self.current_pr,
+            pruning_ratio=self.global_prune_rate,
             pruning_ratio_dict=pruning_ratio_dict if not self.channels_pruner_args["global_pruning"] else None,
             global_pruning=self.channels_pruner_args["global_pruning"],
             round_to=self.channels_pruner_args["current_round_to"],
             max_pruning_ratio=self.channels_pruner_args["max_pruning_rate"],
             forward_fn=self.model_forward_fn,
             isomorphic=self.channels_pruner_args["isomorphic"],
+            iterative_steps=self.iterative_steps,
         )
         # VBPPruner/BasePruner doesn't accept reg; only pass for regularization-based pruners
         if self.pruning_method == PruningMethod.VBP:
@@ -232,9 +239,10 @@ class ChannelPruning:
         self.pruner.update_regularizer()
 
         if self.verbose > 0:
-            _log(log, f"Epoch {self.current_epoch}, pruning progress:")
-            _log(log, f"Pruning from epoch {self.start_epoch} to epoch {self.end_epoch}, with a current pruning rate of {self.current_pr:.3f}.")
-            _log(log, f"Total target: {self.global_prune_rate}, Pruning algorithm: {self.channels_pruner_args['pruning_method']}.")
+            _log(log, f"Pruning setup: {self.iterative_steps} steps from epoch {self.start_epoch} to {self.end_epoch}")
+            _log(log, f"Target prune rate: {self.global_prune_rate:.3f}, Algorithm: {self.channels_pruner_args['pruning_method']}.")
+            if self.mac_target > 0:
+                _log(log, f"MAC target: {self.mac_target:.3f}")
             if self.channels_pruner_args["round_to"] > 1:
                 _log(log, f"Target round_to: {self.channels_pruner_args['round_to']}, Current round_to: {self.channels_pruner_args['current_round_to']}")
             if print_layers:
@@ -260,89 +268,80 @@ class ChannelPruning:
             tp.utils.visualize_graph(self.pruner.DG, self.config_folder, show_groups=True)
 
     def prune(self, model, epoch, log=None, mask_only=True, step=None):
-        """
-            Prune the model
-            We are supporting two modes: 1. Physically prune channels. 2. Mask with zeros.
-            It is handled by mask_only flag.
+        """Prune the model using TP's built-in iterative_steps.
+
+        Supports two modes: physical pruning (VBP) and mask-with-zeros.
+        The pruner is created once at init; each pruning epoch calls step().
         """
         log = log or self.log
         if not self.prune_channels:
             self.update_channel_mask_dict(model)
-            if self.reach_mac_target and self.verbose > 0:
-                _log(log, f" Model already reach {self.mac_target} MACs reduction")
-                _log(log, " Pruning statistics:")
-                for line in self.log_str.split("\n")[:-1]:
-                    _log(log, f" {line}")
             return
+
         self.current_epoch = epoch
-        self.log_str = ""
         is_vbp = self.pruning_method == PruningMethod.VBP
-        if self.start_epoch <= epoch and (not is_vbp or epoch % self.epoch_rate == 0):
-            self.current_step = step
-            self.init_channel_pruner(model, log)
-            self.update_max_imp()
 
-            if is_vbp:
-                # VBP: use VBPPruner.step() which handles compensation internally
-                self.pruner.enable_meancheck(model)
-                model.eval()
-                with torch.no_grad():
-                    model(self.example_inputs)
-                self.pruner.step(interactive=False, enable_compensation=True)
-                self.pruner.disable_meancheck()
-                self.log_str += "VBP pruning with compensation applied\n"
-                _log(log, " VBP pruning with compensation applied")
+        # Check if this is a pruning epoch
+        is_pruning_epoch = (
+            self.start_epoch <= epoch
+            and (epoch - self.start_epoch) % self.epoch_rate == 0
+        )
+
+        if not is_pruning_epoch:
+            if self.verbose > 0 and self.channels_pruner_args["reg"] > 0:
+                _log(log, f" Epoch {epoch}, regularization phase")
+            return
+
+        # Re-collect VBP stats before each step (critical for PAT correctness)
+        if is_vbp and self.train_loader is not None:
+            if self._vbp_model_type == "cnn":
+                target_layers = self._build_target_layers_from_dg(model, self.pruner.DG)
             else:
-                for group in self.pruner.step(interactive=True):
-                    dep, idxs = group[0]
-                    dep_str = str(dep)
-                    if len(idxs) > 0:
-                        mask_only = mask_only and not self.prune_channels_at_init and not self.reach_mac_target
-                        pom = ["Mask", "masked"] if mask_only else ["Prune", "pruned"]
-                        idxs_ratio_str = f"{len(idxs)} / {dep.target.module.weight.shape[0]}"
-                        log_str = f"{pom[0]} {idxs_ratio_str} channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}."
-                        if self.verbose > 1:
-                            log_str += f" Indices of {pom[1]} channels are: {idxs}."
-                        _log(log, f" {log_str}")
-                        self.log_str += f"{log_str}\n"
+                target_layers = self._build_target_layers(model)
+            self.vbp_importance.collect_statistics(
+                model, self.train_loader, self.device,
+                target_layers=target_layers,
+                max_batches=self._vbp_max_batches)
+            # mean_dict is same dict object → VBPPruner sees updates automatically
 
-                        if mask_only:
-                            self.mask_group(group)
-                        else:
-                            group.prune(idxs[:len(idxs) - (len(idxs) % self.slice_block_size)])
-        elif self.verbose > 0 and self.channels_pruner_args["reg"] > 0:
-            _log(log, f" Epoch {self.current_epoch}, regularization phase with alpha = {self.channels_pruner_args['reg']}")
+        self.update_max_imp()
 
         if is_vbp:
-            # VBP physically prunes but supports iterative PAT — only stop after
-            # all scheduled epochs are done (current_epoch >= end_epoch)
-            if self.current_epoch >= self.end_epoch:
-                self.prune_channels = False
-        elif self.prune_channels_at_init or not mask_only or self.reach_mac_target:
+            # VBP: physical pruning with bias compensation
+            self.pruner.enable_meancheck(model)
+            model.eval()
+            with torch.no_grad():
+                model(self.example_inputs)
+            self.pruner.step(interactive=False, enable_compensation=True)
+            self.pruner.disable_meancheck()
+            _log(log, " VBP pruning step complete")
+        else:
+            # Non-VBP: physical or mask pruning via interactive step
+            for group in self.pruner.step(interactive=True):
+                dep, idxs = group[0]
+                if len(idxs) > 0:
+                    use_mask = mask_only and not self.prune_channels_at_init
+                    if use_mask:
+                        self.mask_group(group)
+                    else:
+                        group.prune(idxs[:len(idxs) - (len(idxs) % self.slice_block_size)])
+
+                    if self.verbose > 0:
+                        dep_str = str(dep)
+                        pom = "Mask" if use_mask else "Prune"
+                        _log(log, f" {pom} {len(idxs)}/{dep.target.module.weight.shape[0]} "
+                                  f"channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}.")
+
+        # Check if all iterative steps are done
+        if self.pruner.current_step >= self.iterative_steps:
             self.prune_channels = False
 
         self.update_channel_mask_dict(model)
 
-        # log MACs
+        # Log MAC progress
         current_macs, total_macs = self.measure_macs_masked_model(model)
-        if mask_only or self.prune_channels_at_init:
-            _log(log, f" Current MACs are {current_macs / total_macs:.3f}% of original model")
-            if current_macs / total_macs < self.mac_target and self.prune_at_target:
-                self.reach_mac_target = True
-                # update the config file: 1. reach_mac_target, 2. logs of pruning
-                config_path = os.path.join(self.config_folder, "pruning_config.json")
-                with open(config_path, "r") as f:
-                    sparsity_args = json.load(f)
-                sparsity_args['channel_sparsity_args']['reach_mac_target'] = True
-                if self.prune_at_target:
-                    self.log_str = self.log_str.replace("Mask", "Prune")
-                    self.reset_optimizer = True
-                sparsity_args['channel_sparsity_args']['log_str'] = f"reach_mac_target at epoch {self.current_epoch}\n" + self.log_str
-                with open(config_path, 'w') as file:
-                    json.dump(sparsity_args, file, indent=4)
-
-        else:
-            _log(log, f" Model already reach {self.mac_target} MACs reduction")
+        _log(log, f" Step {self.pruner.current_step}/{self.iterative_steps}: "
+                  f"MACs = {current_macs / total_macs:.3f} of original")
 
     def regularize(self, model):
         # VBP does not use traditional regularization; var loss is handled externally
@@ -353,39 +352,12 @@ class ChannelPruning:
         self.update_max_imp()
         self.pruner.regularize(model, alpha=2 ** self.channels_pruner_args["alpha_shrinkage_reg"])
 
-    def calc_prune_rate(self):
-        """
-        Calculate the pruning rate by interpolating between the coarse epoch-level values
-        using the current step progress within the epoch.
-        """
-        if self.current_epoch < self.start_epoch:
-            self.current_pr = 0
-        elif self.current_epoch < self.end_epoch:
-            # Calculate total coarse updates (epochs where pruning is updated)
-            num_coarse_steps = sum([1 for i in range(self.start_epoch, self.end_epoch)
-                                   if i % self.epoch_rate == 0])
-            # Count how many coarse updates have occurred up to the beginning of the current epoch
-            current_coarse_index = sum([1 for i in range(self.start_epoch, self.current_epoch)
-                                       if i % self.epoch_rate == 0])
-            # Coarse pruning values at the current and next update points
-            prev_pr = self.global_prune_rate * current_coarse_index / num_coarse_steps
-            next_pr = self.global_prune_rate * (current_coarse_index + 1) / num_coarse_steps
-
-            if self.current_step is None:
-                self.current_pr = next_pr
-            else:
-                # Interpolate using the current step progress within the epoch
-                step_fraction = self.current_step[0] / self.current_step[1] if self.current_step[1] > 0 else 0
-                self.current_pr = prev_pr + step_fraction * (next_pr - prev_pr)
-        else:
-            self.current_pr = self.global_prune_rate
-
     def set_layers_to_prune(self, model):
+        """Build ignored_layers and per-layer pruning ratio dict.
+
+        The pruning ratio is self.global_prune_rate for all prunable layers.
+        TP's iterative_steps scheduler handles splitting it across steps.
         """
-            Function that setting layers to prune and their coresponding pruning rate
-            As of now it is kind of hard coded, will be replaced by self.channel_sparsity_args['cp_layers'] style (as in Slice Pruning)
-        """
-        self.calc_prune_rate()
         self.ignored_layers = []  # Reset to prevent accumulation across calls
         ltp = self.layers_to_prune
         pruning_ratio_dict = {}
@@ -396,7 +368,7 @@ class ChannelPruning:
             try:
                 if isinstance(m, (torch.ao.nn.qat.modules.conv.Conv2d, torch.ao.nn.intrinsic.qat.modules.conv_fused.ConvReLU2d)):
                     if name in ltp:
-                        pruning_ratio_dict[m] = self.current_pr
+                        pruning_ratio_dict[m] = self.global_prune_rate
                     else:
                         self.ignored_layers.append(m)
                     continue
@@ -413,7 +385,7 @@ class ChannelPruning:
             # Linear layers: VBP prunes specific Linears, others ignore all
             if isinstance(m, torch.nn.Linear):
                 if self.pruning_method == PruningMethod.VBP and name in ltp:
-                    pruning_ratio_dict[m] = self.current_pr
+                    pruning_ratio_dict[m] = self.global_prune_rate
                 else:
                     self.ignored_layers.append(m)
                 continue
@@ -425,7 +397,7 @@ class ChannelPruning:
                 continue
             # Check if the current layer should be pruned or ignored
             if name in ltp:
-                pruning_ratio_dict[m] = self.current_pr
+                pruning_ratio_dict[m] = self.global_prune_rate
             else:
                 self.ignored_layers.append(m)
 
