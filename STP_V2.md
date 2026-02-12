@@ -131,9 +131,11 @@ Previously on v1.5.1. We rebased onto upstream:
 | `e80127d` — v1.6.1 | Code style cleanup |
 | `a878886` | Internal version bumped to **2.0.0** for our fork |
 
-### 2.2 Pruning Utils Cleanup
+### 2.2 ChannelPruning Simplification
 
-10 commits (`21a4bdf` → `cba9bf4`) modernizing `torch_pruning/utils/pruning_utils.py`:
+Major refactor of `torch_pruning/utils/pruning_utils.py` — both code cleanup and an architectural simplification of the pruning schedule.
+
+#### Code Cleanup (`21a4bdf` → `cba9bf4`)
 
 - **PEP 8 class names:** `channel_pruning` → `ChannelPruning`, `slice_pruning` → `SlicePruning`
 - **`PruningMethod` enum** replacing magic strings for pruning types
@@ -142,6 +144,37 @@ Previously on v1.5.1. We rebased onto upstream:
   - `ignored_layers` accumulation bug in `set_layers_to_prune()` (`e3a381f`)
   - Hardcoded `'cuda'` device in `SlicePruning.regularize()` (`1022317`)
 - **Unit tests** added (`cba9bf4`)
+
+#### Iterative Scheduling Rewrite (`e1abe30`, `b288447`)
+
+Previously, `ChannelPruning.prune()` recreated the pruner every epoch via `init_channel_pruner()`, with custom rate computation (`calc_prune_rate()`), MAC-target flags (`reach_mac_target`, `prune_at_target`), optimizer resets, and JSON config writing. This was fragile and duplicated logic that TP already provides.
+
+**Now:** the pruner is created **once at `__init__`** with `iterative_steps=N`, and each pruning epoch simply calls `pruner.step()`. TP's built-in `linear_scheduler` splits the target ratio across steps automatically.
+
+```
+Before (v1):                          After (v2):
+─────────────                         ──────────
+__init__:                             __init__:
+  (nothing — deferred)                  iterative_steps = (end-start)//rate + 1
+                                        pruner = Pruner(model, iterative_steps=N)
+prune(epoch):
+  if pruning_epoch:                   prune(epoch):
+    calc_prune_rate()                   if pruning_epoch:
+    init_channel_pruner(model)            pruner.step()   # TP handles the ratio
+    pruner.step()
+```
+
+**Removed:** `calc_prune_rate()`, `reach_mac_target` flag, `prune_at_target` flag, `reset_optimizer` flag, per-epoch `init_channel_pruner()` call, JSON config writing.
+
+**Added:** `_estimate_channel_ratio(model)` — analytical MAC-target → channel-ratio conversion at init time. Classifies each layer's MACs as unpruned / 1-dim / 2-dim based on the dependency graph, then solves the resulting quadratic:
+
+```
+mac_target = (U + S1*q + S2*q²) / T    where q = 1-p (keep ratio)
+```
+
+- ViT (all 1-dim): linear solution `p = 1 - mac_target`
+- CNN (2-dim middle layers): quadratic formula
+- Called once at init; the pruner's `iterative_steps` handles splitting across steps
 
 ### 2.3 Transformer Support
 
@@ -217,6 +250,8 @@ Key challenges solved:
 - **Variance entropy loss** (optional `--var_loss_weight`) as auxiliary regularization
 - **Sparse pre-training** modes: `l1_group` (L2,1), `gmp` (Gradual Magnitude Pruning)
 - **Sweep mode**: Collect stats once, then test multiple keep ratios via `deepcopy` + `remap_importance()`
+- **Multi-criterion benchmarking** (`--criterion` flag, `c8b9883`) — supports `variance` (VBP), `magnitude`, `lamp`, and `random` importance criteria for controlled comparisons. VBP-specific logic (stats collection, compensation, var_loss) is gated on `criterion=variance`; all other paths use `BasePruner`
+- **SGD optimizer for fine-tuning** (`--opt_ft sgd`, `2d59e77`) — AdamW at low LR overfits on ResNet-50 and underperforms on MobileNetV2 for short fine-tuning. `--opt_ft sgd --lr_ft 0.01` matches the regime used in the official TP reproduction scripts (SGD, momentum=0.9). Configurable via `--momentum_ft`, `--wd_ft`
 
 ### 2.6 Graph Visualization
 
