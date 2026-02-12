@@ -147,13 +147,7 @@ class TestIgnoredLayersReset:
         cp = ChannelPruning.__new__(ChannelPruning)
         cp.ignored_layers = []
         cp.layers_to_prune = []  # prune nothing
-        cp.current_epoch = 0
-        cp.start_epoch = 0
-        cp.end_epoch = 5
-        cp.epoch_rate = 1
         cp.global_prune_rate = 0.3
-        cp.current_pr = 0.0
-        cp.current_step = None
         cp.channels_pruner_args = {"pruning_method": PruningMethod.GROUP_NORM}
         cp.pruning_method = PruningMethod.GROUP_NORM
 
