@@ -525,6 +525,7 @@ def create_pruner(model, example_inputs, imp, args):
         importance=imp,
         global_pruning=args.global_pruning,
         pruning_ratio=1.0 - args.keep_ratio,
+        max_pruning_ratio=getattr(args, 'max_pruning_ratio', 1.0),
         ignored_layers=ignored_layers,
         output_transform=output_transform,
         mean_dict=imp.means,
@@ -537,7 +538,23 @@ def create_pruner(model, example_inputs, imp, args):
 # ---------------------------------------------------------------------------
 # Pruning with VBP compensation
 # ---------------------------------------------------------------------------
-def prune_model(model, pruner, device, example_inputs):
+def recalibrate_bn(model, loader, device):
+    """Reset and recalibrate BN running stats on the pruned model.
+
+    Essential for CNNs after structured pruning. Needs 1000+ samples
+    (MobileNetV2 needs ~5000 for full recovery).
+    """
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.reset_running_stats()
+    model.train()
+    with torch.no_grad():
+        for images, _ in loader:
+            model(images.to(device, non_blocking=True))
+    model.eval()
+
+
+def prune_model(model, pruner, device, example_inputs, enable_compensation=True):
     """
     Apply VBP pruning with bias compensation.
 
@@ -545,17 +562,19 @@ def prune_model(model, pruner, device, example_inputs):
     1. Caches consumer inputs via forward hooks
     2. For each group: compensates consumer bias, then prunes
     """
-    # Cache consumer inputs for compensation
-    pruner.enable_meancheck(model)
-    model.eval()
-    with torch.no_grad():
-        model(example_inputs)
+    if enable_compensation:
+        # Cache consumer inputs for compensation
+        pruner.enable_meancheck(model)
+        model.eval()
+        with torch.no_grad():
+            model(example_inputs)
 
     # VBPPruner.step(interactive=False) applies compensation + prune per group
-    pruner.step(interactive=False, enable_compensation=True)
+    pruner.step(interactive=False, enable_compensation=enable_compensation)
 
-    pruner.disable_meancheck()
-    log_info("Pruning with VBP compensation complete")
+    if enable_compensation:
+        pruner.disable_meancheck()
+    log_info(f"Pruning complete (compensation={'on' if enable_compensation else 'off'})")
 
 
 # ---------------------------------------------------------------------------
@@ -870,8 +889,15 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
         pruner = create_pruner(model, example_inputs, imp, step_args)
 
         # 3. Prune with compensation
+        enable_comp = not getattr(args, 'no_compensation', False)
         log_info(f"Pruning: per_step_prune={per_step_prune:.4f}")
-        prune_model(model, pruner, device, example_inputs)
+        prune_model(model, pruner, device, example_inputs,
+                    enable_compensation=enable_comp)
+
+        # 3b. BN recalibration for CNNs (essential after structured pruning)
+        if args.model_type == "cnn" and not getattr(args, 'no_recalib', False):
+            log_info("Recalibrating BN running stats...")
+            recalibrate_bn(model, train_loader, device)
 
         cumulative_keep *= per_step_keep
 
@@ -1046,8 +1072,14 @@ def parse_args():
                              help="Ratio of channels to keep (1 - pruning_ratio)")
     prune_group.add_argument("--global_pruning", action="store_true",
                              help="Use global pruning across all layers")
+    prune_group.add_argument("--max_pruning_ratio", type=float, default=1.0,
+                             help="Max fraction of channels to prune per layer (e.g. 0.8 = keep at least 20%%)")
     prune_group.add_argument("--norm_per_layer", action="store_true",
                              help="Normalize variance per layer")
+    prune_group.add_argument("--no_compensation", action="store_true",
+                             help="Disable VBP bias compensation")
+    prune_group.add_argument("--no_recalib", action="store_true",
+                             help="Skip BN recalibration after pruning (CNN mode only)")
 
     # Fine-tuning
     ft_group = parser.add_argument_group("Fine-tuning")
