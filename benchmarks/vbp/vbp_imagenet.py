@@ -306,8 +306,10 @@ def load_model(args, device):
             "mobilenet_v2": tv_models.mobilenet_v2,
         }
         model_fn = model_map[args.cnn_arch]
-        weights = "DEFAULT" if args.pretrained else None
-        model = model_fn(weights=weights).to(device)
+        model = model_fn(pretrained=False)
+        state = torch.load(args.model_name, map_location='cpu', weights_only=True)
+        model.load_state_dict(state, strict=True)
+        model = model.to(device)
         log_info(f"Loaded {args.cnn_arch} (pretrained={args.pretrained})")
 
     else:
