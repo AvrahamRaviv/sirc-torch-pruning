@@ -9,70 +9,99 @@
 
 ## 1. High-Level Design
 
-### 1.1 TP Core Architecture
+### 1.1 The Pruner
 
-Torch-Pruning is built on four abstractions:
+The **Pruner** (`BasePruner`) is the central class. Everything flows through it.
 
-| Abstraction | Role | Key file |
-|---|---|---|
-| **DependencyGraph (DG)** | Traces a model with dummy inputs, builds a dependency graph, and yields *pruning groups* — sets of layers whose channels are coupled and must be pruned together. | `torch_pruning/dependency/graph.py` |
-| **Importance** | Callable that scores channels within a group: `__call__(group) -> 1-D tensor`. Implementations: Magnitude, Taylor, Hessian, BNScale, LAMP, Random, MACAwere, Variance. | `torch_pruning/pruner/importance.py` |
-| **BasePruner** | Orchestrates the pruning loop: `step()` → `_prune()` → iterate groups → compute importance → apply scope/threshold → `group.prune()`. Handles local/global ranking, iterative schedules, ignored layers, attention heads. | `torch_pruning/pruner/algorithms/base_pruner.py` |
-| **Group** | A list of `(Dependency, indices)` pairs representing coupled layers (e.g., Conv → BN → next Conv input channels). `group.prune()` applies the structural modification atomically. | `torch_pruning/dependency/graph.py` |
+```
+                                                   Importance Criteria
+                                                   (pluggable)
+                                                   ~~~~~~~~~~~~~~~~~~~
+                                                   | Magnitude       |
+                                                   | Taylor          |
+     model                                         | Hessian         |
+     example_inputs          pruning_ratio         | Variance (VBP)  |
+     ignored_layers          global/local          | MACAware        |
+         |                   iterative_steps       | LAMP, BNScale...|
+         |                       |                  ~~~~~~~~~~~~~~~~~~~
+         v                       v                          |
+ +=====================================================+    |
+ | Pruner (BasePruner / VBPPruner / ...)               |    |
+ |                                                     |    |
+ |  __init__(model, example_inputs, importance, ...)   |    |
+ |     |                                               |    |
+ |     +---> DG = DependencyGraph.build(model)         |    |
+ |           (traces forward pass, builds dep graph)   |    |
+ |                                                     |    |
+ |  4 public methods:                                  |    |
+ |  ~~~~~~~~~~~~~~~~~                                  |    |
+ |                                                     |    |
+ |  step()                                             |    |
+ |     |                                               |    |
+ |     +--> _prune():                                  |    |
+ |           for group in DG.get_all_groups():         |    |
+ |              |                                      |    |
+ |              +--> importance(group) ----plugged in---+----+
+ |              |         |
+ |              |         v
+ |              |    1-D scores per channel
+ |              |         |
+ |              +--> scope + threshold (local or global)
+ |              |         |
+ |              |         v
+ |              |    indices to prune
+ |              |         |
+ |              +--> [subclass hook: VBP compensation]
+ |              |         |
+ |              +--> group.prune()
+ |                   (structurally removes channels)
+ |                                                     |
+ |  estimate_importance(group) --> 1-D tensor          |
+ |     (calls importance(group), used for analysis)    |
+ |                                                     |
+ |  regularize(model, loss) --> reg_loss               |
+ |     (sparse training: L2,1 / GMP during training)   |
+ |                                                     |
+ |  manual_prune_width(layer, fn, ratio_or_idxs)      |
+ |     (prune a specific layer directly)               |
+ |                                                     |
+ +=====================================================+
+         |
+         v
+     Pruned model (fewer channels, smaller weights)
+```
 
-**Key detail:** `_prune()` is a *generator*. It yields groups one at a time, allowing subclasses (e.g., `VBPPruner`) to apply corrections *before* calling `group.prune()` on each group.
+**Key abstractions inside the Pruner:**
 
-### 1.2 PAT Pipeline
+- **DependencyGraph (DG)** — Traces the model once at init. Yields *groups*: sets of coupled layers that must be pruned together (e.g., Conv -> BN -> next Conv). See `torch_pruning/dependency/graph.py`.
+- **Group** — A list of `(Dependency, indices)` pairs. `group.prune()` applies the structural cut atomically across all coupled layers.
+- **Importance** — The pluggable criterion. Any callable `(group) -> 1-D tensor`. Swapped at init time. This is where Magnitude vs Taylor vs Variance etc. differ.
+- **`_prune()` is a generator** — yields groups one at a time, so subclasses (e.g., `VBPPruner`) can intercept each group to apply corrections *before* `group.prune()`.
 
-The benchmark script (`benchmarks/vbp/vbp_imagenet.py`) wraps **any pruner + importance** in a three-phase pipeline. The importance criterion and pruner type are configurable (Magnitude, Taylor, Variance, etc.).
+### 1.2 PAT (Pruning-Aware Training)
+
+PAT is a thin loop that calls the Pruner's methods. Sparse pre-training, pruning, and fine-tuning are all the same train loop — what happens each epoch is controlled by config.
+
+```
+ PAT Loop (controlled by config: pat_steps, epochs_per_step, epochs_ft, ...)
+ ===========================================================================
+ |                                                                         |
+ |  for step_i in range(pat_steps):                                        |
+ |     |                                                                   |
+ |     |  pruner.regularize(model, loss)   <-- during training if sparse   |
+ |     |  train(epochs_per_step)           <-- same train loop always      |
+ |     |  pruner.step()                    <-- structural pruning          |
+ |     |                                                                   |
+ |     +----> next step                                                    |
+ |                                                                         |
+ |  train(epochs_ft)                       <-- same train loop, post-prune |
+ |                                                                         |
+ ===========================================================================
+```
 
 **Geometric schedule:** each step keeps `per_step_keep = keep_ratio^(1/N)` channels, so after N steps the cumulative ratio equals the target.
 
-**One-shot** = special case with `pat_steps=1`, `pat_epochs_per_step=0`, `epochs_ft=N`.
-
-```
- PAT Pipeline
- ============================================================================
- |                                                                          |
- |  Phase 1 (optional): Sparse Pre-training                                |
- |  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~                                |
- |    reg(model, imp)          # L2,1 / GMP regularization                  |
- |    train(epochs_sparse)                                                  |
- |                                                                          |
- |  Phase 2: PAT Loop  (× pat_steps)                                       |
- |  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~                                    |
- |  for step_i in range(pat_steps):                                         |
- |   |                                                                      |
- |   |  1. Collect importance stats (forward hooks on calibration data)      |
- |   |                                                                      |
- |   |  2. Init Pruner                                                      |
- |   |     +----------------------------------------------------------+     |
- |   |     | Pruner (BasePruner / VBPPruner / ...)                    |     |
- |   |     |                                                          |     |
- |   |     |  __init__:                                               |     |
- |   |     |    Build DG  (model + example_inputs --> dependency graph)|     |
- |   |     |    Set schedule (per_step_keep, ignored_layers, scope)   |     |
- |   |     |                                                          |     |
- |   |     |  step() --> _prune():                                    |     |
- |   |     |    for group in DG.get_all_groups():                     |     |
- |   |     |      |                                                   |     |
- |   |     |      +--> imp_criteria(group) --> 1-D scores             |     |
- |   |     |      +--> scope / threshold (local or global)            |     |
- |   |     |      +--> [VBP: bias compensation + BN var update]       |     |
- |   |     |      +--> group.prune()                                  |     |
- |   |     +----------------------------------------------------------+     |
- |   |                                                                      |
- |   |  3. Fine-tune (epochs_per_step)                                      |
- |   |                                                                      |
- |   +----> next step                                                       |
- |                                                                          |
- |  Phase 3: Post-Prune Fine-Tuning                                        |
- |  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~                                        |
- |    train(epochs_ft)                                                      |
- |    eval --> save                                                         |
- |                                                                          |
- ============================================================================
-```
+**One-shot** = `pat_steps=1`, `epochs_per_step=0`, `epochs_ft=N`.
 
 ---
 
