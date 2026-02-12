@@ -205,9 +205,8 @@ def run_single(model, val_loader, stat_loader, device, args, imp, keep_ratio):
     if not args.no_compensation:
         pruner.disable_meancheck()
 
-    # Recalibrate BN running stats after pruning (unless --no_recalib)
-    if not args.no_recalib:
-        recalibrate_bn(model_copy, stat_loader, device)
+    # Recalibrate BN running stats after pruning
+    recalibrate_bn(model_copy, stat_loader, device)
 
     pruned_macs, pruned_params = tp.utils.count_ops_and_params(model_copy, example_inputs)
     acc_ret = validate(model_copy, val_loader, device)
@@ -284,8 +283,6 @@ def run_vbp(model, val_dataset, device, args):
         prune_pcts = list(range(5, 55, 5))
         results = []
 
-        print(f"Config: compensation={not args.no_compensation}, bn_recalib={not args.no_recalib}")
-
         for pr in prune_pcts:
             keep_ratio = 1.0 - pr / 100.0
             print(f"\n--- Pruning {pr}% (keep={keep_ratio:.2f}) ---")
@@ -313,8 +310,6 @@ def run_vbp(model, val_dataset, device, args):
         print(f"  Device:      {device}")
         print(f"  Keep ratio:  {args.keep_ratio}")
         print(f"  Mode:        {prune_mode}")
-        print(f"  Compensate:  {not args.no_compensation}")
-        print(f"  BN recalib:  {not args.no_recalib}")
         print(f"  Stat samples:{n_stat}")
         print("-" * 62)
         print(f"  MACs:        {base_macs/1e9:.2f}G  ->  {macs_g:.2f}G  "
@@ -357,8 +352,6 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--no_compensation", action="store_true",
                    help="Disable VBP bias compensation (useful when DW convs lack calibration means)")
-    p.add_argument("--no_recalib", action="store_true",
-                   help="Skip BN recalibration after pruning (test compensation in isolation)")
     p.add_argument("--cpu", action="store_true", help="Force CPU")
     return p.parse_args()
 
