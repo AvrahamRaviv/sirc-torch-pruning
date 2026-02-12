@@ -104,12 +104,12 @@ def build_pruning_config(args, model, config_dir):
             "end_epoch": args.epochs - 1,
             "epoch_rate": epoch_rate,
             "global_prune_rate": 1.0 - args.keep_ratio,
+            "mac_target": args.keep_ratio if args.mac_target else 0.0,
             "max_pruning_rate": 0.95,
             "prune_channels_at_init": False,
             "infer": False,
             "input_shape": [1, 3, 224, 224],
             "layers": layers,
-            "mac_target": 0.0,
             "regularize": {"reg": 0, "mac_reg": 0},
             "MAC_params": {},
             # VBP-specific
@@ -129,7 +129,7 @@ def build_pruning_config(args, model, config_dir):
 
     log_info(f"Pruning config written to {config_path}")
     log_info(f"  VBP layers: {len(layers)}, epoch_rate={epoch_rate}, "
-             f"total_prune_rate={1.0 - args.keep_ratio:.3f}")
+             f"keep_ratio={args.keep_ratio:.3f}, mac_target={'yes' if args.mac_target else 'no'}")
     return config_dir
 
 
@@ -229,6 +229,7 @@ def main():
         dist.barrier()
 
     best_acc = 0.0
+    prev_step = 0  # Track pruner step count for DDP rebuild detection
     for epoch in range(args.epochs):
         # Prune via Pruning class (handles epoch_rate scheduling internally)
         # Must prune on unwrapped model
@@ -236,7 +237,9 @@ def main():
         pruner.prune(eval_model, epoch, log=logger, mask_only=False)
 
         # Re-wrap in DDP if pruning changed the model structure
-        if use_ddp and pruner.channel_pruner.reset_optimizer:
+        cur_step = pruner.channel_pruner.pruner.current_step if pruner.channel_pruner.pruner else 0
+        if use_ddp and cur_step > prev_step:
+            prev_step = cur_step
             del train_model
             train_model = DDP(model, device_ids=[args.local_rank],
                               output_device=args.local_rank)
@@ -244,7 +247,6 @@ def main():
                                           lr=args.lr, weight_decay=0.01)
             scheduler, step_per_batch = build_ft_scheduler(
                 optimizer, args.epochs - epoch, len(train_loader))
-            pruner.channel_pruner.reset_optimizer = False
 
         # Train
         train_loss = train_one_epoch(
@@ -325,6 +327,8 @@ def parse_args():
     parser.add_argument("--keep_ratio", type=float, default=0.65)
     parser.add_argument("--global_pruning", action="store_true")
     parser.add_argument("--norm_per_layer", action="store_true")
+    parser.add_argument("--mac_target", action="store_true",
+                        help="Use MAC-target mode: analytically compute channel ratio from keep_ratio")
 
     # PAT
     parser.add_argument("--pat_steps", type=int, default=5,
