@@ -1171,6 +1171,7 @@ class VarianceImportance(Importance):
         Searches the group for a module with collected stats (not just the root).
         This handles cases like MobileNetV2 where the DW conv is the group root
         but stats are on the expand conv (also in the group).
+
         """
         dep, idxs = group[0]
         module = dep.target.module

@@ -1,14 +1,15 @@
-"""VBP retention accuracy test for CNNs on MPS / CPU / CUDA.
+"""Pruning retention accuracy test for CNNs on MPS / CPU / CUDA.
 
-Tests VBPPruner + VarianceImportance on standard CNNs (ResNet, MobileNetV2).
-Uses validation data for both stats collection and evaluation (no train set needed).
+Tests multiple importance criteria (variance/VBP, magnitude, LAMP, random)
+on standard CNNs (ResNet, MobileNetV2). Variance criterion uses VBPPruner
+with optional bias compensation; others use BasePruner.
 
 Usage:
-    # ResNet-50 single ratio
-    python benchmarks/vbp/vbp_retention_mps.py --cnn_arch resnet50 --keep_ratio 0.65 --global_pruning
+    # ResNet-50 VBP sweep
+    python benchmarks/vbp/vbp_retention_mps.py --cnn_arch resnet50 --global_pruning --sweep
 
-    # MobileNetV2 sweep
-    python benchmarks/vbp/vbp_retention_mps.py --cnn_arch mobilenet_v2 --global_pruning --sweep
+    # MobileNetV2 magnitude baseline
+    python benchmarks/vbp/vbp_retention_mps.py --cnn_arch mobilenet_v2 --global_pruning --sweep --criterion magnitude
 
     # Quick debug (500 images)
     python benchmarks/vbp/vbp_retention_mps.py --cnn_arch resnet50 --global_pruning --sweep --eval_samples 500 --stat_samples 500
@@ -17,7 +18,6 @@ Usage:
 import argparse
 import copy
 import os
-import sys
 import time
 
 import torch
@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 import torch_pruning as tp
 from torch_pruning.pruner.importance import (
+    MagnitudeImportance, LAMPImportance, RandomImportance,
     VarianceImportance, build_cnn_ignored_layers, build_cnn_target_layers,
 )
 
@@ -156,6 +157,22 @@ def remap_importance(imp, orig_model, new_model):
 
 
 # ---------------------------------------------------------------------------
+# Build importance by criterion name
+# ---------------------------------------------------------------------------
+def build_importance(criterion):
+    if criterion == "variance":
+        return VarianceImportance()
+    elif criterion == "magnitude":
+        return MagnitudeImportance(p=2)
+    elif criterion == "lamp":
+        return LAMPImportance(p=2)
+    elif criterion == "random":
+        return RandomImportance()
+    else:
+        raise ValueError(f"Unknown criterion: {criterion}")
+
+
+# ---------------------------------------------------------------------------
 # Single-ratio prune
 # ---------------------------------------------------------------------------
 def recalibrate_bn(model, loader, device):
@@ -177,33 +194,48 @@ def recalibrate_bn(model, loader, device):
 def run_single(model, val_loader, stat_loader, device, args, imp, keep_ratio):
     model_copy = copy.deepcopy(model)
     example_inputs = torch.randn(1, 3, 224, 224).to(device)
-
-    imp_mapped = remap_importance(imp, model, model_copy)
     ignored_layers = build_cnn_ignored_layers(
         model_copy, args.cnn_arch, interior_only=args.interior_only)
 
-    pruner = tp.pruner.VBPPruner(
-        model_copy,
-        example_inputs,
-        importance=imp_mapped,
-        global_pruning=args.global_pruning,
-        pruning_ratio=1.0 - keep_ratio,
-        max_pruning_ratio=args.max_pruning_ratio,
-        ignored_layers=ignored_layers,
-        output_transform=lambda out: out.sum(),
-        mean_dict=imp_mapped.means,
-    )
+    if args.criterion == "variance":
+        # VBP path: remap collected stats, use VBPPruner with optional compensation
+        imp_mapped = remap_importance(imp, model, model_copy)
+        pruner = tp.pruner.VBPPruner(
+            model_copy,
+            example_inputs,
+            importance=imp_mapped,
+            global_pruning=args.global_pruning,
+            pruning_ratio=1.0 - keep_ratio,
+            max_pruning_ratio=args.max_pruning_ratio,
+            ignored_layers=ignored_layers,
+            output_transform=lambda out: out.sum(),
+            mean_dict=imp_mapped.means,
+        )
 
-    model_copy.eval()
-    if not args.no_compensation:
-        pruner.enable_meancheck(model_copy)
-        with torch.no_grad():
-            model_copy(example_inputs)
+        model_copy.eval()
+        if not args.no_compensation:
+            pruner.enable_meancheck(model_copy)
+            with torch.no_grad():
+                model_copy(example_inputs)
 
-    pruner.step(interactive=False, enable_compensation=not args.no_compensation)
+        pruner.step(interactive=False, enable_compensation=not args.no_compensation)
 
-    if not args.no_compensation:
-        pruner.disable_meancheck()
+        if not args.no_compensation:
+            pruner.disable_meancheck()
+    else:
+        # Non-VBP path: magnitude/lamp/random via BasePruner
+        criterion_imp = build_importance(args.criterion)
+        pruner = tp.pruner.BasePruner(
+            model_copy,
+            example_inputs,
+            importance=criterion_imp,
+            global_pruning=args.global_pruning,
+            pruning_ratio=1.0 - keep_ratio,
+            max_pruning_ratio=args.max_pruning_ratio,
+            ignored_layers=ignored_layers,
+            output_transform=lambda out: out.sum(),
+        )
+        pruner.step(interactive=False)
 
     # Recalibrate BN running stats after pruning (unless --no_recalib)
     if not args.no_recalib:
@@ -237,13 +269,13 @@ def print_table(results, acc_orig):
 # ---------------------------------------------------------------------------
 # Main logic
 # ---------------------------------------------------------------------------
-def run_vbp(model, val_dataset, device, args):
+def run_pruning(model, val_dataset, device, args):
     example_inputs = torch.randn(1, 3, 224, 224).to(device)
 
     use_pin = (device.type == "cuda")
     workers = 0 if device.type == "mps" else args.num_workers
 
-    # Split val data: first N for stats, rest (or all) for eval
+    # Split val data: first N for stats/recalib, rest (or all) for eval
     n_stat = min(args.stat_samples, len(val_dataset))
     stat_dataset = Subset(val_dataset, range(n_stat))
     stat_loader = DataLoader(
@@ -266,25 +298,29 @@ def run_vbp(model, val_dataset, device, args):
 
     print("Evaluating original model...")
     t0 = time.time()
-    acc_orig = 0.801 # validate(model, val_loader, device)
+    acc_orig = 0.801 if args.cnn_arch == "resnet50" else 0.720 if args.cnn_arch == "mobilenet_v2" else None
     print(f"Original accuracy: {acc_orig*100:.2f}%  ({time.time()-t0:.0f}s)")
 
-    # --- Collect stats using val data ---
-    imp = VarianceImportance()
-    temp_DG = tp.DependencyGraph().build_dependency(model, example_inputs=example_inputs)
-    target_layers = build_cnn_target_layers(model, temp_DG)
-    print(f"\nCollecting activation statistics on {n_stat} val samples "
-          f"({len(target_layers)} target layers)...")
-    t0 = time.time()
-    imp.collect_statistics(model, stat_loader, device, target_layers=target_layers)
-    print(f"Statistics collected for {len(imp.variance)} layers  ({time.time()-t0:.0f}s)")
+    # --- Collect stats (only needed for variance criterion) ---
+    imp = None
+    if args.criterion == "variance":
+        imp = VarianceImportance()
+        temp_DG = tp.DependencyGraph().build_dependency(model, example_inputs=example_inputs)
+        target_layers = build_cnn_target_layers(model, temp_DG)
+        print(f"\nCollecting activation statistics on {n_stat} val samples "
+              f"({len(target_layers)} target layers)...")
+        t0 = time.time()
+        imp.collect_statistics(model, stat_loader, device, target_layers=target_layers)
+        print(f"Statistics collected for {len(imp.variance)} layers  ({time.time()-t0:.0f}s)")
+    else:
+        print(f"\nCriterion: {args.criterion} (no stats collection needed)")
 
     if args.sweep:
         # --- Sweep mode ---
-        prune_pcts = list(range(5, 55, 5))
+        prune_pcts = [10, 20, 30]
         results = []
 
-        print(f"Config: compensation={not args.no_compensation}, bn_recalib={not args.no_recalib}")
+        print(f"Config: criterion={args.criterion}, compensation={not args.no_compensation}, bn_recalib={not args.no_recalib}")
 
         for pr in prune_pcts:
             keep_ratio = 1.0 - pr / 100.0
@@ -310,6 +346,7 @@ def run_vbp(model, val_dataset, device, args):
         print()
         print("=" * 62)
         print(f"  Model:       {args.cnn_arch}")
+        print(f"  Criterion:   {args.criterion}")
         print(f"  Device:      {device}")
         print(f"  Keep ratio:  {args.keep_ratio}")
         print(f"  Mode:        {prune_mode}")
@@ -348,7 +385,7 @@ def parse_args():
     p.add_argument("--max_pruning_ratio", type=float, default=1.0,
                    help="Max fraction of channels to prune per layer (e.g. 0.8 = keep at least 20%%)")
     p.add_argument("--sweep", action="store_true",
-                   help="Sweep pruning ratios 5%%..50%% (step 5%%)")
+                   help="Sweep pruning ratios 10%%, 20%%, 30%%")
     p.add_argument("--stat_samples", type=int, default=5000,
                    help="Number of val images for variance statistics")
     p.add_argument("--eval_samples", type=int, default=None,
@@ -359,6 +396,9 @@ def parse_args():
                    help="Disable VBP bias compensation (useful when DW convs lack calibration means)")
     p.add_argument("--no_recalib", action="store_true",
                    help="Skip BN recalibration after pruning (test compensation in isolation)")
+    p.add_argument("--criterion", default="variance",
+                   choices=["variance", "magnitude", "lamp", "random"],
+                   help="Importance criterion (variance=VBP, others use BasePruner)")
     p.add_argument("--cpu", action="store_true", help="Force CPU")
     return p.parse_args()
 
@@ -370,7 +410,7 @@ def main():
 
     val_dataset = load_imagenet_val(args)
     model = load_model(args, device)
-    run_vbp(model, val_dataset, device, args)
+    run_pruning(model, val_dataset, device, args)
 
 
 if __name__ == "__main__":
