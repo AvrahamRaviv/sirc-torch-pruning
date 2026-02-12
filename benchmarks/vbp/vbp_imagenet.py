@@ -852,8 +852,13 @@ def finetune(model, teacher, train_loader, train_sampler, val_loader,
                           output_device=args.local_rank)
         dist.barrier()
 
-    optimizer = torch.optim.AdamW(train_model.parameters(),
-                                  lr=args.lr_ft, weight_decay=0.01)
+    wd = args.wd_ft if args.wd_ft is not None else (1e-4 if args.opt_ft == "sgd" else 0.01)
+    if args.opt_ft == "sgd":
+        optimizer = torch.optim.SGD(train_model.parameters(), lr=args.lr_ft,
+                                    momentum=args.momentum_ft, weight_decay=wd)
+    else:
+        optimizer = torch.optim.AdamW(train_model.parameters(),
+                                      lr=args.lr_ft, weight_decay=wd)
     scheduler, step_per_batch = build_ft_scheduler(
         optimizer, epochs, len(train_loader))
 
@@ -975,7 +980,9 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
 
     # 6. Post-prune fine-tuning
     if args.epochs_ft > 0:
-        log_info(f"\nPost-prune fine-tuning for {args.epochs_ft} epochs...")
+        wd_display = args.wd_ft if args.wd_ft is not None else (1e-4 if args.opt_ft == "sgd" else 0.01)
+        log_info(f"\nPost-prune fine-tuning for {args.epochs_ft} epochs "
+                 f"({args.opt_ft}, lr={args.lr_ft}, wd={wd_display})...")
         epoch_offset = pat_steps * epochs_per_step
         ft_best = finetune(
             model, teacher, train_loader, train_sampler, val_loader,
@@ -1144,7 +1151,14 @@ def parse_args():
     ft_group.add_argument("--epochs_ft", type=int, default=10,
                           help="Number of fine-tuning epochs")
     ft_group.add_argument("--lr_ft", type=float, default=1.5e-5,
-                          help="Fine-tuning learning rate (AdamW)")
+                          help="Fine-tuning learning rate")
+    ft_group.add_argument("--opt_ft", type=str, default="adamw",
+                          choices=["adamw", "sgd"],
+                          help="Fine-tuning optimizer (default: adamw)")
+    ft_group.add_argument("--momentum_ft", type=float, default=0.9,
+                          help="SGD momentum (ignored for AdamW)")
+    ft_group.add_argument("--wd_ft", type=float, default=None,
+                          help="Fine-tuning weight decay (default: 0.01 for AdamW, 1e-4 for SGD)")
 
     # Knowledge Distillation
     kd_group = parser.add_argument_group("Knowledge Distillation")
