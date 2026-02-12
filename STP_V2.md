@@ -138,13 +138,25 @@ Previously on v1.5.1. We rebased onto upstream:
 - **PEP 8 class names:** `channel_pruning` → `ChannelPruning`, `slice_pruning` → `SlicePruning`
 - **`PruningMethod` enum** replacing magic strings for pruning types
 - **`_log()` helper** eliminating ~15 duplicate if-else logging blocks
-- **Linear + LayerNorm support** for transformers (`ab3e27f`)
 - **Bug fixes:**
   - `ignored_layers` accumulation bug in `set_layers_to_prune()` (`e3a381f`)
   - Hardcoded `'cuda'` device in `SlicePruning.regularize()` (`1022317`)
 - **Unit tests** added (`cba9bf4`)
 
-### 2.3 New Importance Criteria
+### 2.3 Transformer Support
+
+The original `pruning_utils.py` only handled Conv2d + BatchNorm. We extended it for transformer architectures, enabling the VBP work on ViTs (section 2.5).
+
+**Done:**
+- **Linear layer pruning** — `ChannelPruning` now discovers and prunes `nn.Linear` layers with proper in/out channel handling (`ab3e27f`)
+- **LayerNorm pruning** — Coupled with Linear in dependency groups (ViT uses LN before/after attention and MLP)
+
+**TODO:**
+- **MHA head pruning** — Prune entire attention heads (Q/K/V/output projection simultaneously). TP v1.6 has `prune_num_heads` support in `BasePruner`; needs integration into `ChannelPruning`
+- **Embedding dimension pruning** — Prune the residual stream width (affects all layers uniformly)
+- **FFN-only vs full-model pruning modes** — Currently VBP prunes MLP intermediate dim only; extend to joint MLP + attention pruning
+
+### 2.4 New Importance Criteria
 
 #### MACAwareImportance (`6f389ba`)
 
@@ -176,7 +188,7 @@ Post-activation variance as channel importance (VBP paper, arXiv 2507.12988). Co
 | `build_cnn_target_layers(model, DG)` | Walk DG from each Conv2d → find BN + activation → compose into `post_act_fn` |
 | `build_cnn_ignored_layers(model, arch)` | Build ignored layers for ResNet (stem, conv3, downsamples) or MobileNetV2 (stem, classifier, project/DW convs) |
 
-### 2.4 VBP Integration
+### 2.5 VBP Integration
 
 40+ commits (`f8526fd` → `e25177f`) adding Variance-Based Pruning with full pipeline support.
 
@@ -206,7 +218,7 @@ Key challenges solved:
 - **Sparse pre-training** modes: `l1_group` (L2,1), `gmp` (Gradual Magnitude Pruning)
 - **Sweep mode**: Collect stats once, then test multiple keep ratios via `deepcopy` + `remap_importance()`
 
-### 2.5 Graph Visualization
+### 2.6 Graph Visualization
 
 5 commits (`c9ce4fd` → `09661c7`) adding Graphviz-based visualization of the DependencyGraph and pruning groups.
 
