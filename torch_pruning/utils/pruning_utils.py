@@ -560,6 +560,65 @@ class ChannelPruning:
         from torch_pruning.pruner.importance import build_cnn_target_layers
         return build_cnn_target_layers(model, DG)
 
+    def _estimate_channel_ratio(self, model):
+        """Compute global channel pruning ratio to achieve self.mac_target.
+
+        Classifies each layer's MACs by how many dimensions (in/out) are
+        pruned in a global-pruning scenario, then solves:
+
+            mac_target = (U + S1*(1-p) + S2*(1-p)^2) / T
+
+        where U = unpruned MACs, S1 = 1-dim pruned, S2 = 2-dim pruned,
+        T = total MACs, and p = channel pruning ratio.
+        """
+        import math
+
+        macs_dict = count_ops_and_params(model, self.example_inputs, layer_wise=True)[2]
+
+        # Build a temp DG to classify layers by pruned dimensions
+        DG = tp.DependencyGraph().build_dependency(model, example_inputs=self.example_inputs)
+
+        pruned_dims = {}  # module → set of {'in', 'out'}
+        for group in DG.get_all_groups(
+                ignored_layers=self.ignored_layers,
+                root_module_types=[nn.Conv2d, nn.Linear]):
+            for dep, _ in group:
+                module = dep.target.module
+                if DG.is_out_channel_pruning_fn(dep.handler):
+                    pruned_dims.setdefault(module, set()).add('out')
+                elif DG.is_in_channel_pruning_fn(dep.handler):
+                    pruned_dims.setdefault(module, set()).add('in')
+
+        # Only count MACs for Conv2d/Linear layers (skip BN, activation, etc.)
+        prunable_types = (nn.Conv2d, nn.Linear)
+        mac_total = sum(v for m, v in macs_dict.items()
+                        if v is not None and isinstance(m, prunable_types))
+        mac_1dim = sum(macs_dict[m] for m, dims in pruned_dims.items()
+                       if len(dims) == 1 and macs_dict.get(m) is not None)
+        mac_2dim = sum(macs_dict[m] for m, dims in pruned_dims.items()
+                       if len(dims) == 2 and macs_dict.get(m) is not None)
+
+        # Solve quadratic: mac_2dim*q^2 + mac_1dim*q + (mac_unpruned - target) = 0
+        # where q = 1-p (keep ratio)
+        mac_unpruned = mac_total - mac_1dim - mac_2dim
+        target_macs = self.mac_target * mac_total
+        c = mac_unpruned - target_macs
+
+        if mac_2dim > 0:
+            disc = mac_1dim ** 2 - 4 * mac_2dim * c
+            if disc < 0:
+                _log(self.log, "WARNING: MAC target unreachable, using max pruning rate")
+                return self.channels_pruner_args['max_pruning_rate']
+            q = (-mac_1dim + math.sqrt(disc)) / (2 * mac_2dim)
+        elif mac_1dim > 0:
+            q = -c / mac_1dim
+        else:
+            return 0.0
+
+        p = 1.0 - q
+        p = max(0.0, min(p, self.channels_pruner_args['max_pruning_rate']))
+        return p
+
     def update_max_imp(self):
         if self.pruning_method != PruningMethod.MAC_AWARE:
             return
