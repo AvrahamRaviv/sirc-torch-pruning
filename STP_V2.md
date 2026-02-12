@@ -20,63 +20,35 @@ Torch-Pruning is built on four abstractions:
 | **BasePruner** | Orchestrates the pruning loop: `step()` → `_prune()` → iterate groups → compute importance → apply scope/threshold → `group.prune()`. Handles local/global ranking, iterative schedules, ignored layers, attention heads. | `torch_pruning/pruner/algorithms/base_pruner.py` |
 | **Group** | A list of `(Dependency, indices)` pairs representing coupled layers (e.g., Conv → BN → next Conv input channels). `group.prune()` applies the structural modification atomically. | `torch_pruning/dependency/graph.py` |
 
-```mermaid
-flowchart LR
-    A["nn.Module +\nexample_inputs"] --> B["DG.build_dependency()"]
-    B --> C["DG.get_all_groups()"]
-    C --> D["Importance(group)\n→ 1-D scores"]
-    D --> E["Scope / Threshold\n(local or global)"]
-    E --> F["group.prune()"]
-    F --> G["Pruned Model"]
+<!-- TODO: Replace with hand-drawn diagram
+     Diagram 1: TP Core Flow
+     model + example_inputs → DG.build_dependency() → DG.get_all_groups()
+       → Importance(group) → 1-D scores → Scope/Threshold (local or global)
+       → group.prune() → Pruned Model
+-->
+![TP Core Flow](docs/diagrams/tp_core_flow.png)
 
-    style A fill:#e8f4fd,stroke:#4a90d9
-    style D fill:#fff3cd,stroke:#d4a017
-    style G fill:#d4edda,stroke:#28a745
-```
-
-**Key detail:** `_prune()` is a *generator*. It yields groups one at a time, allowing `VBPPruner.step()` to apply bias compensation *before* calling `group.prune()` on each group.
+**Key detail:** `_prune()` is a *generator*. It yields groups one at a time, allowing subclasses (e.g., `VBPPruner`) to apply corrections *before* calling `group.prune()` on each group.
 
 ### 1.2 PAT Pipeline
 
-The benchmark script (`benchmarks/vbp/vbp_imagenet.py`) wraps the pruner in a three-phase pipeline:
+The benchmark script (`benchmarks/vbp/vbp_imagenet.py`) wraps **any pruner + importance** in a three-phase pipeline:
 
 1. **Sparse Pre-training** *(optional)* — L2,1 group regularization or GMP (Gradual Magnitude Pruning) to induce structured sparsity before pruning.
-2. **Iterative PAT Loop** — `pat_steps` iterations of: collect VBP stats → create pruner → `pruner.step()` → per-step fine-tune.
+2. **Iterative PAT Loop** — `pat_steps` iterations of: collect importance stats → create pruner → `pruner.step()` → per-step fine-tune. The importance criterion and pruner type are configurable (Magnitude, Taylor, Variance, etc.).
 3. **Post-Prune Fine-Tuning** — Standard training to recover accuracy after all pruning steps.
 
 **Geometric schedule:** each step keeps `per_step_keep = keep_ratio^(1/N)` channels, so after N steps the cumulative ratio equals the target.
 
 **One-shot** = special case with `pat_steps=1`, `pat_epochs_per_step=0`, `epochs_ft=N`.
 
-```mermaid
-flowchart TB
-    subgraph Phase1["Phase 1: Sparse Pre-training (optional)"]
-        S1["L2,1 / GMP regularization"]
-        S2["Train for epochs_sparse"]
-        S1 --> S2
-    end
-
-    subgraph Phase2["Phase 2: PAT Loop (× pat_steps)"]
-        P1["Collect VBP stats\n(VarianceImportance)"]
-        P2["Create VBPPruner\n(per_step_keep ratio)"]
-        P3["pruner.step()\n+ bias compensation"]
-        P4["Per-step fine-tune\n(epochs_per_step epochs)"]
-        P1 --> P2 --> P3 --> P4
-        P4 -->|"next step"| P1
-    end
-
-    subgraph Phase3["Phase 3: Post-Prune Fine-Tuning"]
-        F1["Fine-tune for epochs_ft"]
-        F2["Final evaluation + save"]
-        F1 --> F2
-    end
-
-    Phase1 --> Phase2 --> Phase3
-
-    style Phase1 fill:#fff3cd,stroke:#d4a017
-    style Phase2 fill:#e8f4fd,stroke:#4a90d9
-    style Phase3 fill:#d4edda,stroke:#28a745
-```
+<!-- TODO: Replace with hand-drawn diagram
+     Diagram 2: PAT Pipeline
+     Phase 1 (optional): Sparse pre-training (L2,1 / GMP) → train for epochs_sparse
+     Phase 2 (loop × pat_steps): Collect stats → Create pruner (per_step_keep) → pruner.step() → Per-step fine-tune → [loop back]
+     Phase 3: Fine-tune for epochs_ft → Final eval + save
+-->
+![PAT Pipeline](docs/diagrams/pat_pipeline.png)
 
 ---
 
@@ -149,22 +121,15 @@ Extends `BasePruner` with three post-prune corrections applied *per group before
 2. **BN variance update** — Analytically corrects `running_var` of downstream BatchNorm using stored activation variances, avoiding the need for full recalibration.
 3. **Mean-check diagnostics** *(optional)* — Forward hooks measure per-channel mean shift before/after compensation for validation.
 
-```mermaid
-flowchart LR
-    subgraph "VBPPruner.step() — per group"
-        A["_prune() yields group"] --> B{"mean_dict\nprovided?"}
-        B -->|yes| C["_apply_compensation()\nδb = W·μ for pruned channels"]
-        C --> D{"var_dict\nprovided?"}
-        D -->|yes| E["_update_consumer_bn_var()\nAnalytical BN correction"]
-        D -->|no| F["group.prune()"]
-        E --> F
-        B -->|no| F
-    end
-
-    style C fill:#fff3cd,stroke:#d4a017
-    style E fill:#e8f4fd,stroke:#4a90d9
-    style F fill:#d4edda,stroke:#28a745
-```
+<!-- TODO: Replace with hand-drawn diagram
+     Diagram 3: VBPPruner.step() — per group
+     _prune() yields group → mean_dict provided?
+       yes → _apply_compensation() (δb = W·μ) → var_dict provided?
+         yes → _update_consumer_bn_var() (analytical BN correction) → group.prune()
+         no  → group.prune()
+       no  → group.prune()
+-->
+![VBPPruner Compensation Flow](docs/diagrams/vbp_compensation.png)
 
 #### CNN Support
 
