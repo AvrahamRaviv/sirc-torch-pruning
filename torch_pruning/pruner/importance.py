@@ -1167,13 +1167,23 @@ class VarianceImportance(Importance):
         """
         Returns importance values for the channels in this pruning group.
         Lower variance => lower importance => pruned first by MagnitudePruner.
+
+        Searches the group for a module with collected stats (not just the root).
+        This handles cases like MobileNetV2 where the DW conv is the group root
+        but stats are on the expand conv (also in the group).
         """
         dep, idxs = group[0]
         module = dep.target.module
 
         if module not in self.variance:
-            # If this module had no stats (unlikely), fallback
-            return torch.ones(len(idxs))
+            # Search group for any module with stats
+            for dep_i, _ in group:
+                candidate = dep_i.target.module
+                if candidate in self.variance and len(self.variance[candidate]) == len(idxs):
+                    module = candidate
+                    break
+            else:
+                return torch.ones(len(idxs))
 
         var = self.variance[module]
         idxs = torch.as_tensor(idxs, dtype=torch.long)
@@ -1194,6 +1204,7 @@ def _grad_fn_to_activation(grad_fn_str):
         "silu": _F.silu,
         "gelu": _F.gelu,
         "relu6": _F.relu6,
+        "hardtanh": _F.relu6,  # nn.ReLU6 uses HardtanhBackward0 internally
         "hardswish": _F.hardswish,
         "hardsigmoid": _F.hardsigmoid,
     }
@@ -1364,10 +1375,10 @@ def build_cnn_ignored_layers(model, architecture, interior_only=True):
                     ignored.append(m)
 
         if interior_only:
-            # Ignore: projection convs (1x1 reduce) and DW convs
-            # In InvertedResidual, the conv sequence is:
-            #   expand 1x1 -> DW 3x3 -> project 1x1
-            # We want to keep only the expand conv
+            # Ignore projection convs (1x1 reduce) only.
+            # DW convs must NOT be ignored: they participate in expand
+            # conv groups (DW channels are tied 1:1 to expand output).
+            # DW convs won't be pruned as roots (MetaPruner skips grouped convs).
             try:
                 from torchvision.models.mobilenetv2 import InvertedResidual
             except ImportError:
@@ -1377,17 +1388,8 @@ def build_cnn_ignored_layers(model, architecture, interior_only=True):
                 if isinstance(m, InvertedResidual):
                     convs = [sub for sub in m.conv.modules() if isinstance(sub, nn.Conv2d)]
                     for conv in convs:
-                        # DW conv: groups == out_channels
-                        if conv.groups == conv.out_channels and conv.out_channels > 1:
-                            ignored.append(conv)
                         # Projection conv: last 1x1 (pointwise, groups=1, not the expand)
-                        elif conv.kernel_size == (1, 1) and conv == convs[-1]:
+                        if conv.kernel_size == (1, 1) and conv == convs[-1]:
                             ignored.append(conv)
-        else:
-            # Only ignore DW convs (can't resize them independently)
-            for m in model.modules():
-                if isinstance(m, nn.Conv2d):
-                    if m.groups == m.out_channels and m.out_channels > 1:
-                        ignored.append(m)
 
     return ignored

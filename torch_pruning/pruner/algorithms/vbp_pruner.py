@@ -142,8 +142,18 @@ class VBPPruner(BasePruner):
         dep0, _ = group[0]
         root = dep0.target.module  # pruned Conv / Linear
 
-        # Use calibration means from mean_dict (keyed by root module)
+        # Use calibration means from mean_dict (keyed by root module).
+        # If root has no mean (e.g. DW conv in MobileNetV2), search the
+        # group for another module with matching-size means (e.g. expand conv).
         mu = self.mean_dict.get(root)
+        if mu is None:
+            for dep_i, _ in group:
+                candidate = dep_i.target.module
+                if candidate in self.mean_dict and len(self.mean_dict[candidate]) == root.weight.shape[0]:
+                    mu = self.mean_dict[candidate]
+                    if self.verbose:
+                        print(f"[VBP-comp] Using mean from {candidate} for root {root}")
+                    break
         if mu is None:
             if self.verbose:
                 print(f"[VBP] No calibration mean for {root}, skipping compensation")
