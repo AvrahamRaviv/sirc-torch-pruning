@@ -419,12 +419,9 @@ def run_sparse_pretraining(model, teacher, train_loader, train_sampler,
     Supports DDP: wraps model for training, unwraps after.
     Modifies model in-place. Uses KD from teacher if --use_kd is set.
     """
-    if args.model_type != "vit":
-        log_info(f"WARNING: Sparse pre-training only supports ViT, "
-                 f"skipping for {args.model_type}")
-        return
-
-    fc1_pairs = get_fc1_modules(model, model_type=args.model_type)
+    fc1_pairs = get_fc1_modules(
+        model, model_type=args.model_type,
+        cnn_arch=getattr(args, 'cnn_arch', None))
     fc1_modules = [m for _, m in fc1_pairs]
     log_info(f"Sparse pre-training: mode={args.sparse_mode}, "
              f"{len(fc1_modules)} fc1 layers, epochs={args.epochs_sparse}")
