@@ -20,15 +20,17 @@ from torch_pruning.pruner.importance import VarianceImportance
 # ---------------------------------------------------------------------------
 # fc1 module extraction
 # ---------------------------------------------------------------------------
-def get_fc1_modules(model, model_type="vit") -> list[tuple[str, nn.Linear]]:
-    """Return (name, module) pairs for fc1 layers.
+def get_fc1_modules(model, model_type="vit", cnn_arch=None) -> list[tuple[str, nn.Module]]:
+    """Return (name, module) pairs for interior layers targeted by sparse training.
 
     Args:
-        model: The model to extract fc1 modules from.
-        model_type: Architecture type. Currently only "vit" is supported.
+        model: The model to extract modules from.
+        model_type: Architecture type ("vit", "cnn").
+        cnn_arch: CNN architecture name (e.g. "resnet50", "mobilenet_v2").
+            Required when model_type == "cnn".
 
     Returns:
-        List of (name, nn.Linear) tuples for each fc1 layer.
+        List of (name, module) tuples for each target layer.
     """
     if model_type == "vit":
         result = []
@@ -36,21 +38,66 @@ def get_fc1_modules(model, model_type="vit") -> list[tuple[str, nn.Linear]]:
             if name.endswith(".intermediate.dense"):
                 result.append((name, module))
         return result
+
+    if model_type == "cnn":
+        if cnn_arch is None:
+            raise ValueError("cnn_arch is required when model_type='cnn'")
+        return _get_cnn_interior_modules(model, cnn_arch)
+
     raise ValueError(f"Unsupported model_type: {model_type}")
+
+
+def _get_cnn_interior_modules(model, cnn_arch: str) -> list[tuple[str, nn.Module]]:
+    """Return interior conv modules for CNN sparse training.
+
+    ResNet-50 (Bottleneck): conv1 and conv2 from each Bottleneck block.
+    MobileNetV2 (InvertedResidual): expand conv (first 1x1 Conv2d) in each block.
+    """
+    result = []
+
+    if cnn_arch.startswith("resnet"):
+        from torchvision.models.resnet import Bottleneck, BasicBlock
+        for name, module in model.named_modules():
+            if isinstance(module, Bottleneck):
+                result.append((name + ".conv1", module.conv1))
+                result.append((name + ".conv2", module.conv2))
+            elif isinstance(module, BasicBlock):
+                result.append((name + ".conv1", module.conv1))
+
+    elif cnn_arch == "mobilenet_v2":
+        try:
+            from torchvision.models.mobilenetv2 import InvertedResidual
+        except ImportError:
+            from torchvision.models.mobilenet import InvertedResidual
+        for name, module in model.named_modules():
+            if isinstance(module, InvertedResidual):
+                # Expand conv: first 1x1 Conv2d that increases channels (out > in).
+                # Blocks with expansion=1 have no expand conv (skip them).
+                for sub_name, sub in module.conv.named_modules():
+                    if (isinstance(sub, nn.Conv2d) and sub.kernel_size == (1, 1)
+                            and sub.groups == 1 and sub.out_channels > sub.in_channels):
+                        result.append((f"{name}.conv.{sub_name}", sub))
+                        break
+
+    else:
+        raise ValueError(f"Unsupported cnn_arch for sparse training: {cnn_arch}")
+
+    return result
 
 
 # ---------------------------------------------------------------------------
 # L2,1 group regularization
 # ---------------------------------------------------------------------------
-def l21_regularization(modules: list[nn.Linear], device) -> torch.Tensor:
+def l21_regularization(modules: list[nn.Module], device) -> torch.Tensor:
     """Compute L2,1 norm: sum of L2 norms of each output neuron's weight row.
 
-    For each fc1 weight [out, in]: ||W||_{2,1} = sum_i ||w_i||_2
-    This encourages entire neurons (rows) to shrink to zero, producing
-    low post-GELU variance on those channels → clean VBP signal.
+    For Linear [out, in] or Conv2d [out, in, k, k]:
+      ||W||_{2,1} = sum_i ||w_i||_2
+    where w_i is the i-th output channel flattened to a vector.
+    This encourages entire output channels to shrink to zero.
 
     Args:
-        modules: List of nn.Linear modules (fc1 layers).
+        modules: List of nn.Linear or nn.Conv2d modules.
         device: Device for the result tensor.
 
     Returns:
@@ -58,9 +105,8 @@ def l21_regularization(modules: list[nn.Linear], device) -> torch.Tensor:
     """
     reg = torch.tensor(0.0, device=device)
     for m in modules:
-        # weight shape: [out_features, in_features]
-        # L2 norm per output neuron (row), then L1 across neurons
-        reg = reg + m.weight.norm(p=2, dim=1).sum()
+        # Flatten to [out_channels, -1] then L2 per row — works for both 2D and 4D
+        reg = reg + m.weight.flatten(1).norm(p=2, dim=1).sum()
     return reg
 
 
@@ -88,14 +134,14 @@ def gmp_sparsity_schedule(epoch: int, total_epochs: int,
     return target_s + (init_s - target_s) * (1.0 - t) ** 3
 
 
-def apply_unstructured_pruning(modules: list[nn.Linear], sparsity: float) -> None:
+def apply_unstructured_pruning(modules: list[nn.Module], sparsity: float) -> None:
     """Apply global unstructured L1 pruning across all modules.
 
     Removes any existing pruning masks before applying the new sparsity level,
     avoiding mask stacking. Uses global pruning to match VBP's global philosophy.
 
     Args:
-        modules: List of nn.Linear modules to prune.
+        modules: List of nn.Linear or nn.Conv2d modules to prune.
         sparsity: Target fraction of weights to zero out (0 to 1).
     """
     if sparsity <= 0:
@@ -115,14 +161,14 @@ def apply_unstructured_pruning(modules: list[nn.Linear], sparsity: float) -> Non
     )
 
 
-def remove_pruning_reparametrization(modules: list[nn.Linear]) -> None:
+def remove_pruning_reparametrization(modules: list[nn.Module]) -> None:
     """Bake pruning masks into weights permanently.
 
     Call this after sparse pre-training, before VBP stats collection,
     so the model becomes a standard dense model with zero-valued weights.
 
     Args:
-        modules: List of nn.Linear modules with active pruning masks.
+        modules: List of nn.Linear or nn.Conv2d modules with active pruning masks.
     """
     for m in modules:
         if hasattr(m, "weight_mask"):
@@ -196,11 +242,11 @@ def compute_variance_entropy(imp: VarianceImportance) -> dict:
     }
 
 
-def compute_weight_sparsity(modules: list[nn.Linear]) -> dict:
+def compute_weight_sparsity(modules: list[nn.Module]) -> dict:
     """Compute fraction of zero weights per layer and globally.
 
     Args:
-        modules: List of nn.Linear modules.
+        modules: List of nn.Linear or nn.Conv2d modules.
 
     Returns:
         Dictionary with per-layer sparsity and global sparsity.
