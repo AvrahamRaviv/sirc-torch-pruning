@@ -28,6 +28,22 @@ def _log(log, msg: str) -> None:
         print(msg)
 
 
+def _recalibrate_bn(model, train_loader, device, log=None):
+    """Recalibrate BN running stats after structural pruning."""
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.reset_running_stats()
+    model.train()
+    total = min(100, len(train_loader))
+    with torch.no_grad():
+        for batch_idx, (images, _) in enumerate(train_loader):
+            if batch_idx >= 100:
+                break
+            model(images.to(device, non_blocking=True))
+    model.eval()
+    _log(log, f"BN recalibration done ({total} batches)")
+
+
 class PruningMethod(str, Enum):
     """Supported channel-pruning methods (str mixin for JSON compat)."""
     BN_SCALE = "BNScalePruner"
@@ -157,12 +173,36 @@ class ChannelPruning:
             self.global_prune_rate = self._estimate_channel_ratio(model)
             _log(log, f"MAC target {self.mac_target:.3f} -> channel prune rate {self.global_prune_rate:.4f}")
 
+        # Pruning schedule (geometric vs linear)
+        self.pruning_schedule = channel_sparsity_args.get('pruning_schedule', 'linear')
+        self._total_steps = self.iterative_steps
+        self._geometric_step = 0
+        if self.pruning_schedule == 'geometric':
+            total_keep = 1.0 - self.global_prune_rate
+            self._per_step_prune = 1.0 - (total_keep ** (1.0 / self._total_steps))
+            self.iterative_steps = 1  # single-step pruner, reinit after each
+            self._total_prune_rate = self.global_prune_rate
+            self.global_prune_rate = self._per_step_prune
+
+        # BN recalibration after pruning steps
+        self._bn_recalibration = channel_sparsity_args.get('bn_recalibration', False)
+
+        # Sparse pre-training config
+        self._sparse_mode = channel_sparsity_args.get('sparse_mode', 'none')
+        self._sparse_l1_lambda = channel_sparsity_args.get('sparse_l1_lambda', 1e-4)
+        self._sparse_gmp_target = channel_sparsity_args.get('sparse_gmp_target', 0.5)
+        self._sparse_modules = []
+        if self._sparse_mode != 'none':
+            for name, m in model.named_modules():
+                if name.replace("module.", "") in self.layers_to_prune:
+                    self._sparse_modules.append(m)
+
         # Initial MAC measurement
         _ = self.measure_macs_masked_model(model)
 
         self.init_channel_pruner(model, log, print_layers=True)
 
-    def init_channel_pruner(self, model, log=None, print_layers=False):
+    def init_channel_pruner(self, model, log=None, print_layers=False, collect_stats=True):
         log = log or self.log
         # set layers to pruned and their pruning rate
         pruning_ratio_dict = self.set_layers_to_prune(model)
@@ -181,16 +221,19 @@ class ChannelPruning:
                                      current_max=self.max_imp_current_step)
             pruner_entry = partial(tp.pruner.GroupNormPruner)
         elif self.pruning_method == PruningMethod.VBP:
-            imp = tp.importance.VarianceImportance(
-                norm_per_layer=self._vbp_norm_per_layer)
-            # Collect stats if train_loader is available and stats not yet collected
-            if self.train_loader is not None and len(imp.variance) == 0:
-                target_layers = self._build_target_layers(model)
-                imp.collect_statistics(
-                    model, self.train_loader, self.device,
-                    target_layers=target_layers,
-                    max_batches=self._vbp_max_batches)
-            self.vbp_importance = imp
+            if not collect_stats and self.vbp_importance is not None:
+                imp = self.vbp_importance
+            else:
+                imp = tp.importance.VarianceImportance(
+                    norm_per_layer=self._vbp_norm_per_layer)
+                # Collect stats if train_loader is available and stats not yet collected
+                if collect_stats and self.train_loader is not None and len(imp.variance) == 0:
+                    target_layers = self._build_target_layers(model)
+                    imp.collect_statistics(
+                        model, self.train_loader, self.device,
+                        target_layers=target_layers,
+                        max_batches=self._vbp_max_batches)
+                self.vbp_importance = imp
             pruner_entry = partial(tp.pruner.VBPPruner, mean_dict=imp.means)
         else:
             raise NameError(f'Unsupported pruner method. {self.channels_pruner_args["pruning_method"]}')
@@ -222,6 +265,7 @@ class ChannelPruning:
         # CNN VBP: collect stats after pruner creation (needs DG for graph-walking)
         if (self.pruning_method == PruningMethod.VBP
                 and self._vbp_model_type == "cnn"
+                and collect_stats
                 and self.train_loader is not None
                 and len(imp.variance) == 0):
             target_layers = self._build_target_layers_from_dg(model, self.pruner.DG)
@@ -239,8 +283,12 @@ class ChannelPruning:
         self.pruner.update_regularizer()
 
         if self.verbose > 0:
-            _log(log, f"Pruning setup: {self.iterative_steps} steps from epoch {self.start_epoch} to {self.end_epoch}")
-            _log(log, f"Target prune rate: {self.global_prune_rate:.3f}, Algorithm: {self.channels_pruner_args['pruning_method']}.")
+            total_steps = self._total_steps if self.pruning_schedule == 'geometric' else self.iterative_steps
+            total_rate = self._total_prune_rate if self.pruning_schedule == 'geometric' else self.global_prune_rate
+            _log(log, f"Pruning setup: {total_steps} steps from epoch {self.start_epoch} to {self.end_epoch} ({self.pruning_schedule})")
+            _log(log, f"Target prune rate: {total_rate:.3f}, Algorithm: {self.channels_pruner_args['pruning_method']}.")
+            if self.pruning_schedule == 'geometric':
+                _log(log, f"Geometric per-step prune: {self._per_step_prune:.4f}")
             if self.mac_target > 0:
                 _log(log, f"MAC target: {self.mac_target:.3f}")
             if self.channels_pruner_args["round_to"] > 1:
@@ -272,6 +320,7 @@ class ChannelPruning:
 
         Supports two modes: physical pruning (VBP) and mask-with-zeros.
         The pruner is created once at init; each pruning epoch calls step().
+        For geometric schedule, reinits pruner after each step (new DG).
         """
         log = log or self.log
         if not self.prune_channels:
@@ -280,6 +329,18 @@ class ChannelPruning:
 
         self.current_epoch = epoch
         is_vbp = self.pruning_method == PruningMethod.VBP
+
+        # GMP masking for sparse pre-training (before start_epoch)
+        if self._sparse_mode == "gmp" and epoch < self.start_epoch:
+            from benchmarks.vbp.sparse_utils import gmp_sparsity_schedule, apply_unstructured_pruning
+            target_s = gmp_sparsity_schedule(epoch, self.start_epoch, target_s=self._sparse_gmp_target)
+            apply_unstructured_pruning(self._sparse_modules, target_s)
+            return
+
+        # Bake GMP masks at start_epoch boundary
+        if self._sparse_mode == "gmp" and epoch == self.start_epoch:
+            from benchmarks.vbp.sparse_utils import remove_pruning_reparametrization
+            remove_pruning_reparametrization(self._sparse_modules)
 
         # Check if this is a pruning epoch
         is_pruning_epoch = (
@@ -332,18 +393,41 @@ class ChannelPruning:
                         _log(log, f" {pom} {len(idxs)}/{dep.target.module.weight.shape[0]} "
                                   f"channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}.")
 
-        # Check if all iterative steps are done
-        if self.pruner.current_step >= self.iterative_steps:
-            self.prune_channels = False
+        # BN recalibration after pruning step
+        if self._bn_recalibration and self.train_loader is not None:
+            _recalibrate_bn(model, self.train_loader, self.device, log)
+
+        # Track step completion and handle schedule
+        if self.pruning_schedule == 'geometric':
+            self._geometric_step += 1
+            if self._geometric_step < self._total_steps:
+                self.init_channel_pruner(model, log, collect_stats=False)
+            else:
+                self.prune_channels = False
+        else:
+            if self.pruner.current_step >= self.iterative_steps:
+                self.prune_channels = False
 
         self.update_channel_mask_dict(model)
 
         # Log MAC progress
+        step_num = self._geometric_step if self.pruning_schedule == 'geometric' else self.pruner.current_step
+        total_num = self._total_steps if self.pruning_schedule == 'geometric' else self.iterative_steps
         current_macs, total_macs = self.measure_macs_masked_model(model)
-        _log(log, f" Step {self.pruner.current_step}/{self.iterative_steps}: "
+        _log(log, f" Step {step_num}/{total_num}: "
                   f"MACs = {current_macs / total_macs:.3f} of original")
 
     def regularize(self, model):
+        # Sparse pre-training: L21 gradient reg for pre-pruning epochs
+        if (self._sparse_mode == "l1_group"
+                and self.current_epoch < self.start_epoch):
+            for m in self._sparse_modules:
+                if m.weight.grad is not None:
+                    w = m.weight.data.flatten(1)
+                    norms = w.norm(p=2, dim=1, keepdim=True) + 1e-8
+                    m.weight.grad.add_(self._sparse_l1_lambda * (w / norms).view_as(m.weight))
+            return
+
         # VBP does not use traditional regularization; var loss is handled externally
         if self.pruning_method == PruningMethod.VBP:
             return

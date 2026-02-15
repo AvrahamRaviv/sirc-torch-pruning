@@ -90,8 +90,12 @@ def build_pruning_config(args, model, config_dir):
         model, args.model_type,
         architecture=getattr(args, 'cnn_arch', None),
         interior_only=getattr(args, 'interior_only', True))
-    epochs_per_step = max(1, args.epochs // args.pat_steps)
-    # epoch_rate: prune every N epochs (maps pat_steps to epoch schedule)
+
+    # Sparse pre-training shifts the pruning start epoch
+    start_epoch = args.epochs_sparse if args.sparse_mode != "none" else 0
+    # PAT epochs span start_epoch..end_epoch
+    pat_total_epochs = args.epochs - start_epoch
+    epochs_per_step = max(1, pat_total_epochs // args.pat_steps)
     epoch_rate = epochs_per_step
 
     config = {
@@ -100,7 +104,7 @@ def build_pruning_config(args, model, config_dir):
             "pruning_method": "VBP",
             "global_pruning": args.global_pruning,
             "block_size": 1,
-            "start_epoch": 0,
+            "start_epoch": start_epoch,
             "end_epoch": args.epochs - 1,
             "epoch_rate": epoch_rate,
             "global_prune_rate": 1.0 - args.keep_ratio,
@@ -118,6 +122,12 @@ def build_pruning_config(args, model, config_dir):
             "var_loss_weight": args.var_loss_weight,
             "norm_per_layer": args.norm_per_layer,
             "verbose": 1,
+            # Schedule and internal features
+            "pruning_schedule": args.pruning_schedule,
+            "bn_recalibration": args.model_type == "cnn",
+            "sparse_mode": args.sparse_mode,
+            "sparse_l1_lambda": args.l1_lambda,
+            "sparse_gmp_target": args.gmp_target_sparsity,
         },
         "slice_sparsity_args": None,
     }
@@ -130,6 +140,8 @@ def build_pruning_config(args, model, config_dir):
     log_info(f"Pruning config written to {config_path}")
     log_info(f"  VBP layers: {len(layers)}, epoch_rate={epoch_rate}, "
              f"keep_ratio={args.keep_ratio:.3f}, mac_target={'yes' if args.mac_target else 'no'}")
+    if args.sparse_mode != "none":
+        log_info(f"  Sparse: mode={args.sparse_mode}, start_epoch={start_epoch}")
     return config_dir
 
 
@@ -237,7 +249,11 @@ def main():
         pruner.prune(eval_model, epoch, log=logger, mask_only=False)
 
         # Re-wrap in DDP if pruning changed the model structure
-        cur_step = pruner.channel_pruner.pruner.current_step if pruner.channel_pruner.pruner else 0
+        # For geometric schedule, use _geometric_step (pruner.current_step resets on reinit)
+        if pruner.channel_pruner.pruning_schedule == 'geometric':
+            cur_step = pruner.channel_pruner._geometric_step
+        else:
+            cur_step = pruner.channel_pruner.pruner.current_step if pruner.channel_pruner.pruner else 0
         if use_ddp and cur_step > prev_step:
             prev_step = cur_step
             del train_model
@@ -254,6 +270,7 @@ def main():
             optimizer, scheduler, device, epoch, args,
             teacher=teacher, step_per_batch=step_per_batch,
             phase="PAT", var_hooks=var_hooks,
+            regularize_fn=pruner.channel_regularize,
         )
 
         # Validate
@@ -337,6 +354,20 @@ def parse_args():
                         help="Total training epochs")
     parser.add_argument("--lr", type=float, default=1.5e-5)
     parser.add_argument("--var_loss_weight", type=float, default=0.0)
+    parser.add_argument("--pruning_schedule", default="geometric",
+                        choices=["geometric", "linear"],
+                        help="Pruning schedule type")
+
+    # Sparse pre-training
+    parser.add_argument("--sparse_mode", default="none",
+                        choices=["l1_group", "gmp", "none"],
+                        help="Sparse pre-training mode (none = skip)")
+    parser.add_argument("--epochs_sparse", type=int, default=0,
+                        help="Sparse pre-training epochs (shifts pruning start)")
+    parser.add_argument("--l1_lambda", type=float, default=1e-4,
+                        help="L2,1 regularization strength (l1_group mode)")
+    parser.add_argument("--gmp_target_sparsity", type=float, default=0.5,
+                        help="Target weight sparsity for GMP mode")
 
     # KD
     parser.add_argument("--use_kd", action="store_true")
