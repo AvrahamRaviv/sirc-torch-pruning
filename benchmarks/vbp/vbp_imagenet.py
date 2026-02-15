@@ -719,7 +719,7 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
                     scheduler, device, epoch, args,
                     teacher=None, fc1_modules=None,
                     step_per_batch=True, phase="Epoch",
-                    var_hooks=None):
+                    var_hooks=None, regularize_fn=None):
     """Unified training epoch: optional KD + optional L2,1 regularization + optional var loss.
 
     Args:
@@ -779,6 +779,9 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
 
         optimizer.zero_grad()
         loss.backward()
+        if regularize_fn is not None:
+            eval_m = model.module if isinstance(model, DDP) else model
+            regularize_fn(eval_m)
         optimizer.step()
         if step_per_batch:
             scheduler.step()
