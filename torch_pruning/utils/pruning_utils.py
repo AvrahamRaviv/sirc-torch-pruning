@@ -477,9 +477,10 @@ class ChannelPruning:
             current_macs = count_ops_and_params(model, self.example_inputs)[0]
             mac_ratio = current_macs / self._original_macs
         else:
-            # Mask-only steps: detect zeroed channels for effective MACs
-            current_macs, total_macs = self.measure_macs_masked_model(model)
-            mac_ratio = current_macs / total_macs
+            # Mask-only: adjusted_macs/touched_macs covers only layers with
+            # zeroed channels. Include untouched layers to get ratio vs original.
+            adjusted_macs, touched_macs = self.measure_macs_masked_model(model)
+            mac_ratio = (self._original_macs - touched_macs + adjusted_macs) / self._original_macs
         _log(log, f" Step {step_num}/{total_num}: "
                   f"MACs = {mac_ratio:.3f} of original")
 
