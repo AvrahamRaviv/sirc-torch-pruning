@@ -76,6 +76,9 @@ class GroupNormPruner(BasePruner):
         forward_fn: typing.Callable = None, # a function to execute model.forward
         output_transform: typing.Callable = None, # a function to transform network outputs
 
+        # Bias compensation
+        mean_dict: typing.Optional[typing.Dict[nn.Module, torch.Tensor]] = None, # per-channel activation means
+
         # deprecated
         channel_groups: typing.Dict[nn.Module, int] = dict(), # channel groups for layers
         ch_sparsity: float = None,
@@ -107,7 +110,9 @@ class GroupNormPruner(BasePruner):
             root_module_types=root_module_types,
             forward_fn=forward_fn,
             output_transform=output_transform,
-            
+
+            mean_dict=mean_dict,
+
             channel_groups=channel_groups,
             ch_sparsity=ch_sparsity,
             ch_sparsity_dict=ch_sparsity_dict
