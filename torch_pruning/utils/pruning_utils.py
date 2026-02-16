@@ -81,9 +81,9 @@ class Pruning:
         self.channel_pruner.slice_block_size = self.slice_pruner.block_size
         self.slice_pruner.channel_mask_dict = self.channel_pruner.channel_mask_dict
 
-    def channel_regularize(self, model: nn.Module) -> None:
+    def channel_regularize(self, model: nn.Module) -> float:
         """Apply channel regularization to the model."""
-        self.channel_pruner.regularize(model)
+        return self.channel_pruner.regularize(model)
 
     def slice_regularize(self, model: nn.Module) -> torch.Tensor:
         """Apply slice regularization to the model."""
@@ -450,14 +450,14 @@ class ChannelPruning:
 
     def regularize(self, model):
         if self.current_epoch > self.end_epoch:
-            return
+            return 0.0
         # VBP does not use traditional regularization; var loss is handled externally
         if self.pruning_method == PruningMethod.VBP:
-            return
+            return 0.0
         if not self.prune_channels or self.channels_pruner_args["reg"] == 0:
-            return
+            return 0.0
         self.update_max_imp()
-        self.pruner.regularize(model, alpha=2 ** self.channels_pruner_args["alpha_shrinkage_reg"])
+        return self.pruner.regularize(model, alpha=2 ** self.channels_pruner_args["alpha_shrinkage_reg"])
 
     def set_layers_to_prune(self, model):
         """Build ignored_layers and per-layer pruning ratio dict.

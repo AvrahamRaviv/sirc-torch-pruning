@@ -128,6 +128,7 @@ class GroupNormPruner(BasePruner):
 
     @torch.no_grad()
     def regularize(self, model, alpha=2**4, bias=False):
+        reg_loss = 0.0
         for i, group in enumerate(self._groups):
             ch_groups = self._get_channel_groups(group)
             imp = self.estimate_importance(group).sqrt()
@@ -152,12 +153,14 @@ class GroupNormPruner(BasePruner):
 
                     w = layer.weight.data[idxs]
                     g = w * _gamma.view( -1, *([1]*(len(w.shape)-1)) ) #/ group_norm.view( -1, *([1]*(len(w.shape)-1)) ) * group_size #group_size #* gamma.view( -1, *([1]*(len(w.shape)-1)) )
-                    layer.weight.grad.data[idxs]+=self.reg * g 
-                    
+                    layer.weight.grad.data[idxs]+=self.reg * g
+                    reg_loss += (self.reg * g).abs().sum().item()
+
                     if bias and layer.bias is not None:
                         b = layer.bias.data[idxs]
                         g = b * _gamma
-                        layer.bias.grad.data[idxs]+=self.reg * g 
+                        layer.bias.grad.data[idxs]+=self.reg * g
+                        reg_loss += (self.reg * g).abs().sum().item()
 
                 elif prune_fn in [
                     function.prune_conv_in_channels,
@@ -179,7 +182,8 @@ class GroupNormPruner(BasePruner):
                     w = layer.weight.data[:, idxs]
                     g = w * _gamma.view( 1, -1, *([1]*(len(w.shape)-2))  ) #/ gn.view( 1, -1, *([1]*(len(w.shape)-2)) ) * group_size #* gamma.view( 1, -1, *([1]*(len(w.shape)-2))  )
                     layer.weight.grad.data[:, idxs]+=self.reg * g
-                    
+                    reg_loss += (self.reg * g).abs().sum().item()
+
                 elif prune_fn == function.prune_batchnorm_out_channels:
                     # regularize BN
                     if layer.affine is not None:
@@ -190,10 +194,13 @@ class GroupNormPruner(BasePruner):
 
                         w = layer.weight.data[idxs]
                         g = w * _gamma #/ group_norm * group_size
-                        layer.weight.grad.data[idxs]+=self.reg * g 
-                        
+                        layer.weight.grad.data[idxs]+=self.reg * g
+                        reg_loss += (self.reg * g).abs().sum().item()
+
                         if bias and layer.bias is not None:
                             b = layer.bias.data[idxs]
                             g = b * _gamma #/ group_norm * group_size
-                            layer.bias.grad.data[idxs]+=self.reg * g 
+                            layer.bias.grad.data[idxs]+=self.reg * g
+                            reg_loss += (self.reg * g).abs().sum().item()
         self.cnt+=1
+        return reg_loss
