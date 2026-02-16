@@ -451,6 +451,16 @@ class ChannelPruning:
             if self.pruner.current_step >= self.iterative_steps:
                 self.prune_channels = False
 
+        # After final step, persist is_prune=False so future loads skip pruning
+        if not self.prune_channels:
+            config_path = os.path.join(self.config_folder, "pruning_config.json")
+            with open(config_path, "r") as f:
+                sparsity_args = json.load(f)
+            sparsity_args['channel_sparsity_args']['is_prune'] = False
+            with open(config_path, 'w') as f:
+                json.dump(sparsity_args, f, indent=4)
+            _log(log, f" Pruning complete — updated {config_path} (is_prune=False)")
+
         self.update_channel_mask_dict(model)
 
         # Log MAC progress (absolute MACs vs original, works after physical pruning too)
