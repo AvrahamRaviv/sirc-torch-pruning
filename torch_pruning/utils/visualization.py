@@ -153,6 +153,7 @@ def _build_group_assignment(
     node_ids: Dict[Any, str],
     ignored_set: Optional[Set[OPTYPE]],
     group_root_types=None,
+    ignored_layers=None,
 ) -> Dict[str, int]:
     """Build node_id -> group_idx mapping. Nodes in multiple groups get assigned to their first.
 
@@ -165,7 +166,7 @@ def _build_group_assignment(
     if group_root_types is None:
         group_root_types = (nn.Conv2d, nn.Linear)
 
-    groups_list = list(DG.get_all_groups(root_module_types=group_root_types))
+    groups_list = list(DG.get_all_groups(root_module_types=group_root_types, ignored_layers=ignored_layers))
     node_id_to_group: Dict[str, int] = {}
     multi_group_nodes: Set[str] = set()
 
@@ -325,6 +326,7 @@ def visualize_graph(
     show_groups: bool = False,
     differentiate_dependencies: bool = True,
     group_root_types=None,
+    ignored_layers: Optional[List] = None,
 ) -> graphviz.Digraph:
     """Visualize the dependency graph using Graphviz.
 
@@ -400,7 +402,7 @@ def visualize_graph(
     num_groups = 0
     if show_groups:
         node_id_to_group, multi_group_nodes, num_groups = _build_group_assignment(
-            DG, node_ids, ignored_set, group_root_types
+            DG, node_ids, ignored_set, group_root_types, ignored_layers
         )
 
     # Collect edges
