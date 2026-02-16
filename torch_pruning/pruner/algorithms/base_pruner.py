@@ -43,6 +43,7 @@ class BasePruner:
         root_module_types (list): types of prunable modules. Default: [nn.Conv2d, nn.Linear, nn.LSTM].
         forward_fn (Callable): A function to execute model.forward. Default: None.
         output_transform (Callable): A function to transform network outputs. Default: None.
+        mean_dict (Dict[nn.Module, Tensor]): per-channel activation means for bias compensation. When set, consumer biases are adjusted before pruning to preserve expected outputs. Default: None.
         channel_groups (Dict[nn.Module, int]): output channel grouping. Default: dict().
         ch_sparsity (float): the same as pruning_ratio. Default: None.
         ch_sparsity_dict (Dict[nn.Module, float]): the same as pruning_ratio_dict. Default: None.
@@ -77,7 +78,10 @@ class BasePruner:
         root_module_types: typing.List = [ops.TORCH_CONV, ops.TORCH_LINEAR, ops.TORCH_LSTM],  # root module for each group
         forward_fn: typing.Callable = None, # a function to execute model.forward
         output_transform: typing.Callable = None, # a function to transform network outputs
-        
+
+        # Bias compensation
+        mean_dict: typing.Optional[typing.Dict[nn.Module, torch.Tensor]] = None, # per-channel activation means for bias compensation
+
         # deprecated
         channel_groups: typing.Dict[nn.Module, int] = dict(), # channel grouping
         ch_sparsity: float = None,
@@ -85,6 +89,7 @@ class BasePruner:
     ):
         self.model = model
         self.importance = importance
+        self.mean_dict = mean_dict
 
         # Handle deprecated parameters
         if ch_sparsity is not None:
@@ -265,21 +270,93 @@ class BasePruner:
         self.initial_total_channels = initial_total_channels
         self.initial_total_heads = initial_total_heads
 
+    @torch.no_grad()
+    def set_mean_dict(self, mean_dict):
+        """Set or update activation means for bias compensation (e.g. between PAT steps)."""
+        self.mean_dict = mean_dict
+
+    @torch.no_grad()
+    def _add_bias(self, module, delta):
+        """Create or update a bias parameter on module."""
+        if module.bias is None:
+            module.bias = nn.Parameter(delta.clone())
+        else:
+            module.bias.data += delta
+
+    @torch.no_grad()
+    def _apply_compensation(self, group, idx_to_prune):
+        """Compensate consumer biases for pruned channels using calibration means.
+
+        For any linear layer y = Wx + b, removing input channels causes
+        E[Δy] = W_pruned @ E[x_pruned]. This method adds that correction
+        to the consumer's bias before the channels are actually removed.
+
+        Works with Linear, Conv2d (standard), and Conv2d (depthwise).
+        """
+        dep0, _ = group[0]
+        root = dep0.target.module
+
+        # Look up calibration mean for root; fall back to group search
+        # (handles DW conv in MobileNetV2 where stats are on expand conv)
+        mu = self.mean_dict.get(root)
+        if mu is None:
+            for dep_i, _ in group:
+                candidate = dep_i.target.module
+                if candidate in self.mean_dict and len(self.mean_dict[candidate]) == root.weight.shape[0]:
+                    mu = self.mean_dict[candidate]
+                    break
+        if mu is None:
+            return
+
+        rem = torch.as_tensor(idx_to_prune, device=root.weight.device)
+        mu = mu.to(root.weight.device)
+
+        for dep, _ in group[1:]:
+            handler = dep.handler
+            consumer = dep.target.module
+
+            if not isinstance(consumer, (nn.Conv2d, nn.Linear)):
+                continue
+
+            if handler == function.prune_linear_in_channels:
+                W = consumer.weight[:, rem]
+                delta_b = (W * mu[rem]).sum(dim=1)
+                self._add_bias(consumer, delta_b)
+
+            elif handler == function.prune_conv_in_channels:
+                if consumer.groups == consumer.in_channels:
+                    # depthwise
+                    delta_b = torch.zeros(consumer.out_channels, device=consumer.weight.device)
+                    delta_b[rem] = consumer.weight[rem, 0].sum(dim=(1, 2)) * mu[rem]
+                    self._add_bias(consumer, delta_b)
+                else:
+                    W = consumer.weight[:, rem, :, :]
+                    W_sp = W.sum(dim=(2, 3))
+                    delta_b = (W_sp * mu[rem]).sum(dim=1)
+                    self._add_bias(consumer, delta_b)
+
     def step(self, interactive: bool = False) -> typing.Union[typing.Generator, None]:
         """Execute one step of pruning.
-        
+
         Args:
-            interactive: If True, yields groups for interactive pruning. 
+            interactive: If True, yields groups for interactive pruning.
                         If False, prunes all groups automatically.
-                        
+
         Returns:
             Generator yielding pruning groups if interactive=True, None otherwise.
         """
         self.current_step += 1
         if interactive:  # yield groups for interactive pruning
             return self._prune()
+        if self.mean_dict is None:
+            for group in self._prune():
+                group.prune()
         else:
             for group in self._prune():
+                dep0, idxs = group[0]
+                if len(idxs) == 0:
+                    continue
+                self._apply_compensation(group, idxs)
                 group.prune()
 
     def manual_prune_width(self, layer: nn.Module, pruning_fn: typing.Callable, 

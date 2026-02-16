@@ -39,6 +39,9 @@ __all__ = [
     # CNN VBP helpers
     "build_cnn_target_layers",
     "build_cnn_ignored_layers",
+
+    # Standalone stats collection
+    "collect_activation_means",
 ]
 
 class Importance(abc.ABC):
@@ -1394,3 +1397,26 @@ def build_cnn_ignored_layers(model, architecture, interior_only=True):
                             ignored.append(conv)
 
     return ignored
+
+
+def collect_activation_means(model, dataloader, device, target_layers=None, max_batches=200):
+    """Collect per-channel activation means for bias compensation.
+
+    Standalone utility -- use with ANY pruning criterion.
+    Pass the returned dict as ``mean_dict`` to any pruner for compensation.
+
+    Args:
+        model: The model to collect statistics from.
+        dataloader: Calibration data loader (images, labels).
+        device: Device to run on.
+        target_layers: Optional list of (module, post_act_fn) tuples.
+            See VarianceImportance.collect_statistics for details.
+        max_batches: Maximum calibration batches. Default: 200.
+
+    Returns:
+        dict mapping nn.Module -> 1-D Tensor of per-channel means.
+    """
+    collector = VarianceImportance()
+    collector.collect_statistics(model, dataloader, device,
+                                target_layers=target_layers, max_batches=max_batches)
+    return dict(collector.means)

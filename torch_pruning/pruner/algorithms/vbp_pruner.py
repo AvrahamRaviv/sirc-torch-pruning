@@ -12,19 +12,14 @@ from .. import function
 
 class VBPPruner(BasePruner):
     def __init__(self, model, example_inputs, *args, mean_dict=None, var_dict=None, verbose=True, **kwargs):
-        super().__init__(model, example_inputs, *args, **kwargs)
+        super().__init__(model, example_inputs, *args, mean_dict=mean_dict, **kwargs)
         self.example_inputs = example_inputs
-        self.mean_dict = mean_dict
         self.var_dict = var_dict  # reserved for future BN variance correction
         self.verbose = verbose
 
         # mean-check state
         self._meancheck_enabled = False
         self._meancheck_handles = []
-
-    @torch.no_grad()
-    def set_mean_dict(self, mean_dict):
-        self.mean_dict = mean_dict
 
     @torch.no_grad()
     def set_var_dict(self, var_dict):
@@ -85,12 +80,10 @@ class VBPPruner(BasePruner):
             dep0, idxs = group[0]
             if len(idxs) == 0:
                 continue
-            root = dep0.target.module
 
             # Optional mean-check diagnostic (requires enable_meancheck + forward pass)
             consumer = None
             mu_before = None
-            mu_after = None
             if self._meancheck_enabled:
                 for dep, _ in group[1:]:
                     if dep.handler in (
@@ -124,87 +117,6 @@ class VBPPruner(BasePruner):
                         f"mean(|Δμ|)={d.mean():.5f}, "
                         f"max(|Δμ|)={d.max():.5f}"
                     )
-
-    @torch.no_grad()
-    def _add_bias(self, module, delta):
-        if module.bias is None:
-            module.bias = nn.Parameter(delta.clone())
-        else:
-            module.bias.data += delta
-
-    @torch.no_grad()
-    def _apply_compensation(self, group, idx_to_prune):
-        """Compensate consumer biases for pruned channels using calibration means.
-
-        NOTE on residual stream pruning (e.g. ResNet conv3 -> add -> next block):
-        When pruning channels that feed through a residual add, the compensation
-        uses the post-BN+ReLU mean of the pruned conv's output. This is an
-        approximation -- the true input to the consumer is (residual + conv_output),
-        but we only have the conv_output mean. Fine-tuning recovers this gap.
-        Interior block pruning (conv1/conv2 in Bottleneck) is exact since there
-        is no add node between the pruned conv and its consumer.
-        """
-        dep0, _ = group[0]
-        root = dep0.target.module  # pruned Conv / Linear
-
-        # Use calibration means from mean_dict (keyed by root module).
-        # If root has no mean (e.g. DW conv in MobileNetV2), search the
-        # group for another module with matching-size means (e.g. expand conv).
-        mu = self.mean_dict.get(root)
-        if mu is None:
-            for dep_i, _ in group:
-                candidate = dep_i.target.module
-                if candidate in self.mean_dict and len(self.mean_dict[candidate]) == root.weight.shape[0]:
-                    mu = self.mean_dict[candidate]
-                    if self.verbose:
-                        print(f"[VBP-comp] Using mean from {candidate} for root {root}")
-                    break
-        if mu is None:
-            if self.verbose:
-                print(f"[VBP] No calibration mean for {root}, skipping compensation")
-            return
-
-        rem = torch.as_tensor(idx_to_prune, device=root.weight.device)
-        mu = mu.to(root.weight.device)
-        compensated = False
-
-        for dep, _ in group[1:]:
-            handler = dep.handler
-            consumer = dep.target.module
-
-            # We only compensate real parameterized consumers
-            if not isinstance(consumer, (nn.Conv2d, nn.Linear)):
-                continue
-
-            # ----- Linear consumer -----
-            if handler == function.prune_linear_in_channels:
-                # consumer.weight: [C_out, C_in]
-                W = consumer.weight[:, rem]  # [C_out, |rem|]
-                delta_b = (W * mu[rem]).sum(dim=1)  # [C_out]
-                self._add_bias(consumer, delta_b)
-                compensated = True
-                if self.verbose:
-                    print(f"[VBP-comp] consumer {consumer} compensated (calibration mu)")
-
-            # ----- Conv consumer -----
-            elif handler == function.prune_conv_in_channels:
-                if consumer.groups == consumer.in_channels:
-                    # depthwise
-                    delta_b = torch.zeros(consumer.out_channels, device=consumer.weight.device)
-                    delta_b[rem] = consumer.weight[rem, 0].sum(dim=(1, 2)) * mu[rem]
-                    self._add_bias(consumer, delta_b)
-                else:
-                    W = consumer.weight[:, rem, :, :]  # [C_out, |rem|, kH, kW]
-                    W_sp = W.sum(dim=(2, 3))  # [C_out, |rem|]
-                    delta_b = (W_sp * mu[rem]).sum(dim=1)  # [C_out]
-                    self._add_bias(consumer, delta_b)
-
-                compensated = True
-                if self.verbose:
-                    print(f"[VBP-comp] consumer {consumer} compensated (calibration mu)")
-
-        if not compensated and self.verbose:
-            print(f"[VBP] No compensation applied for {root} (no param consumer found)")
 
     @torch.no_grad()
     def _collect_out_mean(self, model, module, x):
