@@ -506,6 +506,7 @@ def visualize_all_views(
     group_root_types=None,
     differentiate_dependencies: bool = True,
     show_edge_labels: bool = False,
+    ignored_layers: Optional[List] = None,
 ) -> Dict[str, graphviz.Digraph]:
     """Generate computational, dependency, and combined views with consistent layout.
 
@@ -523,6 +524,7 @@ def visualize_all_views(
         group_root_types: Module types for group roots (default: Conv2d, Linear).
         differentiate_dependencies: Style direct vs force-shape-match differently.
         show_edge_labels: Whether to show trigger/handler labels on dependency edges.
+        ignored_layers: Layers to exclude from group assignment.
 
     Returns:
         Dict mapping view name to its graphviz.Digraph object.
@@ -544,5 +546,6 @@ def visualize_all_views(
             show_groups=True,
             differentiate_dependencies=differentiate_dependencies,
             group_root_types=group_root_types,
+            ignored_layers=ignored_layers,
         )
     return results
