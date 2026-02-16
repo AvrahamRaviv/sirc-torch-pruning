@@ -645,10 +645,8 @@ class ChannelPruning:
                 elif DG.is_in_channel_pruning_fn(dep.handler):
                     pruned_dims.setdefault(module, set()).add('in')
 
-        # Only count MACs for Conv2d/Linear layers (skip BN, activation, etc.)
-        prunable_types = (nn.Conv2d, nn.Linear)
-        mac_total = sum(v for m, v in macs_dict.items()
-                        if v is not None and isinstance(m, prunable_types))
+        # Only count MACs for layers that appear in pruning groups (excludes ignored layers)
+        mac_total = sum(macs_dict.get(m, 0) or 0 for m in pruned_dims)
         mac_1dim = sum(macs_dict[m] for m, dims in pruned_dims.items()
                        if len(dims) == 1 and macs_dict.get(m) is not None)
         mac_2dim = sum(macs_dict[m] for m, dims in pruned_dims.items()
