@@ -227,7 +227,7 @@ class DependencyGraph(object):
                 dep, idxs = processing_stack.pop(-1)
                 node, fn = dep.target, dep.handler
                 visited_node.add(node)
-
+    
                 for new_dep in node.dependencies:
                     if new_dep.is_triggered_by(fn):
                         new_indices = idxs
@@ -237,8 +237,10 @@ class DependencyGraph(object):
 
                         if len(new_indices) == 0:
                             continue
-
-                        if group.has_pruning_op(new_dep, new_indices):
+                        
+                        if (new_dep.target in visited_node) and group.has_pruning_op(
+                            new_dep, new_indices
+                        ):
                             continue
                         else:
                             group.add_dep(new_dep, new_indices)
