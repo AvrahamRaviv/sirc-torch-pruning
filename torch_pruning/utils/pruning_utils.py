@@ -113,6 +113,12 @@ class ChannelPruning:
             return
 
         self.prune_channels = channel_sparsity_args.get('is_prune', True)
+        if not self.prune_channels:
+            _log(self.log, "=> Channel pruning already complete (is_prune=False), skipping init.")
+            self.prune_channels_at_init = False
+            self.slice_block_size = None
+            return
+
         self.channel_sparsity_args = channel_sparsity_args
         self.device = device
         self.infer = self.channel_sparsity_args['infer']
@@ -478,12 +484,14 @@ class ChannelPruning:
                   f"MACs = {mac_ratio:.3f} of original")
 
     def regularize(self, model):
+        if not self.prune_channels:
+            return 0.0
         if self.current_epoch > self.end_epoch:
             return 0.0
         # VBP does not use traditional regularization; var loss is handled externally
         if self.pruning_method == PruningMethod.VBP:
             return 0.0
-        if not self.prune_channels or self.channels_pruner_args["reg"] == 0:
+        if self.channels_pruner_args["reg"] == 0:
             return 0.0
         self.update_max_imp()
         return self.pruner.regularize(model, alpha=2 ** self.channels_pruner_args["alpha_shrinkage_reg"])
