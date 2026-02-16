@@ -154,13 +154,15 @@ class ChannelPruning:
         self.slice_block_size = None
         self.verbose = self.channel_sparsity_args.get("verbose", 1)
 
-        # VBP-specific state
+        # Stats collection & compensation state (used by VBP and any criterion with compensation)
         self.vbp_importance = None
-        self.train_loader = None  # set externally for VBP stats collection
+        self._compensation_means = None  # collected means for bias compensation (any criterion)
+        self.train_loader = None  # set externally for stats collection
         self._vbp_model_type = self.channel_sparsity_args.get("model_type", None)
         self._vbp_max_batches = self.channel_sparsity_args.get("max_batches", 200)
         self._vbp_var_loss_weight = self.channel_sparsity_args.get("var_loss_weight", 0.0)
         self._vbp_norm_per_layer = self.channel_sparsity_args.get("norm_per_layer", False)
+        self._no_compensation = self.channel_sparsity_args.get("no_compensation", False)
 
         # Build ignored_layers (needed before MAC estimation)
         self.set_layers_to_prune(model)
@@ -234,9 +236,25 @@ class ChannelPruning:
                         target_layers=target_layers,
                         max_batches=self._vbp_max_batches)
                 self.vbp_importance = imp
-            pruner_entry = partial(tp.pruner.VBPPruner, mean_dict=imp.means)
+            pruner_entry = partial(tp.pruner.VBPPruner)
         else:
             raise NameError(f'Unsupported pruner method. {self.channels_pruner_args["pruning_method"]}')
+
+        # Collect activation means for bias compensation (any criterion)
+        want_compensation = not self._no_compensation and self.train_loader is not None
+        if want_compensation and collect_stats:
+            if self.pruning_method == PruningMethod.VBP:
+                # VBP already collected means via VarianceImportance
+                self._compensation_means = dict(imp.means) if imp.means else None
+            elif self._compensation_means is None:
+                # Non-VBP: collect means using standalone utility
+                from torch_pruning.pruner.importance import collect_activation_means
+                target_layers = self._build_target_layers(model)
+                self._compensation_means = collect_activation_means(
+                    model, self.train_loader, self.device,
+                    target_layers=target_layers,
+                    max_batches=self._vbp_max_batches)
+                _log(log, f"Collected activation means for compensation ({len(self._compensation_means)} layers)")
 
         # init pruner
         grad_d = {}
@@ -254,6 +272,7 @@ class ChannelPruning:
             forward_fn=self.model_forward_fn,
             isomorphic=self.channels_pruner_args["isomorphic"],
             iterative_steps=self.iterative_steps,
+            mean_dict=self._compensation_means if want_compensation else None,
         )
         # VBPPruner/BasePruner doesn't accept reg; only pass for regularization-based pruners
         if self.pruning_method == PruningMethod.VBP:
@@ -262,7 +281,20 @@ class ChannelPruning:
             pruner_kwargs["reg"] = self.channels_pruner_args["reg"]
         self.pruner = pruner_entry(model, **pruner_kwargs)
 
-        # CNN VBP: collect stats after pruner creation (needs DG for graph-walking)
+        # CNN: collect stats after pruner creation (needs DG for graph-walking)
+        if (self._vbp_model_type == "cnn"
+                and collect_stats
+                and self.train_loader is not None
+                and self._compensation_means is None
+                and want_compensation):
+            target_layers = self._build_target_layers_from_dg(model, self.pruner.DG)
+            from torch_pruning.pruner.importance import collect_activation_means
+            self._compensation_means = collect_activation_means(
+                model, self.train_loader, self.device,
+                target_layers=target_layers,
+                max_batches=self._vbp_max_batches)
+            self.pruner.set_mean_dict(self._compensation_means)
+        # VBP CNN: also update vbp_importance if variance was just collected
         if (self.pruning_method == PruningMethod.VBP
                 and self._vbp_model_type == "cnn"
                 and collect_stats
@@ -273,8 +305,8 @@ class ChannelPruning:
                 model, self.train_loader, self.device,
                 target_layers=target_layers,
                 max_batches=self._vbp_max_batches)
-            # Update mean_dict on the pruner after stats are collected
-            self.pruner.set_mean_dict(imp.means)
+            self._compensation_means = dict(imp.means)
+            self.pruner.set_mean_dict(self._compensation_means)
 
         for n, m in model.named_parameters():
             m.requires_grad = grad_d[n]
@@ -354,44 +386,65 @@ class ChannelPruning:
                 _log(log, f" Epoch {epoch}, regularization phase")
             return
 
-        # Re-collect VBP stats before each step (critical for PAT correctness)
-        if is_vbp and self.train_loader is not None:
-            if self._vbp_model_type == "cnn":
-                target_layers = self._build_target_layers_from_dg(model, self.pruner.DG)
-            else:
-                target_layers = self._build_target_layers(model)
-            self.vbp_importance.collect_statistics(
-                model, self.train_loader, self.device,
-                target_layers=target_layers,
-                max_batches=self._vbp_max_batches)
-            # mean_dict is same dict object → VBPPruner sees updates automatically
+        # Re-collect stats before each step (critical for PAT correctness)
+        has_compensation = self.pruner.mean_dict is not None
+        if self.train_loader is not None:
+            if is_vbp:
+                # VBP: re-collect variance + means
+                if self._vbp_model_type == "cnn":
+                    target_layers = self._build_target_layers_from_dg(model, self.pruner.DG)
+                else:
+                    target_layers = self._build_target_layers(model)
+                self.vbp_importance.collect_statistics(
+                    model, self.train_loader, self.device,
+                    target_layers=target_layers,
+                    max_batches=self._vbp_max_batches)
+                self._compensation_means = dict(self.vbp_importance.means)
+                self.pruner.set_mean_dict(self._compensation_means)
+            elif has_compensation:
+                # Non-VBP: re-collect means only (model changed since last step)
+                from torch_pruning.pruner.importance import collect_activation_means
+                if self._vbp_model_type == "cnn":
+                    target_layers = self._build_target_layers_from_dg(model, self.pruner.DG)
+                else:
+                    target_layers = self._build_target_layers(model)
+                self._compensation_means = collect_activation_means(
+                    model, self.train_loader, self.device,
+                    target_layers=target_layers,
+                    max_batches=self._vbp_max_batches)
+                self.pruner.set_mean_dict(self._compensation_means)
 
         self.update_max_imp()
 
-        if is_vbp:
-            # VBP: physical pruning with bias compensation
+        use_mask = mask_only and not self.prune_channels_at_init
+
+        if is_vbp and not use_mask:
+            # VBP: physical pruning with meancheck diagnostic
             self.pruner.enable_meancheck(model)
             model.eval()
             with torch.no_grad():
                 model(self.example_inputs)
-            self.pruner.step(interactive=False, enable_compensation=True)
+            self.pruner.step(interactive=False, enable_compensation=has_compensation)
             self.pruner.disable_meancheck()
             _log(log, " VBP pruning step complete")
+        elif not use_mask:
+            # Non-VBP physical pruning: BasePruner.step() handles compensation when mean_dict set
+            self.pruner.step(interactive=False)
+            comp_str = " (with compensation)" if has_compensation else ""
+            _log(log, f" Pruning step complete{comp_str}")
         else:
-            # Non-VBP: physical or mask pruning via interactive step
+            # Mask-only mode: interactive step with optional compensation
             for group in self.pruner.step(interactive=True):
                 dep, idxs = group[0]
                 if len(idxs) > 0:
-                    use_mask = mask_only and not self.prune_channels_at_init
-                    if use_mask:
-                        self.mask_group(group)
-                    else:
-                        group.prune(idxs[:len(idxs) - (len(idxs) % self.slice_block_size)])
+                    if has_compensation:
+                        self.pruner._apply_compensation(group, idxs)
+                    self.mask_group(group)
 
                     if self.verbose > 0:
                         dep_str = str(dep)
-                        pom = "Mask" if use_mask else "Prune"
-                        _log(log, f" {pom} {len(idxs)}/{dep.target.module.weight.shape[0]} "
+                        comp_str = "+comp" if has_compensation else ""
+                        _log(log, f" Mask{comp_str} {len(idxs)}/{dep.target.module.weight.shape[0]} "
                                   f"channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}.")
 
         # BN recalibration after pruning step
