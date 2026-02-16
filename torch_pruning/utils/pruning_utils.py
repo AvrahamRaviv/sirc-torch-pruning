@@ -90,9 +90,10 @@ class Pruning:
         return self.slice_pruner.regularize(model)
 
     def prune(self, model: nn.Module, epoch: int, log: Optional[Any] = None,
-              mask_only: bool = True) -> None:
+              mask_only: bool = True, train_loader=None) -> None:
         """Perform pruning using both channel and slice pruners."""
-        self.channel_pruner.prune(model, epoch, log=log, mask_only=mask_only)
+        self.channel_pruner.prune(model, epoch, log=log, mask_only=mask_only,
+                                  train_loader=train_loader)
         self.slice_pruner.prune(model, epoch, log=log)
 
 
@@ -157,8 +158,7 @@ class ChannelPruning:
         # Stats collection & compensation state (used by VBP and any criterion with compensation)
         self.vbp_importance = None
         self._compensation_means = None  # collected means for bias compensation (any criterion)
-        self.train_loader = None  # set externally for stats collection
-        self._vbp_model_type = self.channel_sparsity_args.get("model_type", None)
+        self.train_loader = None  # set externally, or pass to prune()/init_channel_pruner()
         self._vbp_max_batches = self.channel_sparsity_args.get("max_batches", 200)
         self._vbp_var_loss_weight = self.channel_sparsity_args.get("var_loss_weight", 0.0)
         self._vbp_norm_per_layer = self.channel_sparsity_args.get("norm_per_layer", False)
@@ -203,12 +203,15 @@ class ChannelPruning:
 
         self.init_channel_pruner(model, log, print_layers=True)
 
-    def init_channel_pruner(self, model, log=None, print_layers=False, collect_stats=True):
+    def init_channel_pruner(self, model, log=None, print_layers=False, collect_stats=True,
+                             train_loader=None):
         log = log or self.log
+        loader = train_loader or self.train_loader
+
         # set layers to pruned and their pruning rate
         pruning_ratio_dict = self.set_layers_to_prune(model)
 
-        # set pruning method
+        # set pruning method (importance + pruner entry — no stats yet)
         if self.pruning_method == PruningMethod.BN_SCALE:
             imp = tp.importance.BNScaleImportance()
             pruner_entry = partial(tp.pruner.BNScalePruner, group_lasso=True)
@@ -227,35 +230,12 @@ class ChannelPruning:
             else:
                 imp = tp.importance.VarianceImportance(
                     norm_per_layer=self._vbp_norm_per_layer)
-                # Collect stats if train_loader is available and stats not yet collected
-                if collect_stats and self.train_loader is not None and len(imp.variance) == 0:
-                    target_layers = self._build_target_layers(model)
-                    imp.collect_statistics(
-                        model, self.train_loader, self.device,
-                        target_layers=target_layers,
-                        max_batches=self._vbp_max_batches)
                 self.vbp_importance = imp
             pruner_entry = partial(tp.pruner.VBPPruner)
         else:
             raise NameError(f'Unsupported pruner method. {self.channels_pruner_args["pruning_method"]}')
 
-        # Collect activation means for bias compensation (any criterion)
-        want_compensation = not self._no_compensation and self.train_loader is not None
-        if want_compensation and collect_stats:
-            if self.pruning_method == PruningMethod.VBP:
-                # VBP already collected means via VarianceImportance
-                self._compensation_means = dict(imp.means) if imp.means else None
-            elif self._compensation_means is None:
-                # Non-VBP: collect means using standalone utility
-                from torch_pruning.pruner.importance import collect_activation_means
-                target_layers = self._build_target_layers(model)
-                self._compensation_means = collect_activation_means(
-                    model, self.train_loader, self.device,
-                    target_layers=target_layers,
-                    max_batches=self._vbp_max_batches)
-                _log(log, f"Collected activation means for compensation ({len(self._compensation_means)} layers)")
-
-        # init pruner
+        # Create pruner first (builds DG for graph-walking)
         grad_d = {}
         for n, m in model.named_parameters():
             grad_d[n] = m.requires_grad
@@ -271,40 +251,36 @@ class ChannelPruning:
             forward_fn=self.model_forward_fn,
             isomorphic=self.channels_pruner_args["isomorphic"],
             iterative_steps=self.iterative_steps,
-            mean_dict=self._compensation_means if want_compensation else None,
         )
-        # VBPPruner/BasePruner doesn't accept reg; only pass for regularization-based pruners
         if self.pruning_method == PruningMethod.VBP:
             pruner_kwargs["verbose"] = self.verbose > 0
         else:
             pruner_kwargs["reg"] = self.channels_pruner_args["reg"]
         self.pruner = pruner_entry(model, **pruner_kwargs)
 
-        # CNN: collect stats after pruner creation (needs DG for graph-walking)
-        if (self._vbp_model_type == "cnn"
-                and collect_stats
-                and self.train_loader is not None
-                and self._compensation_means is None
-                and want_compensation):
-            target_layers = self._build_target_layers_from_dg(model, self.pruner.DG)
-            from torch_pruning.pruner.importance import collect_activation_means
-            self._compensation_means = collect_activation_means(
-                model, self.train_loader, self.device,
-                target_layers=target_layers,
-                max_batches=self._vbp_max_batches)
-            self.pruner.set_mean_dict(self._compensation_means)
-        # VBP CNN: also update vbp_importance if variance was just collected
-        if (self.pruning_method == PruningMethod.VBP
-                and self._vbp_model_type == "cnn"
-                and collect_stats
-                and self.train_loader is not None
-                and len(imp.variance) == 0):
-            target_layers = self._build_target_layers_from_dg(model, self.pruner.DG)
-            imp.collect_statistics(
-                model, self.train_loader, self.device,
-                target_layers=target_layers,
-                max_batches=self._vbp_max_batches)
-            self._compensation_means = dict(imp.means)
+        # Auto-detect target layers from DG (works for CNN, ViT, ConvNeXt, etc.)
+        from torch_pruning.pruner.importance import build_target_layers, collect_activation_means
+        target_layers = build_target_layers(model, self.pruner.DG)
+
+        # Collect stats using DG-detected target layers
+        want_compensation = not self._no_compensation and loader is not None
+        if collect_stats and loader is not None:
+            if self.pruning_method == PruningMethod.VBP and len(imp.variance) == 0:
+                imp.collect_statistics(
+                    model, loader, self.device,
+                    target_layers=target_layers,
+                    max_batches=self._vbp_max_batches)
+                if want_compensation:
+                    self._compensation_means = dict(imp.means) if imp.means else None
+            elif want_compensation and self._compensation_means is None:
+                self._compensation_means = collect_activation_means(
+                    model, loader, self.device,
+                    target_layers=target_layers,
+                    max_batches=self._vbp_max_batches)
+                _log(log, f"Collected activation means for compensation ({len(self._compensation_means)} layers)")
+
+        # Set mean_dict on pruner for bias compensation
+        if want_compensation and self._compensation_means:
             self.pruner.set_mean_dict(self._compensation_means)
 
         for n, m in model.named_parameters():
@@ -350,12 +326,16 @@ class ChannelPruning:
                     self.pruner.DG, viz_dir, format=fmt,
                     ignored_layers=self.ignored_layers)
 
-    def prune(self, model, epoch, log=None, mask_only=True, step=None):
+    def prune(self, model, epoch, log=None, mask_only=True, step=None, train_loader=None):
         """Prune the model using TP's built-in iterative_steps.
 
         Supports two modes: physical pruning (VBP) and mask-with-zeros.
         The pruner is created once at init; each pruning epoch calls step().
         For geometric schedule, reinits pruner after each step (new DG).
+
+        Args:
+            train_loader: Optional dataloader for stats re-collection. Falls
+                back to self.train_loader if not provided.
         """
         log = log or self.log
         if not self.prune_channels:
@@ -364,6 +344,7 @@ class ChannelPruning:
 
         self.current_epoch = epoch
         is_vbp = self.pruning_method == PruningMethod.VBP
+        loader = train_loader or self.train_loader
 
         # GMP masking for sparse pre-training (before start_epoch)
         if self._sparse_mode == "gmp" and epoch < self.start_epoch:
@@ -390,28 +371,22 @@ class ChannelPruning:
 
         # Re-collect stats before each step (critical for PAT correctness)
         has_compensation = self.pruner.mean_dict is not None
-        if self.train_loader is not None:
+        if loader is not None:
+            from torch_pruning.pruner.importance import build_target_layers, collect_activation_means
+            target_layers = build_target_layers(model, self.pruner.DG)
+
             if is_vbp:
                 # VBP: re-collect variance + means
-                if self._vbp_model_type == "cnn":
-                    target_layers = self._build_target_layers_from_dg(model, self.pruner.DG)
-                else:
-                    target_layers = self._build_target_layers(model)
                 self.vbp_importance.collect_statistics(
-                    model, self.train_loader, self.device,
+                    model, loader, self.device,
                     target_layers=target_layers,
                     max_batches=self._vbp_max_batches)
                 self._compensation_means = dict(self.vbp_importance.means)
                 self.pruner.set_mean_dict(self._compensation_means)
             elif has_compensation:
                 # Non-VBP: re-collect means only (model changed since last step)
-                from torch_pruning.pruner.importance import collect_activation_means
-                if self._vbp_model_type == "cnn":
-                    target_layers = self._build_target_layers_from_dg(model, self.pruner.DG)
-                else:
-                    target_layers = self._build_target_layers(model)
                 self._compensation_means = collect_activation_means(
-                    model, self.train_loader, self.device,
+                    model, loader, self.device,
                     target_layers=target_layers,
                     max_batches=self._vbp_max_batches)
                 self.pruner.set_mean_dict(self._compensation_means)
@@ -625,44 +600,11 @@ class ChannelPruning:
             total_adjusted_macs, total_macs = 1., 1.
         return total_adjusted_macs, total_macs
 
-    def _build_target_layers(self, model):
-        """Auto-detect target layers for VBP stats collection based on model_type."""
-        model_type = self._vbp_model_type
-        if model_type == "vit":
-            # HuggingFace ViT: block.intermediate.dense + block.intermediate.intermediate_act_fn
-            target_layers = []
-            for name, m in model.named_modules():
-                if name.endswith(".intermediate.dense"):
-                    # Navigate to parent block to get act fn
-                    parts = name.split(".")
-                    # intermediate.dense -> go up to block level
-                    block = model
-                    for p in parts[:-1]:  # up to "intermediate"
-                        block = getattr(block, p)
-                    act_fn = getattr(block, "intermediate_act_fn", None)
-                    target_layers.append((m, act_fn))
-            return target_layers if target_layers else None
-        elif model_type == "convnext":
-            target_layers = []
-            for name, m in model.named_modules():
-                if hasattr(m, "pwconv1") and hasattr(m, "act"):
-                    def _make_post_gelu_nchw(act_fn):
-                        def fn(x):
-                            return act_fn(x).permute(0, 3, 1, 2)
-                        return fn
-                    target_layers.append((m.pwconv1, _make_post_gelu_nchw(m.act)))
-            return target_layers if target_layers else None
-        elif model_type == "cnn":
-            # CNN target layers require a DependencyGraph for graph-walking.
-            # Return None here; caller should use _build_target_layers_from_dg() after
-            # building the pruner (which creates the DG).
-            return None
-        return None
-
-    def _build_target_layers_from_dg(self, model, DG):
-        """Build CNN target layers using DG graph-walking (post-pruner creation)."""
-        from torch_pruning.pruner.importance import build_cnn_target_layers
-        return build_cnn_target_layers(model, DG)
+    @staticmethod
+    def _build_target_layers_from_dg(model, DG):
+        """Build target layers using DG graph-walking. Handles all architectures."""
+        from torch_pruning.pruner.importance import build_target_layers
+        return build_target_layers(model, DG)
 
     def _estimate_channel_ratio(self, model):
         """Compute global channel pruning ratio to achieve self.mac_target.

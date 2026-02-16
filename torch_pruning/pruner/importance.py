@@ -40,6 +40,9 @@ __all__ = [
     "build_cnn_target_layers",
     "build_cnn_ignored_layers",
 
+    # Universal DG-based target layer detection
+    "build_target_layers",
+
     # Standalone stats collection
     "collect_activation_means",
 ]
@@ -1290,6 +1293,39 @@ def build_cnn_target_layers(model, DG):
         target_layers.append((module, post_act_fn))
 
     return target_layers
+
+
+def build_target_layers(model, DG):
+    """Auto-detect target_layers for stats collection using DG graph-walking.
+
+    Handles both Conv2d (Conv→BN→Act) and Linear (Linear→Act) patterns.
+    Works for CNNs, ViTs, ConvNeXt, and any architecture whose DG graph
+    captures the activation functions following prunable layers.
+
+    Args:
+        model: The model to detect target layers for.
+        DG: Built DependencyGraph with module2node populated.
+
+    Returns:
+        list of (module, post_act_fn) tuples, or None if no layers found.
+    """
+    target_layers = []
+    for module, node in DG.module2node.items():
+        if isinstance(module, nn.Conv2d):
+            # Skip depthwise convolutions
+            if module.groups == module.out_channels and module.out_channels > 1:
+                continue
+            if module.out_channels == 1:
+                continue
+        elif isinstance(module, nn.Linear):
+            pass  # Include all Linear modules; pruner filters via ignored_layers
+        else:
+            continue
+
+        post_act_fn = _compose_post_act(node)
+        target_layers.append((module, post_act_fn))
+
+    return target_layers if target_layers else None
 
 
 def _is_bottleneck_resnet(model):
