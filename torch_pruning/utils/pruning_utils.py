@@ -191,7 +191,6 @@ class ChannelPruning:
 
         # Sparse pre-training config
         self._sparse_mode = channel_sparsity_args.get('sparse_mode', 'none')
-        self._sparse_l1_lambda = channel_sparsity_args.get('sparse_l1_lambda', 1e-4)
         self._sparse_gmp_target = channel_sparsity_args.get('sparse_gmp_target', 0.5)
         self._sparse_modules = []
         if self._sparse_mode != 'none':
@@ -472,20 +471,12 @@ class ChannelPruning:
                   f"MACs = {current_macs / total_macs:.3f} of original")
 
     def regularize(self, model):
-        # Sparse pre-training: L21 gradient reg for pre-pruning epochs
-        if (self._sparse_mode == "l1_group"
-                and self.current_epoch < self.start_epoch):
-            for m in self._sparse_modules:
-                if m.weight.grad is not None:
-                    w = m.weight.data.flatten(1)
-                    norms = w.norm(p=2, dim=1, keepdim=True) + 1e-8
-                    m.weight.grad.add_(self._sparse_l1_lambda * (w / norms).view_as(m.weight))
+        if self.current_epoch > self.end_epoch:
             return
-
         # VBP does not use traditional regularization; var loss is handled externally
         if self.pruning_method == PruningMethod.VBP:
             return
-        if not self.prune_channels or self.channels_pruner_args["reg"] == 0 or self.current_epoch > self.end_epoch:
+        if not self.prune_channels or self.channels_pruner_args["reg"] == 0:
             return
         self.update_max_imp()
         self.pruner.regularize(model, alpha=2 ** self.channels_pruner_args["alpha_shrinkage_reg"])
