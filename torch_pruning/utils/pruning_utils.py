@@ -328,13 +328,10 @@ class ChannelPruning:
 
             # Viz graph — all 3 views (computational, dependency, both) in png + pdf
             viz_dir = os.path.join(self.config_folder, "viz")
-            try:
-                for fmt in ("png", "pdf"):
-                    tp.utils.visualize_all_views(
-                        self.pruner.DG, viz_dir, format=fmt,
-                        ignored_layers=self.ignored_layers)
-            except Exception as e:
-                _log(log, f"Graph visualization failed (non-critical): {e}")
+            for fmt in ("png", "pdf"):
+                tp.utils.visualize_all_views(
+                    self.pruner.DG, viz_dir, format=fmt,
+                    ignored_layers=self.ignored_layers)
 
     def prune(self, model, epoch, log=None, mask_only=True, step=None, train_loader=None):
         """Prune the model using TP's built-in iterative_steps.

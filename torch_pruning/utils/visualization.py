@@ -373,7 +373,7 @@ def visualize_graph(
         format=format,
         graph_attr={
             "rankdir": rankdir,
-            "splines": "ortho",
+            "splines": "polyline",
             "nodesep": "0.5",
             "ranksep": "0.5",
             "compound": "true",
