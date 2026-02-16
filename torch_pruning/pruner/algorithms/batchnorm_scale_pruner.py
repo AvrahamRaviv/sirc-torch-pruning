@@ -131,11 +131,14 @@ class BNScalePruner(BasePruner):
         if reg is None:
             reg = self.reg # use the default reg
 
+        reg_loss = 0.0
         if self.group_lasso==False:
             for m in model.modules():
                 if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)) and m.affine==True and m not in self.ignored_layers:
                     if m.weight.grad is None: continue
-                    m.weight.grad.data.add_(reg*torch.sign(m.weight.data))
+                    g = reg*torch.sign(m.weight.data)
+                    m.weight.grad.data.add_(g)
+                    reg_loss += g.abs().sum().item()
         else:
             for group in self._groups:
                 group_l2norm_sq = self._l2_imp(group) + 1e-9 # + 1e-9 to avoid inf
@@ -149,4 +152,7 @@ class BNScalePruner(BasePruner):
                         if layer.weight.grad is None: continue
                         root_idxs = group[i].root_idxs
                         _gamma = torch.index_select(gamma, 0, torch.tensor(root_idxs, device=gamma.device))
-                        layer.weight.grad.data.add_(_gamma * layer.weight.data) # Group Lasso https://tibshirani.su.domains/ftp/sparse-grlasso.pdf
+                        g = _gamma * layer.weight.data
+                        layer.weight.grad.data.add_(g) # Group Lasso https://tibshirani.su.domains/ftp/sparse-grlasso.pdf
+                        reg_loss += g.abs().sum().item()
+        return reg_loss
