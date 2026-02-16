@@ -395,6 +395,17 @@ class ChannelPruning:
 
         use_mask = mask_only and not self.prune_channels_at_init
 
+        # On the last pruning step, force physical channel removal so
+        # fine-tuning operates on the structurally smaller model.
+        if use_mask:
+            if self.pruning_schedule == 'geometric':
+                is_last_step = (self._geometric_step == self._total_steps - 1)
+            else:
+                is_last_step = (self.pruner.current_step == self.iterative_steps - 1)
+            if is_last_step:
+                use_mask = False
+                _log(log, " Last pruning step: switching to physical channel removal")
+
         if is_vbp and not use_mask:
             # VBP: physical pruning with meancheck diagnostic
             self.pruner.enable_meancheck(model)
