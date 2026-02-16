@@ -463,12 +463,19 @@ class ChannelPruning:
 
         self.update_channel_mask_dict(model)
 
-        # Log MAC progress (absolute MACs vs original, works after physical pruning too)
+        # Log MAC progress
         step_num = self._geometric_step if self.pruning_schedule == 'geometric' else self.pruner.current_step
         total_num = self._total_steps if self.pruning_schedule == 'geometric' else self.iterative_steps
-        current_macs = count_ops_and_params(model, self.example_inputs)[0]
+        if not self.prune_channels:
+            # After physical pruning: absolute MACs vs stored original
+            current_macs = count_ops_and_params(model, self.example_inputs)[0]
+            mac_ratio = current_macs / self._original_macs
+        else:
+            # Mask-only steps: detect zeroed channels for effective MACs
+            current_macs, total_macs = self.measure_macs_masked_model(model)
+            mac_ratio = current_macs / total_macs
         _log(log, f" Step {step_num}/{total_num}: "
-                  f"MACs = {current_macs / self._original_macs:.3f} of original")
+                  f"MACs = {mac_ratio:.3f} of original")
 
     def regularize(self, model):
         if self.current_epoch > self.end_epoch:
