@@ -138,6 +138,8 @@ class GroupNormPruner(BasePruner):
             # Update Gradient
             for i, (dep, idxs) in enumerate(group):
                 layer = dep.target.module
+                if isinstance(layer, torch.nn.ConvTranspose2d):
+                    continue
                 prune_fn = dep.handler
                 if prune_fn in [
                     function.prune_conv_out_channels,
