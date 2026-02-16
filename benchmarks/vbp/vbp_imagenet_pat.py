@@ -148,7 +148,7 @@ def build_pruning_config(args, model, config_dir):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main():
+def main(argv):
     args = parse_args()
 
     # Setup DDP or single GPU
@@ -205,13 +205,7 @@ def main():
     config_dir = os.path.join(args.save_dir, "pruning_config")
     build_pruning_config(args, model, config_dir)
 
-    output_transform = None
-    if args.model_type == "vit":
-        output_transform = lambda out: out.logits.sum()
-    elif args.model_type in ("convnext", "cnn"):
-        output_transform = lambda out: out.sum()
-
-    pruner = Pruning(model, config_dir, forward_fn=output_transform, device=device)
+    pruner = Pruning(model, config_dir, device=device)
     # Inject train_loader for VBP stats collection
     pruner.channel_pruner.train_loader = train_loader
 
@@ -385,5 +379,5 @@ def parse_args():
     return parser.parse_args()
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    main(sys.argv[1:])
