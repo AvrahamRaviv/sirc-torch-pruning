@@ -343,9 +343,12 @@ class ChannelPruning:
                     num_groups += 1
                 _log(log, f"There are {num_groups} groups of layers, with the following source layers:\n{source_convs}")
 
-            # Viz graph
-            tp.utils.visualize_graph(self.pruner.DG, os.path.join(self.config_folder, "viz"),
-                                     show_groups=True, ignored_layers=self.ignored_layers)
+            # Viz graph — all 3 views (computational, dependency, both) in png + pdf
+            viz_dir = os.path.join(self.config_folder, "viz")
+            for fmt in ("png", "pdf"):
+                tp.utils.visualize_all_views(
+                    self.pruner.DG, viz_dir, format=fmt,
+                    ignored_layers=self.ignored_layers)
 
     def prune(self, model, epoch, log=None, mask_only=True, step=None):
         """Prune the model using TP's built-in iterative_steps.
