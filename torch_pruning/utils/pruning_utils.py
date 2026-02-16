@@ -212,8 +212,8 @@ class ChannelPruning:
             imp = tp.importance.BNScaleImportance()
             pruner_entry = partial(tp.pruner.BNScalePruner, group_lasso=True)
         elif self.pruning_method == PruningMethod.GROUP_NORM:
-            imp = tp.importance.GroupNormImportance(p=2, gamma=self.channels_pruner_args["gamma_reg"])
-            pruner_entry = partial(tp.pruner.GroupNormPruner)
+            imp = tp.importance.GroupMagnitudeImportance(p=2)
+            pruner_entry = partial(tp.pruner.GroupNormPruner, reg=self.channels_pruner_args["gamma_reg"])
         elif self.pruning_method == PruningMethod.MAC_AWARE:
             L_MACs = {k: v[0] for k, v in self.MACs_per_layer.items()}
             imp = tp.importance.MACAwareImportance(p=2, layers_mac=L_MACs,
