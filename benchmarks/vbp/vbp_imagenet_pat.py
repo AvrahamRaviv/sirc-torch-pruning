@@ -212,10 +212,7 @@ def main(argv):
     config_dir = os.path.join(args.save_dir, "pruning_config")
     build_pruning_config(args, model, config_dir)
 
-    pruner = Pruning(model, config_dir, device=device)
-    # Re-init with train_loader so stats + compensation means are collected
-    pruner.channel_pruner.train_loader = train_loader
-    pruner.channel_pruner.init_channel_pruner(model, log=logger)
+    pruner = Pruning(model, config_dir, device=device, train_loader=train_loader)
 
     # Variance concentration hooks (optional)
     var_hooks = None
