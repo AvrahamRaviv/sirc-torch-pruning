@@ -486,7 +486,9 @@ class ChannelPruning:
                         dep_str = str(dep)
                         mode_str = "Mask" if use_mask else "Prune"
                         comp_str = "+comp" if has_compensation else ""
-                        _log(log, f" {mode_str}{comp_str} {len(idxs)}/{dep.target.module.weight.shape[0]} "
+                        # After physical prune, shape[0] is already reduced
+                        total_ch = dep.target.module.weight.shape[0] + (len(idxs) if not use_mask else 0)
+                        _log(log, f" {mode_str}{comp_str} {len(idxs)}/{total_ch} "
                                   f"channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}.")
 
         # BN recalibration after pruning step
