@@ -171,6 +171,7 @@ class ChannelPruning:
         self._vbp_var_loss_weight = self.channel_sparsity_args.get("var_loss_weight", 0.0)
         self._vbp_norm_per_layer = self.channel_sparsity_args.get("norm_per_layer", False)
         self._no_compensation = self.channel_sparsity_args.get("no_compensation", False)
+        self._stats_fresh = False  # True after stats collected, False after prune step
 
         # Build ignored_layers (needed before MAC estimation)
         self.set_layers_to_prune(model)
@@ -281,12 +282,14 @@ class ChannelPruning:
                     max_batches=self._vbp_max_batches)
                 if want_compensation:
                     self._compensation_means = dict(imp.means) if imp.means else None
+                self._stats_fresh = True
             elif want_compensation and self._compensation_means is None:
                 self._compensation_means = collect_activation_means(
                     model, loader, self.device,
                     target_layers=target_layers,
                     max_batches=self._vbp_max_batches)
                 _log(log, f"Collected activation means for compensation ({len(self._compensation_means)} layers)")
+                self._stats_fresh = True
 
         # Set mean_dict on pruner for bias compensation
         if want_compensation and self._compensation_means:
@@ -378,9 +381,10 @@ class ChannelPruning:
                 _log(log, f" Epoch {epoch}, regularization phase")
             return
 
-        # Re-collect stats before each step (critical for PAT correctness)
+        # Re-collect stats before each step (critical for PAT correctness).
+        # Skip if stats are fresh (just collected at init or previous re-init).
         has_compensation = self.pruner.mean_dict is not None
-        if loader is not None:
+        if loader is not None and not self._stats_fresh:
             from torch_pruning.pruner.importance import build_target_layers, collect_activation_means
             target_layers = build_target_layers(model, self.pruner.DG)
 
@@ -399,6 +403,7 @@ class ChannelPruning:
                     target_layers=target_layers,
                     max_batches=self._vbp_max_batches)
                 self.pruner.set_mean_dict(self._compensation_means)
+        self._stats_fresh = False
 
         self.update_max_imp()
 
