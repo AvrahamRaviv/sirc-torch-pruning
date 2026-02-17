@@ -592,9 +592,10 @@ def recalibrate_bn(model, loader, device, max_batches=100):
     total = min(max_batches, len(loader))
     log_interval = max(total // 20, 1)
     with torch.no_grad():
-        for batch_idx, (images, _) in enumerate(loader):
+        for batch_idx, batch in enumerate(loader):
             if batch_idx >= max_batches:
                 break
+            images = batch[0] if isinstance(batch, (tuple, list)) else batch
             model(images.to(device, non_blocking=True))
             if is_main() and (batch_idx % log_interval == 0 or batch_idx == total - 1):
                 log_info(f"BN recalib [{batch_idx+1}/{total}]")
