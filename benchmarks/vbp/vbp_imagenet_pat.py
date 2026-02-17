@@ -135,6 +135,7 @@ def build_pruning_config(args, model, config_dir):
             "max_batches": args.max_batches,
             "var_loss_weight": args.var_loss_weight,
             "norm_per_layer": args.norm_per_layer,
+            "no_compensation": args.no_compensation,
             "verbose": 1,
             # Schedule and internal features
             "pruning_schedule": args.pruning_schedule,
@@ -379,6 +380,8 @@ def parse_args():
     parser.add_argument("--norm_per_layer", action="store_true")
     parser.add_argument("--mac_target", action="store_true",
                         help="Use MAC-target mode: analytically compute channel ratio from keep_ratio")
+    parser.add_argument("--no_compensation", action="store_true",
+                        help="Disable bias compensation after pruning")
 
     # PAT
     parser.add_argument("--pat_steps", type=int, default=5,

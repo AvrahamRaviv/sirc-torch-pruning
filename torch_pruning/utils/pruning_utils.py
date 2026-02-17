@@ -314,17 +314,16 @@ class ChannelPruning:
         target_layers = build_target_layers(model, self.pruner.DG)
 
         # Collect stats using DG-detected target layers
-        want_compensation = not self._no_compensation and loader is not None
         if collect_stats and loader is not None:
             if self.pruning_method == PruningMethod.VBP and len(imp.variance) == 0:
                 imp.collect_statistics(
                     model, loader, self.device,
                     target_layers=target_layers,
                     max_batches=self._vbp_max_batches)
-                if want_compensation:
+                if not self._no_compensation:
                     self._compensation_means = dict(imp.means) if imp.means else None
                 self._stats_fresh = True
-            elif want_compensation and self._compensation_means is None:
+            elif not self._no_compensation and self._compensation_means is None:
                 self._compensation_means = collect_activation_means(
                     model, loader, self.device,
                     target_layers=target_layers,
@@ -333,7 +332,7 @@ class ChannelPruning:
                 self._stats_fresh = True
 
         # Set mean_dict on pruner for bias compensation
-        if want_compensation and self._compensation_means:
+        if not self._no_compensation and self._compensation_means:
             self.pruner.set_mean_dict(self._compensation_means)
 
         for n, m in model.named_parameters():
@@ -424,7 +423,6 @@ class ChannelPruning:
 
         # Re-collect stats before each step (critical for PAT correctness).
         # Skip if stats are fresh (just collected at init or previous re-init).
-        has_compensation = self.pruner.mean_dict is not None
         if loader is not None and not self._stats_fresh:
             from torch_pruning.pruner.importance import build_target_layers, collect_activation_means
             target_layers = build_target_layers(model, self.pruner.DG)
@@ -435,9 +433,10 @@ class ChannelPruning:
                     model, loader, self.device,
                     target_layers=target_layers,
                     max_batches=self._vbp_max_batches)
-                self._compensation_means = dict(self.vbp_importance.means)
-                self.pruner.set_mean_dict(self._compensation_means)
-            elif has_compensation:
+                if not self._no_compensation:
+                    self._compensation_means = dict(self.vbp_importance.means)
+                    self.pruner.set_mean_dict(self._compensation_means)
+            elif not self._no_compensation and self.pruner.mean_dict is not None:
                 # Non-VBP: re-collect means only (model changed since last step)
                 self._compensation_means = collect_activation_means(
                     model, loader, self.device,
@@ -445,6 +444,8 @@ class ChannelPruning:
                     max_batches=self._vbp_max_batches)
                 self.pruner.set_mean_dict(self._compensation_means)
         self._stats_fresh = False
+
+        has_compensation = self.pruner.mean_dict is not None
 
         self.update_max_imp()
 
