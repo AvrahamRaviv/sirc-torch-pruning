@@ -93,10 +93,16 @@ def build_pruning_config(args, model, config_dir):
 
     # Sparse pre-training shifts the pruning start epoch
     start_epoch = args.epochs_sparse if args.sparse_mode != "none" else 0
-    # PAT epochs span start_epoch..end_epoch
-    pat_total_epochs = args.epochs - start_epoch
-    epochs_per_step = max(1, pat_total_epochs // args.pat_steps)
-    epoch_rate = epochs_per_step
+    pat_total = args.epochs - start_epoch
+
+    if args.pat_steps <= 1:
+        # One-shot: single prune at start_epoch
+        epoch_rate = 1
+        end_epoch = start_epoch
+    else:
+        # PAT: distribute pat_steps across available epochs
+        epoch_rate = max(1, pat_total // args.pat_steps)
+        end_epoch = start_epoch + (args.pat_steps - 1) * epoch_rate
 
     config = {
         "channel_sparsity_args": {
@@ -105,7 +111,7 @@ def build_pruning_config(args, model, config_dir):
             "global_pruning": args.global_pruning,
             "block_size": 1,
             "start_epoch": start_epoch,
-            "end_epoch": args.epochs - 1,
+            "end_epoch": end_epoch,
             "epoch_rate": epoch_rate,
             "global_prune_rate": 1.0 - args.keep_ratio,
             "mac_target": args.keep_ratio if args.mac_target else 0.0,
@@ -138,8 +144,9 @@ def build_pruning_config(args, model, config_dir):
         json.dump(config, f, indent=2)
 
     log_info(f"Pruning config written to {config_path}")
-    log_info(f"  VBP layers: {len(layers)}, epoch_rate={epoch_rate}, "
-             f"keep_ratio={args.keep_ratio:.3f}, mac_target={'yes' if args.mac_target else 'no'}")
+    log_info(f"  VBP layers: {len(layers)}, start={start_epoch}, end={end_epoch}, "
+             f"epoch_rate={epoch_rate}, keep_ratio={args.keep_ratio:.3f}, "
+             f"mac_target={'yes' if args.mac_target else 'no'}")
     if args.sparse_mode != "none":
         log_info(f"  Sparse: mode={args.sparse_mode}, start_epoch={start_epoch}")
     return config_dir
@@ -223,41 +230,29 @@ def main(argv):
     # Training loop with epoch-based pruning
     use_ddp = not args.disable_ddp and dist.is_initialized()
 
+    # Pre-loop prune: one-shot prunes here; PAT does step 1
+    pruner.prune(model, epoch=0, log=logger, mask_only=False)
+
+    # Optimizer + scheduler AFTER prune (parameters may have changed)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     scheduler, step_per_batch = build_ft_scheduler(
         optimizer, args.epochs, len(train_loader))
 
-    # Wrap in DDP
+    # Wrap in DDP after initial prune
     train_model = model
     if use_ddp:
         train_model = DDP(model, device_ids=[args.local_rank],
                           output_device=args.local_rank)
         dist.barrier()
 
+    # Track pruning step for DDP rebuild detection
+    if pruner.channel_pruner.pruning_schedule == 'geometric':
+        prev_step = pruner.channel_pruner._geometric_step
+    else:
+        prev_step = pruner.channel_pruner.pruner.current_step if pruner.channel_pruner.pruner else 0
+
     best_acc = 0.0
-    prev_step = 0  # Track pruner step count for DDP rebuild detection
     for epoch in range(args.epochs):
-        # Prune via Pruning class (handles epoch_rate scheduling internally)
-        # Must prune on unwrapped model
-        eval_model = train_model.module if isinstance(train_model, DDP) else train_model
-        pruner.prune(eval_model, epoch, log=logger, mask_only=False)
-
-        # Re-wrap in DDP if pruning changed the model structure
-        # For geometric schedule, use _geometric_step (pruner.current_step resets on reinit)
-        if pruner.channel_pruner.pruning_schedule == 'geometric':
-            cur_step = pruner.channel_pruner._geometric_step
-        else:
-            cur_step = pruner.channel_pruner.pruner.current_step if pruner.channel_pruner.pruner else 0
-        if use_ddp and cur_step > prev_step:
-            prev_step = cur_step
-            del train_model
-            train_model = DDP(model, device_ids=[args.local_rank],
-                              output_device=args.local_rank)
-            optimizer = torch.optim.AdamW(train_model.parameters(),
-                                          lr=args.lr, weight_decay=0.01)
-            scheduler, step_per_batch = build_ft_scheduler(
-                optimizer, args.epochs - epoch, len(train_loader))
-
         # Train
         train_loss = train_one_epoch(
             train_model, train_loader, train_sampler,
@@ -266,6 +261,26 @@ def main(argv):
             phase="PAT", var_hooks=var_hooks,
             regularize_fn=pruner.channel_regularize,
         )
+
+        # End-of-epoch prune (skip epoch 0, already done pre-loop)
+        if epoch > 0:
+            pruner.prune(model, epoch, log=logger, mask_only=False)
+
+            # Re-wrap DDP + rebuild optimizer if pruning step advanced
+            if pruner.channel_pruner.pruning_schedule == 'geometric':
+                cur_step = pruner.channel_pruner._geometric_step
+            else:
+                cur_step = pruner.channel_pruner.pruner.current_step if pruner.channel_pruner.pruner else 0
+            if cur_step > prev_step:
+                prev_step = cur_step
+                if use_ddp:
+                    del train_model
+                    train_model = DDP(model, device_ids=[args.local_rank],
+                                      output_device=args.local_rank)
+                optimizer = torch.optim.AdamW(train_model.parameters(),
+                                              lr=args.lr, weight_decay=0.01)
+                scheduler, step_per_batch = build_ft_scheduler(
+                    optimizer, args.epochs - epoch - 1, len(train_loader))
 
         # Validate
         if is_main():
@@ -343,7 +358,7 @@ def parse_args():
 
     # PAT
     parser.add_argument("--pat_steps", type=int, default=5,
-                        help="Number of prune steps (maps to epoch_rate)")
+                        help="Number of prune steps (0 or 1 = one-shot, >1 = PAT)")
     parser.add_argument("--epochs", type=int, default=15,
                         help="Total training epochs")
     parser.add_argument("--lr", type=float, default=1.5e-5)
