@@ -50,6 +50,8 @@ class PruningMethod(str, Enum):
     GROUP_NORM = "GroupNormPruner"
     MAC_AWARE = "MACAwareImportance"
     VBP = "VBP"
+    LAMP = "LAMP"
+    RANDOM = "Random"
 
 
 class Pruning:
@@ -232,7 +234,7 @@ class ChannelPruning:
             pruner_entry = partial(tp.pruner.BNScalePruner, group_lasso=True)
         elif self.pruning_method == PruningMethod.GROUP_NORM:
             imp = tp.importance.GroupMagnitudeImportance(p=2)
-            pruner_entry = partial(tp.pruner.GroupNormPruner, reg=self.channels_pruner_args["gamma_reg"])
+            pruner_entry = partial(tp.pruner.GroupNormPruner)
         elif self.pruning_method == PruningMethod.MAC_AWARE:
             L_MACs = {k: v[0] for k, v in self.MACs_per_layer.items()}
             imp = tp.importance.MACAwareImportance(p=2, layers_mac=L_MACs,
@@ -247,6 +249,12 @@ class ChannelPruning:
                     norm_per_layer=self._vbp_norm_per_layer)
                 self.vbp_importance = imp
             pruner_entry = partial(tp.pruner.VBPPruner)
+        elif self.pruning_method == PruningMethod.LAMP:
+            imp = tp.importance.LAMPImportance(p=2)
+            pruner_entry = partial(tp.pruner.GroupNormPruner)
+        elif self.pruning_method == PruningMethod.RANDOM:
+            imp = tp.importance.RandomImportance()
+            pruner_entry = partial(tp.pruner.GroupNormPruner)
         else:
             raise NameError(f'Unsupported pruner method. {self.channels_pruner_args["pruning_method"]}')
 
@@ -539,9 +547,9 @@ class ChannelPruning:
             if isinstance(m, torch.nn.PixelShuffle):
                 self.ignored_layers.append(m)
                 continue
-            # Linear layers: VBP prunes specific Linears, others ignore all
+            # Linear layers: prune if explicitly listed in config layers, otherwise ignore
             if isinstance(m, torch.nn.Linear):
-                if self.pruning_method == PruningMethod.VBP and name in ltp:
+                if name in ltp:
                     pruning_ratio_dict[m] = self.global_prune_rate
                 else:
                     self.ignored_layers.append(m)
