@@ -1,12 +1,11 @@
 """
-VBP Pruning-Aware Training (PAT) via the Pruning class from pruning_utils.py.
+Pruning-Aware Training (PAT) via the Pruning class from pruning_utils.py.
 
-This script demonstrates iterative VBP pruning using the standard Pruning
-class interface (channel_pruning + slice_pruning), with epoch-based gradual
-pruning and optional variance concentration loss.
+Supports multiple pruning criteria (variance/VBP, magnitude, LAMP, random)
+using the standard Pruning class interface with epoch-based gradual pruning.
 
 Usage:
-    # Single GPU
+    # Single GPU (VBP, default)
     python benchmarks/vbp/vbp_imagenet_pat.py \
         --model_type vit \
         --model_name google/vit-base-patch16-224 \
@@ -17,8 +16,9 @@ Usage:
         --epochs 15 \
         --disable_ddp
 
-    # Multi-GPU (DDP)
-    torchrun --nproc_per_node=4 benchmarks/vbp/vbp_imagenet_pat.py \
+    # Magnitude criterion
+    python benchmarks/vbp/vbp_imagenet_pat.py \
+        --criterion magnitude \
         --model_type vit \
         --model_name /path/to/deit_tiny \
         --data_path /path/to/imagenet \
@@ -26,7 +26,7 @@ Usage:
         --global_pruning \
         --pat_steps 5 \
         --epochs 15 \
-        --use_kd
+        --disable_ddp
 """
 
 import argparse
@@ -63,8 +63,8 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Config generation
 # ---------------------------------------------------------------------------
-def build_vbp_layers_to_prune(model, model_type, architecture=None, interior_only=True):
-    """Return list of module names that VBP should prune (fc1 / pwconv1 / interior convs)."""
+def build_layers_to_prune(model, model_type, architecture=None, interior_only=True):
+    """Return list of module names to prune (fc1 / pwconv1 / interior convs)."""
     layers = []
     if model_type == "vit":
         for name, m in model.named_modules():
@@ -84,9 +84,17 @@ def build_vbp_layers_to_prune(model, model_type, architecture=None, interior_onl
     return layers
 
 
+_CRITERION_TO_METHOD = {
+    "variance": "VBP",
+    "magnitude": "GroupNormPruner",
+    "lamp": "LAMP",
+    "random": "Random",
+}
+
+
 def build_pruning_config(args, model, config_dir):
     """Programmatically create pruning_config.json for the Pruning class."""
-    layers = build_vbp_layers_to_prune(
+    layers = build_layers_to_prune(
         model, args.model_type,
         architecture=getattr(args, 'cnn_arch', None),
         interior_only=getattr(args, 'interior_only', True))
@@ -107,7 +115,7 @@ def build_pruning_config(args, model, config_dir):
     config = {
         "channel_sparsity_args": {
             "is_prune": True,
-            "pruning_method": "VBP",
+            "pruning_method": _CRITERION_TO_METHOD[args.criterion],
             "global_pruning": args.global_pruning,
             "block_size": 1,
             "start_epoch": start_epoch,
@@ -144,7 +152,7 @@ def build_pruning_config(args, model, config_dir):
         json.dump(config, f, indent=2)
 
     log_info(f"Pruning config written to {config_path}")
-    log_info(f"  VBP layers: {len(layers)}, start={start_epoch}, end={end_epoch}, "
+    log_info(f"  Pruning layers ({args.criterion}): {len(layers)}, start={start_epoch}, end={end_epoch}, "
              f"epoch_rate={epoch_rate}, keep_ratio={args.keep_ratio:.3f}, "
              f"mac_target={'yes' if args.mac_target else 'no'}")
     if args.sparse_mode != "none":
@@ -176,7 +184,7 @@ def main(argv):
 
     if is_main():
         log_info("=" * 60)
-        log_info("VBP PAT via Pruning class")
+        log_info(f"PAT via Pruning class (criterion={args.criterion})")
         log_info("=" * 60)
         for k, v in vars(args).items():
             logger.info(f"  {k}: {v}")
@@ -214,9 +222,9 @@ def main(argv):
 
     pruner = Pruning(model, config_dir, device=device, train_loader=train_loader)
 
-    # Variance concentration hooks (optional)
+    # Variance concentration hooks (optional, VBP only)
     var_hooks = None
-    if args.var_loss_weight > 0:
+    if args.criterion == "variance" and args.var_loss_weight > 0:
         cnn_target_layers = None
         if args.model_type == "cnn":
             from torch_pruning.pruner.importance import build_cnn_target_layers
@@ -306,7 +314,7 @@ def main(argv):
 
             if acc > best_acc:
                 best_acc = acc
-                save_path = os.path.join(args.save_dir, "vbp_pat_best.pth")
+                save_path = os.path.join(args.save_dir, f"{args.criterion}_pat_best.pth")
                 torch.save(eval_model.state_dict(), save_path)
                 log_info(f"New best! Saved to {save_path}")
 
@@ -334,7 +342,7 @@ def main(argv):
         log_info(f"Final Acc:    {acc_final:.4f}")
         log_info(f"Best Acc:     {best_acc:.4f}")
 
-        save_path = os.path.join(args.save_dir, "vbp_pat_final.pth")
+        save_path = os.path.join(args.save_dir, f"{args.criterion}_pat_final.pth")
         torch.save(eval_model.state_dict(), save_path)
         log_info(f"Final model saved to {save_path}")
 
@@ -344,7 +352,7 @@ def main(argv):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="VBP PAT via Pruning class",
+        description="PAT via Pruning class (multi-criterion)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -364,6 +372,8 @@ def parse_args():
     parser.add_argument("--max_batches", type=int, default=200)
 
     # Pruning
+    parser.add_argument("--criterion", default="variance",
+                        choices=["variance", "magnitude", "lamp", "random"])
     parser.add_argument("--keep_ratio", type=float, default=0.65)
     parser.add_argument("--global_pruning", action="store_true")
     parser.add_argument("--norm_per_layer", action="store_true")
