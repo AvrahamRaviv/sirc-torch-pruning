@@ -28,6 +28,13 @@ def _log(log, msg: str) -> None:
         print(msg)
 
 
+def _unpack_images(batch):
+    """Extract image tensor from a dataloader batch (with or without labels)."""
+    if isinstance(batch, (tuple, list)):
+        return batch[0]
+    return batch
+
+
 def _recalibrate_bn(model, train_loader, device, log=None):
     """Recalibrate BN running stats after structural pruning."""
     for m in model.modules():
@@ -36,9 +43,10 @@ def _recalibrate_bn(model, train_loader, device, log=None):
     model.train()
     total = min(100, len(train_loader))
     with torch.no_grad():
-        for batch_idx, (images, _) in enumerate(train_loader):
+        for batch_idx, batch in enumerate(train_loader):
             if batch_idx >= 100:
                 break
+            images = _unpack_images(batch)
             model(images.to(device, non_blocking=True))
     model.eval()
     _log(log, f"BN recalibration done ({total} batches)")

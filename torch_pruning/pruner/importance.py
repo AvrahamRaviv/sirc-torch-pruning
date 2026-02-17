@@ -1089,7 +1089,8 @@ class VarianceImportance(Importance):
         model.eval()
         total = min(len(train_loader), max_batches) if max_batches else len(train_loader)
         pbar = tqdm(train_loader, desc="Collecting stats", total=total, miniters=max(total // 20, 1))
-        for batch_idx, (images, _) in enumerate(pbar):
+        for batch_idx, batch in enumerate(pbar):
+            images = batch[0] if isinstance(batch, (tuple, list)) else batch
             images = images.to(device, non_blocking=True)
             model(images)
             if max_batches is not None and (batch_idx + 1) >= max_batches:
