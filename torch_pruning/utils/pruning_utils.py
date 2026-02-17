@@ -153,9 +153,7 @@ class ChannelPruning:
             "isomorphic": self.channel_sparsity_args.get("isomorphic", False)
         }
         self.pruner = None
-        self.regularization = None
         self.model_forward_fn = forward_fn
-        self.init_channel_mask: Dict[Any, Any] = {}
         self.MACs_per_layer: Dict[str, List[float]] = {}
         self.channels_pruner_args["current_round_to"] = 1
         self.config_folder = config_folder
@@ -215,6 +213,13 @@ class ChannelPruning:
 
     def init_channel_pruner(self, model, log=None, print_layers=False, collect_stats=True,
                              train_loader=None):
+        """Build importance criterion, pruner, and optionally collect stats.
+
+        Called once from __init__ (with collect_stats=True) and again after each
+        geometric step (with collect_stats=False to reuse cached importance).
+        When train_loader is available (via parameter or self.train_loader),
+        collects VBP stats + compensation means and sets _stats_fresh=True.
+        """
         log = log or self.log
         loader = train_loader or self.train_loader
 
@@ -338,7 +343,7 @@ class ChannelPruning:
                     self.pruner.DG, viz_dir, format=fmt,
                     ignored_layers=self.ignored_layers)
 
-    def prune(self, model, epoch, log=None, mask_only=True, step=None, train_loader=None):
+    def prune(self, model, epoch, log=None, mask_only=True, train_loader=None):
         """Prune the model using TP's built-in iterative_steps.
 
         Supports two modes: physical pruning (VBP) and mask-with-zeros.
@@ -516,7 +521,7 @@ class ChannelPruning:
 
         for name, m in model.named_modules():
             name = name.replace("module.", "")
-            # Check spyk first
+            # QAT modules
             try:
                 if isinstance(m, (torch.ao.nn.qat.modules.conv.Conv2d, torch.ao.nn.intrinsic.qat.modules.conv_fused.ConvReLU2d)):
                     if name in ltp:
@@ -644,12 +649,6 @@ class ChannelPruning:
         if total_macs == 0:
             total_adjusted_macs, total_macs = 1., 1.
         return total_adjusted_macs, total_macs
-
-    @staticmethod
-    def _build_target_layers_from_dg(model, DG):
-        """Build target layers using DG graph-walking. Handles all architectures."""
-        from torch_pruning.pruner.importance import build_target_layers
-        return build_target_layers(model, DG)
 
     def _estimate_channel_ratio(self, model):
         """Compute global channel pruning ratio to achieve self.mac_target.
