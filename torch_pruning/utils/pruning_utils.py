@@ -57,7 +57,8 @@ class Pruning:
     High-level pruning interface combining channel and slice pruning.
     """
     def __init__(self, model: nn.Module, config_folder: str, forward_fn: Optional[Any] = None,
-                 log: Optional[Any] = None, device: Optional[torch.device] = None) -> None:
+                 log: Optional[Any] = None, device: Optional[torch.device] = None,
+                 train_loader=None) -> None:
         self.version = "1.1.5"
         try:
             config_path = os.path.join(config_folder, "pruning_config.json")
@@ -75,7 +76,8 @@ class Pruning:
             channel_sa, slice_sa = None, None
             _log(log, "=> Unable to find a valid pruning configuration.")
 
-        self.channel_pruner = ChannelPruning(channel_sa, model, config_folder, forward_fn, log, device)
+        self.channel_pruner = ChannelPruning(channel_sa, model, config_folder, forward_fn, log, device,
+                                             train_loader=train_loader)
         self.slice_pruner = SlicePruning(slice_sa, model, log)
         # Synchronize slice block size and channel mask dictionary between pruners.
         self.channel_pruner.slice_block_size = self.slice_pruner.block_size
@@ -103,7 +105,7 @@ class ChannelPruning:
     """
     def __init__(self, channel_sparsity_args: Optional[Dict[str, Any]], model: nn.Module,
                  config_folder: str, forward_fn: Any, log: Optional[Any] = None,
-                 device: Optional[torch.device] = None) -> None:
+                 device: Optional[torch.device] = None, train_loader=None) -> None:
         self.channel_mask_dict: Dict[str, torch.Tensor] = {}
         self.log = log
         if channel_sparsity_args is None:
@@ -164,7 +166,7 @@ class ChannelPruning:
         # Stats collection & compensation state (used by VBP and any criterion with compensation)
         self.vbp_importance = None
         self._compensation_means = None  # collected means for bias compensation (any criterion)
-        self.train_loader = None  # set externally, or pass to prune()/init_channel_pruner()
+        self.train_loader = train_loader  # passed at init or set externally
         self._vbp_max_batches = self.channel_sparsity_args.get("max_batches", 200)
         self._vbp_var_loss_weight = self.channel_sparsity_args.get("var_loss_weight", 0.0)
         self._vbp_norm_per_layer = self.channel_sparsity_args.get("norm_per_layer", False)
