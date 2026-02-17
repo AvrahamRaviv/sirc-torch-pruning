@@ -28,11 +28,31 @@ def _log(log, msg: str) -> None:
         print(msg)
 
 
+_IMAGE_KEYS = ("image", "images", "img", "img1", "input", "inputs",
+               "pixel_values", "x", "data")
+
+
 def _unpack_images(batch):
-    """Extract image tensor from a dataloader batch (with or without labels)."""
+    """Extract image tensor from a dataloader batch.
+
+    Handles three formats:
+    - Tensor: returned as-is
+    - tuple/list: returns first element (standard (images, labels) convention)
+    - dict: looks up common image keys, falls back to first Tensor value
+    """
+    if isinstance(batch, torch.Tensor):
+        return batch
     if isinstance(batch, (tuple, list)):
         return batch[0]
-    return batch
+    if isinstance(batch, dict):
+        for key in _IMAGE_KEYS:
+            if key in batch:
+                return batch[key]
+        for v in batch.values():
+            if isinstance(v, torch.Tensor):
+                return v
+    raise ValueError(f"Cannot extract images from batch of type {type(batch)}. "
+                     f"Expected Tensor, tuple/list, or dict with one of {_IMAGE_KEYS}.")
 
 
 def _recalibrate_bn(model, train_loader, device, log=None):
