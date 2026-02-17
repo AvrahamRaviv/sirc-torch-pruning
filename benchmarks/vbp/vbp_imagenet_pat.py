@@ -233,6 +233,15 @@ def main(argv):
     # Pre-loop prune: one-shot prunes here; PAT does step 1
     pruner.prune(model, epoch=0, log=logger, mask_only=False)
 
+    # Log retention accuracy after final pruning (one-shot finishes here)
+    retention_logged = False
+    if is_main() and not pruner.channel_pruner.prune_channels:
+        acc_ret, _ = validate(model, val_loader, device, args.model_type)
+        pruned_macs, pruned_params = tp.utils.count_ops_and_params(model, example_inputs)
+        log_info(f"Retention accuracy: {acc_ret:.4f} "
+                 f"(MACs={pruned_macs / 1e9:.2f}G, Params={pruned_params / 1e6:.2f}M)")
+        retention_logged = True
+
     # Optimizer + scheduler AFTER prune (parameters may have changed)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     scheduler, step_per_batch = build_ft_scheduler(
@@ -265,6 +274,14 @@ def main(argv):
         # End-of-epoch prune (skip epoch 0, already done pre-loop)
         if epoch > 0:
             pruner.prune(model, epoch, log=logger, mask_only=False)
+
+            # Log retention after final pruning step (PAT finishes here)
+            if is_main() and not retention_logged and not pruner.channel_pruner.prune_channels:
+                acc_ret, _ = validate(model, val_loader, device, args.model_type)
+                pruned_macs, pruned_params = tp.utils.count_ops_and_params(model, example_inputs)
+                log_info(f"Retention accuracy: {acc_ret:.4f} "
+                         f"(MACs={pruned_macs / 1e9:.2f}G, Params={pruned_params / 1e6:.2f}M)")
+                retention_logged = True
 
             # Re-wrap DDP + rebuild optimizer if pruning step advanced
             if pruner.channel_pruner.pruning_schedule == 'geometric':
