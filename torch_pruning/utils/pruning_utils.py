@@ -475,9 +475,9 @@ class ChannelPruning:
             for group in self.pruner.step(interactive=True):
                 dep, idxs = group[0]
                 if len(idxs) > 0:
+                    if has_compensation:
+                        self.pruner._apply_compensation(group, idxs)
                     if use_mask:
-                        if has_compensation:
-                            self.pruner._apply_compensation(group, idxs)
                         self.mask_group(group)
                     else:
                         group.prune()
