@@ -470,24 +470,23 @@ class ChannelPruning:
             self.pruner.step(interactive=False, enable_compensation=has_compensation)
             self.pruner.disable_meancheck()
             _log(log, " VBP pruning step complete")
-        elif not use_mask:
-            # Non-VBP physical pruning: BasePruner.step() handles compensation when mean_dict set
-            self.pruner.step(interactive=False)
-            comp_str = " (with compensation)" if has_compensation else ""
-            _log(log, f" Pruning step complete{comp_str}")
         else:
-            # Mask-only mode: interactive step with optional compensation
+            # Interactive step: physical or mask-only
             for group in self.pruner.step(interactive=True):
                 dep, idxs = group[0]
                 if len(idxs) > 0:
-                    if has_compensation:
-                        self.pruner._apply_compensation(group, idxs)
-                    self.mask_group(group)
+                    if use_mask:
+                        if has_compensation:
+                            self.pruner._apply_compensation(group, idxs)
+                        self.mask_group(group)
+                    else:
+                        group.prune()
 
                     if self.verbose > 0:
                         dep_str = str(dep)
+                        mode_str = "Mask" if use_mask else "Prune"
                         comp_str = "+comp" if has_compensation else ""
-                        _log(log, f" Mask{comp_str} {len(idxs)}/{dep.target.module.weight.shape[0]} "
+                        _log(log, f" {mode_str}{comp_str} {len(idxs)}/{dep.target.module.weight.shape[0]} "
                                   f"channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}.")
 
         # BN recalibration after pruning step
