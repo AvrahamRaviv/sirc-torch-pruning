@@ -259,7 +259,7 @@ def main(argv):
         prev_step = pruner.channel_pruner.pruner.current_step if pruner.channel_pruner.pruner else 0
 
     best_acc = 0.0
-    for epoch in range(args.epochs):
+    for epoch in range(1, args.epochs + 1):
         # Train
         train_loss = train_one_epoch(
             train_model, train_loader, train_sampler,
@@ -269,40 +269,39 @@ def main(argv):
             regularize_fn=pruner.channel_regularize,
         )
 
-        # End-of-epoch prune (skip epoch 0, already done pre-loop)
-        if epoch > 0:
-            pruner.prune(model, epoch, log=logger, mask_only=False)
+        # End-of-epoch prune (epoch 0 already done pre-loop)
+        pruner.prune(model, epoch, log=logger, mask_only=False)
 
-            # Log retention after final pruning step (PAT finishes here)
-            if is_main() and not retention_logged and not pruner.channel_pruner.prune_channels:
-                acc_ret, _ = validate(model, val_loader, device, args.model_type)
-                pruned_macs, pruned_params = tp.utils.count_ops_and_params(model, example_inputs)
-                log_info(f"Retention accuracy: {acc_ret:.4f} "
-                         f"(MACs={pruned_macs / 1e9:.2f}G, Params={pruned_params / 1e6:.2f}M)")
-                retention_logged = True
+        # Log retention after final pruning step (PAT finishes here)
+        if is_main() and not retention_logged and not pruner.channel_pruner.prune_channels:
+            acc_ret, _ = validate(model, val_loader, device, args.model_type)
+            pruned_macs, pruned_params = tp.utils.count_ops_and_params(model, example_inputs)
+            log_info(f"Retention accuracy: {acc_ret:.4f} "
+                     f"(MACs={pruned_macs / 1e9:.2f}G, Params={pruned_params / 1e6:.2f}M)")
+            retention_logged = True
 
-            # Re-wrap DDP + rebuild optimizer if pruning step advanced
-            if pruner.channel_pruner.pruning_schedule == 'geometric':
-                cur_step = pruner.channel_pruner._geometric_step
-            else:
-                cur_step = pruner.channel_pruner.pruner.current_step if pruner.channel_pruner.pruner else 0
-            if cur_step > prev_step:
-                prev_step = cur_step
-                if use_ddp:
-                    del train_model
-                    train_model = DDP(model, device_ids=[args.local_rank],
-                                      output_device=args.local_rank)
-                optimizer = torch.optim.AdamW(train_model.parameters(),
-                                              lr=args.lr, weight_decay=0.01)
-                scheduler, step_per_batch = build_ft_scheduler(
-                    optimizer, args.epochs - epoch - 1, len(train_loader))
+        # Re-wrap DDP + rebuild optimizer if pruning step advanced
+        if pruner.channel_pruner.pruning_schedule == 'geometric':
+            cur_step = pruner.channel_pruner._geometric_step
+        else:
+            cur_step = pruner.channel_pruner.pruner.current_step if pruner.channel_pruner.pruner else 0
+        if cur_step > prev_step:
+            prev_step = cur_step
+            if use_ddp:
+                del train_model
+                train_model = DDP(model, device_ids=[args.local_rank],
+                                  output_device=args.local_rank)
+            optimizer = torch.optim.AdamW(train_model.parameters(),
+                                          lr=args.lr, weight_decay=0.01)
+            scheduler, step_per_batch = build_ft_scheduler(
+                optimizer, args.epochs - epoch, len(train_loader))
 
         # Validate
         if is_main():
             eval_model = train_model.module if isinstance(train_model, DDP) else train_model
             acc, val_loss = validate(eval_model, val_loader, device, args.model_type)
             pruned_macs, pruned_params = tp.utils.count_ops_and_params(eval_model, example_inputs)
-            log_info(f"Epoch {epoch+1}/{args.epochs}: train_loss={train_loss:.4f}, "
+            log_info(f"Epoch {epoch}/{args.epochs}: train_loss={train_loss:.4f}, "
                      f"val_acc={acc:.4f}, MACs={pruned_macs / 1e9:.2f}G")
 
             if acc > best_acc:
