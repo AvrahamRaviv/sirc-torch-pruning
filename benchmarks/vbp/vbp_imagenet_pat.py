@@ -139,7 +139,7 @@ def build_pruning_config(args, model, config_dir):
             "verbose": 1,
             # Schedule and internal features
             "pruning_schedule": args.pruning_schedule,
-            "bn_recalibration": args.model_type == "cnn",
+            "bn_recalibration": args.bn_recalibration,
             "sparse_mode": args.sparse_mode,
             "sparse_l1_lambda": args.l1_lambda,
             "sparse_gmp_target": args.gmp_target_sparsity,
@@ -382,6 +382,8 @@ def parse_args():
                         help="Use MAC-target mode: analytically compute channel ratio from keep_ratio")
     parser.add_argument("--no_compensation", action="store_true",
                         help="Disable bias compensation after pruning")
+    parser.add_argument("--bn_recalibration", action="store_true",
+                        help="Recalibrate BN running stats after each pruning step")
 
     # PAT
     parser.add_argument("--pat_steps", type=int, default=5,
