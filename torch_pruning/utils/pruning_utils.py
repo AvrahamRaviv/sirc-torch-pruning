@@ -400,14 +400,14 @@ class ChannelPruning:
 
         # GMP masking for sparse pre-training (before start_epoch)
         if self._sparse_mode == "gmp" and epoch < self.start_epoch:
-            from benchmarks.vbp.sparse_utils import gmp_sparsity_schedule, apply_unstructured_pruning
+            from torch_pruning.utils.sparse_utils import gmp_sparsity_schedule, apply_unstructured_pruning
             target_s = gmp_sparsity_schedule(epoch, self.start_epoch, target_s=self._sparse_gmp_target)
             apply_unstructured_pruning(self._sparse_modules, target_s)
             return
 
         # Bake GMP masks at start_epoch boundary
         if self._sparse_mode == "gmp" and epoch == self.start_epoch:
-            from benchmarks.vbp.sparse_utils import remove_pruning_reparametrization
+            from torch_pruning.utils.sparse_utils import remove_pruning_reparametrization
             remove_pruning_reparametrization(self._sparse_modules)
 
         # Check if this is a pruning epoch
