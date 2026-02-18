@@ -69,18 +69,11 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from convnext import convnext_tiny, convnext_small, convnext_base, convnext_large
 
-try:
-    from .sparse_utils import (
-        get_fc1_modules, l21_regularization, gmp_sparsity_schedule,
-        apply_unstructured_pruning, remove_pruning_reparametrization,
-        compute_variance_entropy, compute_weight_sparsity,
-    )
-except ImportError:
-    from sparse_utils import (
-        get_fc1_modules, l21_regularization, gmp_sparsity_schedule,
-        apply_unstructured_pruning, remove_pruning_reparametrization,
-        compute_variance_entropy, compute_weight_sparsity,
-    )
+from torch_pruning.utils.sparse_utils import (
+    get_fc1_modules, l21_regularization, gmp_sparsity_schedule,
+    apply_unstructured_pruning, remove_pruning_reparametrization,
+    compute_variance_entropy, compute_weight_sparsity,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
