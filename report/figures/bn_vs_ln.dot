@@ -1,0 +1,65 @@
+digraph BNvsLN {
+    rankdir=TB;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+    bgcolor="white";
+    newrank=true;
+    compound=true;
+
+    label="Normalization After Pruning: Why CNNs Need BN Recalibration";
+    labelloc=t;
+    fontsize=13;
+    fontcolor="#0D47A1";
+
+    // ===================== ViT side =====================
+    subgraph cluster_vit {
+        label="ViT (Linear + LayerNorm)";
+        labeljust="c";
+        style="filled,rounded";
+        color="#2E7D32";
+        fillcolor="#E8F5E9";
+        fontsize=12;
+        fontcolor="#1B5E20";
+
+        vit_prune [label="Prune fc1 channels\n+ bias compensation\n(Δb = W·μ_pruned)", shape=box, style="rounded,filled", fillcolor="white", color="#2E7D32"];
+
+        vit_ln [label="LayerNorm\n─────────────\nComputes μ, σ from\ncurrent input\n(no stored stats)", shape=box, style="rounded,filled,bold", fillcolor="#C8E6C9", color="#2E7D32", penwidth=2];
+
+        vit_result [label="✓  Adapts automatically\nNo recalibration needed", shape=box, style="rounded,filled", fillcolor="#A5D6A7", color="#1B5E20", penwidth=1.5];
+
+        vit_prune -> vit_ln [label="activation\ndistribution\nchanged"];
+        vit_ln -> vit_result [label="recomputes\nstats on-the-fly"];
+    }
+
+    // ===================== CNN side =====================
+    subgraph cluster_cnn {
+        label="CNN (Conv2d + BatchNorm)";
+        labeljust="c";
+        style="filled,rounded";
+        color="#C62828";
+        fillcolor="#FFEBEE";
+        fontsize=12;
+        fontcolor="#B71C1C";
+
+        cnn_prune [label="Prune conv channels\n+ bias compensation\n(Δb = W·μ_pruned)", shape=box, style="rounded,filled", fillcolor="white", color="#C62828"];
+
+        cnn_bn [label="BatchNorm\n─────────────\nUses stored\nrunning_mean, running_var\n(from original training)", shape=box, style="rounded,filled,bold", fillcolor="#FFCDD2", color="#C62828", penwidth=2];
+
+        cnn_problem [label="✗  Stale statistics\n• μ_stored ≠ μ_actual\n• σ²_stored > σ²_actual\n• Errors compound\n  across layers", shape=box, style="rounded,filled", fillcolor="#EF9A9A", color="#B71C1C", penwidth=1.5];
+
+        cnn_fix [label="BN Recalibration\n─────────────\n1. Reset running stats\n2. Forward calibration set\n   (train mode, no grads)\n3. Freeze (eval mode)", shape=box, style="rounded,filled,bold", fillcolor="#C8E6C9", color="#2E7D32", penwidth=2];
+
+        cnn_ok [label="✓  Fresh statistics\nmatch pruned network", shape=box, style="rounded,filled", fillcolor="#A5D6A7", color="#1B5E20", penwidth=1.5];
+
+        cnn_prune -> cnn_bn [label="activation\ndistribution\nchanged"];
+        cnn_bn -> cnn_problem [label="normalizes with\nwrong μ, σ²"];
+        cnn_problem -> cnn_fix [style=bold, color="#2E7D32", label="fix"];
+        cnn_fix -> cnn_ok;
+    }
+
+    // Layout alignment
+    {rank=same; vit_prune; cnn_prune;}
+    {rank=same; vit_ln; cnn_bn;}
+    {rank=same; vit_result; cnn_problem;}
+}

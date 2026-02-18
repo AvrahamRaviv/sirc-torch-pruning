@@ -1,0 +1,94 @@
+digraph PATPipeline {
+    rankdir=LR;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=11];
+    edge [fontname="Helvetica", fontsize=10];
+    bgcolor="white";
+    newrank=true;
+    nodesep=0.4;
+    ranksep=0.6;
+
+    // Timeline header
+    label="Pruning-Aware Training (PAT) Pipeline";
+    labelloc=t;
+    fontsize=16;
+    fontcolor="#0D47A1";
+
+    // --- Phase nodes ---
+    subgraph cluster_sparse {
+        label="Phase 1: Sparse Pre-training\n(optional)";
+        labeljust="c";
+        style="filled,rounded";
+        color="#7B1FA2";
+        fillcolor="#F3E5F5";
+        fontsize=12;
+        fontcolor="#4A148C";
+
+        sp_desc [label="Group-sparsity\nregularization (L2,1)\nor GMP schedule\n\nPrime the pruning signal", shape=box, style="rounded,filled", fillcolor="white", color="#7B1FA2", fontsize=11];
+    }
+
+    subgraph cluster_pat {
+        label="Phase 2: Iterative Pruning\n(N steps, M epochs each)";
+        labeljust="c";
+        style="filled,rounded";
+        color="#1565C0";
+        fillcolor="#E3F2FD";
+        fontsize=12;
+        fontcolor="#0D47A1";
+
+        pat_loop [shape=none, label=<
+            <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="10">
+            <TR><TD BGCOLOR="#E0E0E0" PORT="stats"><FONT FACE="Helvetica" POINT-SIZE="11" COLOR="#616161"><I>Collect activation means (optional)</I></FONT><BR/><FONT FACE="Helvetica" POINT-SIZE="9" COLOR="#9E9E9E">any criterion: for bias compensation</FONT></TD>
+                <TD ROWSPAN="4" BORDER="0" VALIGN="MIDDLE" CELLPADDING="6"><FONT FACE="Helvetica" POINT-SIZE="24" COLOR="#1565C0">&#8635;</FONT><BR/><FONT FACE="Helvetica-Oblique" POINT-SIZE="9" COLOR="#1565C0">repeat<BR/><I>N</I> steps</FONT></TD></TR>
+            <TR><TD BGCOLOR="#BBDEFB" PORT="step"><FONT FACE="Helvetica" POINT-SIZE="12">Score &amp; prune channels</FONT><BR/><FONT FACE="Helvetica" POINT-SIZE="10">(pruner.step — any criterion)</FONT></TD></TR>
+            <TR><TD BGCOLOR="#E0E0E0" PORT="comp"><FONT FACE="Helvetica" POINT-SIZE="11" COLOR="#616161"><I>Compensate (optional)</I></FONT><BR/><FONT FACE="Helvetica" POINT-SIZE="9" COLOR="#9E9E9E">BasePruner: bias correction via mean_dict</FONT></TD></TR>
+            <TR><TD BGCOLOR="#FFF9C4" PORT="train"><FONT FACE="Helvetica" POINT-SIZE="12">Train M epochs</FONT><BR/><FONT FACE="Helvetica" POINT-SIZE="10">(CE + KD)</FONT></TD></TR>
+            </TABLE>
+        >];
+    }
+
+    subgraph cluster_ft {
+        label="Phase 3: Fine-tuning\n(recover accuracy)";
+        labeljust="c";
+        style="filled,rounded";
+        color="#2E7D32";
+        fillcolor="#E8F5E9";
+        fontsize=12;
+        fontcolor="#1B5E20";
+
+        ft_desc [label="Standard training\n(no pruning)\n\nBN recalibration\n(CNNs only)", shape=box, style="rounded,filled", fillcolor="white", color="#2E7D32", fontsize=11];
+    }
+
+    // --- Input/Output ---
+    input [label="Pretrained\nModel", shape=box, style="rounded,filled", fillcolor="#E8F0FE", color="#4285F4", penwidth=1.5, fontsize=11];
+    output [label="Pruned &\nFine-tuned\nModel", shape=box, style="rounded,filled", fillcolor="#E8F5E9", color="#2E7D32", penwidth=2, fontsize=11];
+
+    // --- Edges ---
+    input -> sp_desc;
+    sp_desc -> pat_loop;
+    pat_loop -> ft_desc;
+    ft_desc -> output;
+
+    // --- Annotations ---
+    subgraph cluster_schedule {
+        label="Schedule";
+        labeljust="c";
+        style="dashed,rounded";
+        color="#9E9E9E";
+        fillcolor="#FAFAFA";
+        fontsize=10;
+        fontcolor="#616161";
+
+        sched [shape=note, style="filled", fillcolor="#FFFDE7", color="#F9A825", label=<
+            <TABLE BORDER="0" CELLSPACING="0" CELLPADDING="2">
+            <TR><TD ALIGN="LEFT"><FONT FACE="Helvetica" POINT-SIZE="10">Geometric: each step</FONT></TD></TR>
+            <TR><TD ALIGN="LEFT"><FONT FACE="Helvetica" POINT-SIZE="10">keeps </FONT><FONT FACE="Helvetica-Oblique" POINT-SIZE="10"><I>q</I> = <I>r</I></FONT><FONT FACE="Helvetica" POINT-SIZE="9"><SUP> 1/<I>N</I></SUP></FONT><FONT FACE="Helvetica" POINT-SIZE="10"> channels</FONT></TD></TR>
+            <TR><TD ALIGN="LEFT"><FONT FACE="Helvetica" POINT-SIZE="10">After </FONT><FONT FACE="Helvetica-Oblique" POINT-SIZE="10"><I>N</I></FONT><FONT FACE="Helvetica" POINT-SIZE="10"> steps: </FONT><FONT FACE="Helvetica-Oblique" POINT-SIZE="10"><I>q</I><SUP><I>N</I></SUP> = <I>r</I></FONT></TD></TR>
+            <TR><TD> </TD></TR>
+            <TR><TD ALIGN="LEFT"><FONT FACE="Helvetica" POINT-SIZE="10">One-shot: </FONT><FONT FACE="Helvetica-Oblique" POINT-SIZE="10"><I>N</I></FONT><FONT FACE="Helvetica" POINT-SIZE="10">=1, </FONT><FONT FACE="Helvetica-Oblique" POINT-SIZE="10"><I>M</I></FONT><FONT FACE="Helvetica" POINT-SIZE="10">=0</FONT></TD></TR>
+            </TABLE>
+        >];
+    }
+
+    sched -> pat_loop [style=dotted, color="#9E9E9E", arrowhead=none];
+}

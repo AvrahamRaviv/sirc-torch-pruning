@@ -1,22 +1,16 @@
 ---
 title: "SIRC Torch-Pruning v2 (STP v2)"
 subtitle: "Internal Technical Report"
-author:
-  - Avraham Raviv
 date: "February 2026"
 abstract: |
   Fork of Torch-Pruning extended with Pruning-Aware Training (PAT),
   new importance criteria (VBP, MAC-Aware), bias compensation, and regularization strategies.
 
-  \medskip
-  \noindent\textbf{Repository:} \texttt{sirc-torch-pruning} (\texttt{master}) \quad
-  \textbf{Upstream:} Torch-Pruning v1.6.1 \\
-  \textbf{References:} DepGraph [Fang et al., CVPR 2023], VBP [arXiv 2507.12988]
 geometry: margin=2.5cm
 fontsize: 11pt
 documentclass: article
 toc: true
-toc-depth: 3
+toc-depth: 2
 numbersections: true
 header-includes:
   - \usepackage{graphicx}
@@ -351,15 +345,19 @@ Tested on ResNet-50 and MobileNetV2. Key challenges resolved:
 - **Depthwise convs and ignored layers** --- depthwise convs must not be in the ignored-layers list, as they appear in expand conv groups with output-channel pruning, causing group rejection.
 - **ReLU6 detection** --- \texttt{nn.ReLU6} uses \texttt{HardtanhBackward0} internally, requiring an explicit mapping in activation auto-detection.
 
-### Mask-Then-Prune Strategy
+### Unified Pruning Loop
+
+All criteria (VBP, magnitude, LAMP, random) now share a single interactive pruning loop. Previously VBP had a separate non-interactive code path; now all criteria use the same loop with identical per-group logging (``Prune/Mask N/M channels'' with a compensation indicator). VBP mean-check setup/teardown wraps the shared loop conditionally. This also fixed a bug where compensation was missing in the non-VBP physical pruning path --- \texttt{\_apply\_compensation()} now runs before both mask and prune branches.
+
+### Multi-Criterion Support
+
+The \texttt{PruningMethod} enum was extended with \texttt{LAMP} and \texttt{RANDOM} values. \texttt{init\_channel\_pruner()} branches on the enum to instantiate the appropriate importance (\texttt{GroupMagnitudeImportance}, \texttt{LAMPImportance}, or random). Both \texttt{vbp\_imagenet.py} and \texttt{vbp\_imagenet\_pat.py} accept \texttt{--criterion} to select the criterion; VBP-specific logic (stats collection, variance loss) is automatically gated on \texttt{criterion=variance}.
+
+## Mask-Then-Prune Strategy
 
 In PAT mode, intermediate pruning steps now use **mask-only mode** (zeroing channels but keeping the architecture intact), which allows the optimizer state and learning rate schedule to remain consistent across steps. The **final step** switches to physical structural removal, so fine-tuning operates on the actually smaller model with reduced MACs.
 
 **MAC logging.** Mask-only and physical steps require different MAC measurement. Standard \texttt{count\_ops\_and\_params} counts ops from tensor shapes, so zeroed channels still register as full MACs. Mask steps therefore use \texttt{measure\_macs\_masked\_model()} which detects zeroed channels and subtracts their contribution. The final physical step compares current absolute MACs against the stored original. Both paths report a consistent ratio relative to the unpruned model.
-
-### Config Lifecycle
-
-After the final pruning step, \texttt{ChannelPruning} persists \texttt{is\_prune=False} in the JSON config. On subsequent training runs (e.g., resumed fine-tuning), the constructor detects this flag and early-returns, skipping all pruner initialization: MAC estimation, DependencyGraph construction, statistics collection, and graph visualization. This avoids errors when loading an already-pruned model and reduces startup time.
 
 ## Dependency Graph Visualization
 
@@ -370,236 +368,3 @@ Graphviz-based visualization of the DependencyGraph and pruning groups, providin
 - **Combined** --- both overlaid with consistent node layout.
 
 Features: group cluster boxes, color-coded nodes by operation type, multi-group detection, and consistent layout across views. Output formats: PNG, SVG, PDF.
-
-
-\newpage
-
-# Practical Guide
-
-This part explains how to use the two main entry points for VBP pruning.
-
-## Direct Pipeline: \texttt{vbp\_imagenet.py}
-
-The primary research script. Supports one-shot pruning, iterative PAT, sparse pre-training, knowledge distillation, and multi-criterion benchmarking. All three pipeline phases (sparse $\to$ prune $\to$ fine-tune) are controlled via command-line arguments.
-
-### One-Shot Pruning
-
-The simplest mode: collect statistics, prune once, fine-tune.
-
-```bash
-python benchmarks/vbp/vbp_imagenet.py \
-  --model_type vit --model_name google/vit-base-patch16-224 \
-  --data_path /path/to/imagenet \
-  --keep_ratio 0.65 --global_pruning \
-  --epochs_ft 10 --disable_ddp
-```
-
-When \texttt{--pat} is not set, the script automatically converts to one-shot mode (\texttt{pat\_steps=1}, \texttt{pat\_epochs\_per\_step=0}), followed by \texttt{epochs\_ft} epochs of fine-tuning.
-
-### Iterative PAT
-
-Multiple prune-then-train cycles for better accuracy at aggressive ratios:
-
-```bash
-python benchmarks/vbp/vbp_imagenet.py \
-  --model_type vit --model_name /path/to/deit_tiny \
-  --data_path /path/to/imagenet \
-  --keep_ratio 0.65 --global_pruning \
-  --pat --pat_steps 5 --pat_epochs_per_step 1 \
-  --epochs_ft 10 --disable_ddp
-```
-
-Each step keeps $q = 0.65^{1/5} \approx 0.894$ of channels. After 5 steps: $0.894^5 = 0.65$ total retention. Between steps: 1 epoch of fine-tuning. After all steps: 10 epochs of final fine-tuning.
-
-### Sparse Pre-Training
-
-Optional first phase to prime the pruning signal before any structural pruning:
-
-**L2,1 group sparsity** (structured signal):
-
-```bash
-python benchmarks/vbp/vbp_imagenet.py \
-  --sparse_mode l1_group --epochs_sparse 5 --l1_lambda 1e-4 \
-  --keep_ratio 0.65 --global_pruning --epochs_ft 10 --disable_ddp \
-  --model_type vit --model_name /path/to/model --data_path /path/to/data
-```
-
-**Gradual Magnitude Pruning** (unstructured signal):
-
-```bash
-python benchmarks/vbp/vbp_imagenet.py \
-  --sparse_mode gmp --epochs_sparse 5 --gmp_target_sparsity 0.5 \
-  --keep_ratio 0.65 --global_pruning --epochs_ft 10 --disable_ddp \
-  --model_type vit --model_name /path/to/model --data_path /path/to/data
-```
-
-### CNN Pruning (ResNet-50)
-
-```bash
-python benchmarks/vbp/vbp_imagenet.py \
-  --model_type cnn --cnn_arch resnet50 \
-  --model_name /path/to/resnet50.pth \
-  --data_path /path/to/imagenet \
-  --keep_ratio 0.8 --global_pruning \
-  --opt_ft sgd --lr_ft 0.01 \
-  --epochs_ft 15 --disable_ddp
-```
-
-For CNNs, BN recalibration is applied automatically after pruning. Use \texttt{--no\_recalib} to skip (not recommended). SGD with higher learning rate (\texttt{--opt\_ft sgd --lr\_ft 0.01}) is preferred over AdamW for CNN fine-tuning.
-
-### Multi-GPU (DDP)
-
-```bash
-torchrun --nproc_per_node=4 benchmarks/vbp/vbp_imagenet.py \
-  --model_type vit --model_name /path/to/deit_tiny \
-  --data_path /path/to/imagenet \
-  --keep_ratio 0.65 --global_pruning \
-  --pat --pat_steps 5 --pat_epochs_per_step 1 \
-  --epochs_ft 10 --use_kd
-```
-
-Statistics are collected on rank~0 and broadcast to all ranks. Omit \texttt{--disable\_ddp} when using \texttt{torchrun}.
-
-### Multi-Criterion Comparison
-
-```bash
-python benchmarks/vbp/vbp_imagenet.py --criterion variance ...   # VBP, default
-python benchmarks/vbp/vbp_imagenet.py --criterion magnitude ...  # baseline
-python benchmarks/vbp/vbp_imagenet.py --criterion lamp ...       # baseline
-python benchmarks/vbp/vbp_imagenet.py --criterion random ...     # baseline
-```
-
-VBP-specific logic (stats collection, compensation, variance loss) is automatically gated on \texttt{--criterion variance}; other criteria use the base pruner.
-
-
-## Pruning Class API: \texttt{vbp\_imagenet\_pat.py}
-
-A thin wrapper demonstrating the \texttt{ChannelPruning} class from \texttt{pruning\_utils.py}. This is the **integration path** --- the IP's training loop stays unchanged, and the pruning logic is encapsulated behind two method calls.
-
-### Integration Pattern
-
-The integration requires three additions to an existing training loop:
-
-```python
-from torch_pruning.utils.pruning_utils import Pruning
-
-# 1. Initialize (once) — train_loader enables stats + compensation
-pruner = Pruning(model, config_folder, device=device,
-                 train_loader=train_loader)
-
-# 2. Pre-loop prune (one-shot prunes here; PAT does step 1)
-pruner.prune(model, epoch=0, log=logger, mask_only=False)
-
-# 3. Rebuild optimizer (parameters may have changed)
-optimizer = AdamW(model.parameters(), lr=lr)
-
-# 4. Training loop
-for epoch in range(1, total_epochs + 1):
-    train_one_epoch(model, optimizer, ...)
-    pruner.prune(model, epoch, log=logger, mask_only=False)
-    pruner.channel_regularize(model)
-```
-
-The \texttt{Pruning} constructor accepts \texttt{train\_loader} so that statistics and compensation means are collected during initialization (avoiding a redundant second pass). The pre-loop prune fires at epoch~0; subsequent calls use the internal epoch schedule to decide whether to prune or no-op. A \texttt{\_stats\_fresh} flag ensures statistics are not re-collected on the first pruning call when they were just gathered at init.
-
-### Epoch-Based Scheduling
-
-The training loop uses a 1-indexed convention: a pre-loop call handles epoch~0, then the loop runs from epoch~1 to \texttt{total\_epochs}. The \texttt{ChannelPruning.prune()} method decides what to do at each epoch based on the configuration:
-
-\begin{table}[H]
-\centering
-\caption{Epoch-based behavior of the ChannelPruning wrapper.}
-\begin{tabular}{lll}
-\toprule
-\textbf{Epoch range} & \textbf{regularize()} & \textbf{prune()} \\
-\midrule
-Pre-loop (epoch 0) & --- & First prune step (one-shot completes here) \\
-Before \texttt{start\_epoch} & Apply L$_{2,1}$ / GMP & No-op (or GMP mask update) \\
-Pruning epochs & Apply L$_{2,1}$ / GMP & Re-collect stats, prune step, BN recalib \\
-After \texttt{end\_epoch} & No-op & No-op (fine-tuning) \\
-\bottomrule
-\end{tabular}
-\label{tab:epoch-schedule}
-\end{table}
-
-After the final pruning step, retention accuracy is logged automatically (post-prune, pre-fine-tuning). The \texttt{prune\_channels} flag transitions to \texttt{False}, and all subsequent \texttt{prune()} calls return immediately.
-
-### Example: PAT with Sparse Pre-Training
-
-```bash
-torchrun --nproc_per_node=4 benchmarks/vbp/vbp_imagenet_pat.py \
-  --model_type vit --model_name /path/to/deit_tiny \
-  --data_path /path/to/imagenet \
-  --keep_ratio 0.65 --global_pruning \
-  --pat_steps 5 --epochs 15 \
-  --pruning_schedule geometric \
-  --sparse_mode l1_group --epochs_sparse 5 --l1_lambda 1e-4 \
-  --var_loss_weight 0.1 --use_kd
-```
-
-
-## Configuration Reference
-
-\begin{table}[H]
-\centering
-\caption{Key command-line arguments for \texttt{vbp\_imagenet.py}.}
-\small
-\begin{tabular}{llll}
-\toprule
-\textbf{Argument} & \textbf{Default} & \textbf{Type} & \textbf{Description} \\
-\midrule
-\multicolumn{4}{l}{\textit{Model}} \\
-\texttt{--model\_type} & vit & str & Architecture: vit, convnext, cnn \\
-\texttt{--model\_name} & --- & str & HuggingFace ID or local path \\
-\texttt{--cnn\_arch} & resnet50 & str & CNN variant (if model\_type=cnn) \\
-\midrule
-\multicolumn{4}{l}{\textit{Pruning}} \\
-\texttt{--keep\_ratio} & 0.65 & float & Target channel retention ratio \\
-\texttt{--global\_pruning} & False & flag & Global vs.\ per-layer threshold \\
-\texttt{--criterion} & variance & str & variance, magnitude, lamp, random \\
-\texttt{--no\_compensation} & False & flag & Disable VBP bias compensation \\
-\midrule
-\multicolumn{4}{l}{\textit{PAT}} \\
-\texttt{--pat} & False & flag & Enable iterative PAT \\
-\texttt{--pat\_steps} & 5 & int & Number of prune-train cycles \\
-\texttt{--pat\_epochs\_per\_step} & 3 & int & FT epochs between prune steps \\
-\texttt{--var\_loss\_weight} & 0.0 & float & Variance entropy loss weight \\
-\midrule
-\multicolumn{4}{l}{\textit{Sparse Pre-training}} \\
-\texttt{--sparse\_mode} & none & str & l1\_group, gmp, or none \\
-\texttt{--epochs\_sparse} & 5 & int & Sparse training epochs \\
-\texttt{--l1\_lambda} & 1e-4 & float & L$_{2,1}$ regularization strength \\
-\midrule
-\multicolumn{4}{l}{\textit{Fine-tuning}} \\
-\texttt{--epochs\_ft} & 10 & int & Post-prune fine-tuning epochs \\
-\texttt{--lr\_ft} & 1.5e-5 & float & Fine-tuning learning rate \\
-\texttt{--opt\_ft} & adamw & str & Optimizer: adamw or sgd \\
-\texttt{--use\_kd} & False & flag & Knowledge distillation \\
-\texttt{--kd\_alpha} & 0.7 & float & CE weight in KD loss \\
-\midrule
-\multicolumn{4}{l}{\textit{Data \& Distributed}} \\
-\texttt{--data\_path} & --- & str & ImageNet root (train/val subdirs) \\
-\texttt{--train\_batch\_size} & 64 & int & Batch size per GPU \\
-\texttt{--max\_batches} & 200 & int & Batches for stats collection \\
-\texttt{--disable\_ddp} & False & flag & Single-GPU mode \\
-\bottomrule
-\end{tabular}
-\label{tab:args}
-\end{table}
-
-
-## Common Pitfalls
-
-\begin{enumerate}
-\item \textbf{Missing statistics.} If \texttt{collect\_and\_sync\_stats()} is skipped or fails silently, all importance scores default to 1.0. The global threshold then selects \textit{all} channels for pruning, which the validity check rejects --- resulting in 0 groups pruned and no error message. Always verify logs show ``Statistics collected for N layers.''
-
-\item \textbf{Skipping BN recalibration on CNNs.} Without resetting and recomputing BN running statistics after pruning, accuracy drops to ${\sim}0\%$ regardless of pruning ratio or criterion. This is the single most common failure mode for CNN pruning.
-
-\item \textbf{Scheduler granularity.} \texttt{build\_ft\_scheduler()} returns \texttt{(scheduler, step\_per\_batch=True)}. The scheduler must be stepped after every \textit{batch}, not every epoch. Stepping per-epoch with a per-batch scheduler produces near-zero learning rates.
-
-\item \textbf{Variance loss outside PAT.} The \texttt{--var\_loss\_weight} flag only applies during per-step fine-tuning in PAT mode. It has no effect in one-shot mode or during post-prune fine-tuning.
-
-\item \textbf{DDP stat synchronization.} Statistics are collected on rank~0 only and broadcast. If the broadcast fails silently (e.g., process group not initialized), non-main ranks will have empty importance --- leading to inconsistent pruning across GPUs.
-
-\item \textbf{MobileNetV2 one-shot.} One-shot structured pruning is fundamentally broken for MobileNetV2 across all criteria. Always use iterative PAT for narrow-bottleneck architectures.
-\end{enumerate}
