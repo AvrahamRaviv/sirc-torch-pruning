@@ -1,0 +1,66 @@
+digraph PrunerArchitecture {
+    rankdir=TB;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=12, shape=box, style="rounded,filled", penwidth=1.5];
+    edge [fontname="Helvetica", fontsize=10];
+    bgcolor="white";
+    nodesep=0.5;
+    ranksep=0.6;
+
+    // --- Step 1: Input ---
+    model [label="Pretrained Model", fillcolor="#E8F0FE", color="#4285F4"];
+
+    // --- Step 2: DG ---
+    dg [label="1  Build DependencyGraph\n(trace forward pass, discover\nstructural coupling between layers)", fillcolor="#BBDEFB", color="#1565C0"];
+
+    // --- Step 3: Groups ---
+    groups [label="2  Enumerate Pruning Groups\n(each group = set of coupled layers\nthat must be pruned together)", fillcolor="#BBDEFB", color="#1565C0"];
+
+    // --- Step 4: Importance ---
+    importance [label="3  Score Channels\n(pluggable importance criterion\nscores each channel in the group)", fillcolor="#FFF3E0", color="#FB8C00"];
+
+    // --- Criteria list ---
+    subgraph cluster_criteria {
+        label="";
+        style="invis";
+        crit [shape=none, label=<
+            <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6">
+            <TR>
+            <TD BGCOLOR="#FFF3E0"><FONT FACE="Helvetica" POINT-SIZE="10">GroupMagnitude</FONT></TD>
+            <TD BGCOLOR="#FFF3E0"><FONT FACE="Helvetica" POINT-SIZE="10">GroupTaylor</FONT></TD>
+            <TD BGCOLOR="#FFE0B2"><FONT FACE="Helvetica" POINT-SIZE="10"><B>Variance (VBP)</B></FONT></TD>
+            <TD BGCOLOR="#FFE0B2"><FONT FACE="Helvetica" POINT-SIZE="10"><B>MAC-Aware</B></FONT></TD>
+            <TD BGCOLOR="#FFF3E0"><FONT FACE="Helvetica" POINT-SIZE="10">LAMP, BNScale</FONT></TD>
+            </TR>
+            </TABLE>
+        >];
+    }
+
+    // --- Step 5: Threshold ---
+    threshold [label="4  Select Channels to Prune\n(local per-layer or global threshold)", fillcolor="#BBDEFB", color="#1565C0"];
+
+    // --- Step 5b: Compensation (optional, dashed) ---
+    compensate [label="4b  Compensate (optional)\n(any criterion + mean_dict;\nbias correction via BasePruner)", fillcolor="#F5F5F5", color="#9E9E9E", style="rounded,filled,dashed", fontcolor="#616161"];
+
+    // --- Step 6: Prune ---
+    prune [label="5  Structural Removal\n(group.prune() removes channels\nacross all coupled layers atomically)", fillcolor="#FFCDD2", color="#C62828"];
+
+    // --- Output ---
+    output [label="Pruned Model\n(fewer channels, lower MACs)", fillcolor="#E8F5E9", color="#2E7D32", penwidth=2];
+
+    // --- Edges ---
+    model -> dg;
+    dg -> groups;
+    groups -> importance;
+    importance -> crit [style=dashed, arrowhead=none, color="#9E9E9E"];
+    importance -> threshold;
+    threshold -> compensate [style=dashed, color="#9E9E9E", label="  if applicable"];
+    threshold -> prune [label="  default path"];
+    compensate -> prune [style=dashed, color="#9E9E9E"];
+    prune -> output;
+
+    // --- PAT loop annotation ---
+    pat [label="PAT: repeat steps 2-5\nN times with interleaved\ntraining between steps", shape=note, style="filled", fillcolor="#FFFDE7", color="#F9A825", fontsize=10];
+    pat -> groups [style=dotted, color="#F9A825", arrowhead=none];
+    prune -> groups [style=dashed, color="#1565C0", label="  next PAT step", constraint=false];
+}
