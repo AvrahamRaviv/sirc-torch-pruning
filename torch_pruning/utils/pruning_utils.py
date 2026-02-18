@@ -462,35 +462,35 @@ class ChannelPruning:
                 use_mask = False
                 _log(log, " Last pruning step: switching to physical channel removal")
 
+        # Enable VBP meancheck if applicable (needs forward pass before pruning)
         if is_vbp and not use_mask:
-            # VBP: physical pruning with meancheck diagnostic
             self.pruner.enable_meancheck(model)
             model.eval()
             with torch.no_grad():
                 model(self.example_inputs)
-            self.pruner.step(interactive=False, enable_compensation=has_compensation)
-            self.pruner.disable_meancheck()
-            _log(log, " VBP pruning step complete")
-        else:
-            # Interactive step: physical or mask-only
-            for group in self.pruner.step(interactive=True):
-                dep, idxs = group[0]
-                if len(idxs) > 0:
-                    if has_compensation:
-                        self.pruner._apply_compensation(group, idxs)
-                    if use_mask:
-                        self.mask_group(group)
-                    else:
-                        group.prune()
 
-                    if self.verbose > 0:
-                        dep_str = str(dep)
-                        mode_str = "Mask" if use_mask else "Prune"
-                        comp_str = "+comp" if has_compensation else ""
-                        # After physical prune, shape[0] is already reduced
-                        total_ch = dep.target.module.weight.shape[0] + (len(idxs) if not use_mask else 0)
-                        _log(log, f" {mode_str}{comp_str} {len(idxs)}/{total_ch} "
-                                  f"channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}.")
+        # Unified interactive loop for all criteria (physical + mask)
+        for group in self.pruner.step(interactive=True):
+            dep, idxs = group[0]
+            if len(idxs) > 0:
+                if has_compensation:
+                    self.pruner._apply_compensation(group, idxs)
+                if use_mask:
+                    self.mask_group(group)
+                else:
+                    group.prune()
+
+                if self.verbose > 0:
+                    dep_str = str(dep)
+                    mode_str = "Mask" if use_mask else "Prune"
+                    comp_str = "+comp" if has_compensation else ""
+                    # After physical prune, shape[0] is already reduced
+                    total_ch = dep.target.module.weight.shape[0] + (len(idxs) if not use_mask else 0)
+                    _log(log, f" {mode_str}{comp_str} {len(idxs)}/{total_ch} "
+                              f"channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}.")
+
+        if is_vbp and not use_mask:
+            self.pruner.disable_meancheck()
 
         # BN recalibration after pruning step
         if self._bn_recalibration and self.train_loader is not None:
