@@ -87,9 +87,9 @@ PAT is the central contribution of STP v2. It wraps the single-pass pruning engi
 \noindent\textbf{Phase 2: Iterative Pruning.} The core PAT loop, repeated $N$ times:
 
 \begin{enumerate}[leftmargin=2em]
-\item \textit{Collect stats} \textcolor{gray}{(optional)} --- criteria that rely on activation statistics (e.g., VBP) run a calibration forward pass to gather per-channel means and variances. Weight-only criteria (magnitude, LAMP) skip this.
+\item \textit{Collect stats} \textcolor{gray}{(optional)} --- run a calibration forward pass to gather per-channel means and variances.
 \item \textit{Score \& prune channels} --- the importance criterion scores every channel, a threshold selects the bottom fraction, and the pruner structurally removes them (Section~1.1, steps 3--5).
-\item \textit{Compensate} \textcolor{gray}{(optional)} --- VBP applies bias correction and BN variance update before the structural cut (Section~\ref{sec:compensation}). Other criteria skip this.
+\item \textit{Compensate} \textcolor{gray}{(optional)} --- Pruner applies bias correction and BN variance update before the structural cut (Section~\ref{sec:compensation}). 
 \item \textit{Train $M$ epochs} --- standard training (cross-entropy, optionally knowledge distillation) to recover accuracy before the next pruning step.
 \end{enumerate}
 
