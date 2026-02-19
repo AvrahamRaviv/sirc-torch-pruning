@@ -16,6 +16,7 @@ ours.sh
 benchmarks/draw
 tests/*.png
 tests/*.pdf
+report/STP_V2_report.pdf
 modelnet40_ply_hdf5_2048.zip
 modelnet40_ply_hdf5_2048
 benchmarks/draw
