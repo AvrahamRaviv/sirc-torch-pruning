@@ -41,6 +41,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import torch_pruning as tp
 from torch_pruning.utils.pruning_utils import Pruning
+from torch_pruning.utils.reparam import MeanResidualManager
 
 # Reuse infrastructure from vbp_imagenet
 try:
@@ -48,6 +49,7 @@ try:
         build_dataloaders, load_model, forward_logits, validate,
         setup_distributed, cleanup, is_main, log_info, setup_logging,
         build_ft_scheduler, VarianceConcentrationHooks, train_one_epoch,
+        build_layers_to_prune, run_reparam_pretraining,
         logger,
     )
 except ImportError:
@@ -56,32 +58,9 @@ except ImportError:
         build_dataloaders, load_model, forward_logits, validate,
         setup_distributed, cleanup, is_main, log_info, setup_logging,
         build_ft_scheduler, VarianceConcentrationHooks, train_one_epoch,
+        build_layers_to_prune, run_reparam_pretraining,
         logger,
     )
-
-
-# ---------------------------------------------------------------------------
-# Config generation
-# ---------------------------------------------------------------------------
-def build_layers_to_prune(model, model_type, architecture=None, interior_only=True):
-    """Return list of module names to prune (fc1 / pwconv1 / interior convs)."""
-    layers = []
-    if model_type == "vit":
-        for name, m in model.named_modules():
-            if name.endswith(".intermediate.dense"):
-                layers.append(name)
-    elif model_type == "convnext":
-        for name, m in model.named_modules():
-            if hasattr(m, "pwconv1"):
-                layers.append(name + ".pwconv1")
-    elif model_type == "cnn":
-        from torch_pruning.pruner.importance import build_cnn_ignored_layers
-        import torch.nn as nn
-        ignored = build_cnn_ignored_layers(model, architecture, interior_only)
-        for name, m in model.named_modules():
-            if isinstance(m, nn.Conv2d) and m not in ignored:
-                layers.append(name)
-    return layers
 
 
 _CRITERION_TO_METHOD = {
@@ -162,6 +141,32 @@ def build_pruning_config(args, model, config_dir):
 
 
 # ---------------------------------------------------------------------------
+# Optimizer with reparam-aware weight decay grouping
+# ---------------------------------------------------------------------------
+def build_optimizer(model, args, reparam_manager=None):
+    """Build optimizer with optional param group splitting for reparam.
+
+    When reparam is active, v and m parameters get weight_decay=0 (regularized
+    via aux loss instead). Other parameters use standard weight decay.
+    """
+    params = list(model.parameters())
+    if reparam_manager and reparam_manager.is_active:
+        reparam_ids = reparam_manager.reparam_param_ids()
+        base = [p for p in params if id(p) not in reparam_ids]
+        reparam = [p for p in params if id(p) in reparam_ids]
+        groups = [
+            {"params": base, "weight_decay": args.wd},
+            {"params": reparam, "weight_decay": 0.0},
+        ]
+    else:
+        groups = [{"params": params, "weight_decay": args.wd}]
+
+    if args.opt == "sgd":
+        return torch.optim.SGD(groups, lr=args.lr, momentum=0.9)
+    return torch.optim.AdamW(groups, lr=args.lr)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main(argv):
@@ -217,6 +222,11 @@ def main(argv):
             p.requires_grad = False
         log_info("Created teacher model for KD")
 
+    # --- Sparse pre-training (reparam mode uses MeanResidualManager) ---
+    if args.sparse_mode == "reparam" and args.epochs_sparse > 0:
+        run_reparam_pretraining(model, teacher, train_loader, train_sampler,
+                                val_loader, device, args)
+
     # Build pruning config and Pruning class
     config_dir = os.path.join(args.save_dir, "pruning_config")
     build_pruning_config(args, model, config_dir)
@@ -249,8 +259,21 @@ def main(argv):
                  f"(MACs={pruned_macs / 1e9:.2f}G, Params={pruned_params / 1e6:.2f}M)")
         retention_logged = True
 
+    # --- Mean-residual reparameterization (optional) ---
+    reparam_manager = None
+    if args.reparam and pruner.channel_pruner.prune_channels:
+        target_names = build_layers_to_prune(
+            model, args.model_type,
+            architecture=getattr(args, 'cnn_arch', None),
+            interior_only=getattr(args, 'interior_only', True))
+        reparam_manager = MeanResidualManager(
+            model, target_names, device,
+            lambda_reg=args.reparam_lambda,
+            max_batches=args.max_batches)
+        reparam_manager.reparameterize(train_loader)
+
     # Optimizer + scheduler AFTER prune (parameters may have changed)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    optimizer = build_optimizer(model, args, reparam_manager)
     scheduler, step_per_batch = build_ft_scheduler(
         optimizer, args.epochs, len(train_loader))
 
@@ -269,6 +292,10 @@ def main(argv):
 
     best_acc = 0.0
     for epoch in range(1, args.epochs + 1):
+        # Aux loss for reparam regularization
+        aux_loss_fn = (reparam_manager.regularization_loss
+                       if reparam_manager and reparam_manager.is_active else None)
+
         # Train
         train_loss = train_one_epoch(
             train_model, train_loader, train_sampler,
@@ -276,13 +303,25 @@ def main(argv):
             teacher=teacher, step_per_batch=step_per_batch,
             phase="PAT", var_hooks=var_hooks,
             regularize_fn=pruner.channel_regularize,
+            aux_loss_fn=aux_loss_fn,
         )
+
+        # Check if pruning will happen this epoch
+        cp = pruner.channel_pruner
+        will_prune = (cp.prune_channels
+                      and cp.start_epoch <= epoch
+                      and (epoch - cp.start_epoch) % cp.epoch_rate == 0)
+
+        # Merge back before pruning so DG sees standard modules
+        if will_prune and reparam_manager and reparam_manager.is_active:
+            reparam_manager.merge_back()
+            cp.init_channel_pruner(model, logger, collect_stats=False)
 
         # End-of-epoch prune (epoch 0 already done pre-loop)
         pruner.prune(model, epoch, log=logger, mask_only=False)
 
         # Log retention after final pruning step (PAT finishes here)
-        if is_main() and not retention_logged and not pruner.channel_pruner.prune_channels:
+        if is_main() and not retention_logged and not cp.prune_channels:
             acc_ret, _ = validate(model, val_loader, device, args.model_type)
             pruned_macs, pruned_params = tp.utils.count_ops_and_params(model, example_inputs)
             log_info(f"Retention accuracy: {acc_ret:.4f} "
@@ -296,14 +335,24 @@ def main(argv):
             cur_step = pruner.channel_pruner.pruner.current_step if pruner.channel_pruner.pruner else 0
         if cur_step > prev_step:
             prev_step = cur_step
+
+            # Re-reparameterize after prune if more pruning ahead
+            if reparam_manager and cp.prune_channels:
+                reparam_manager.reparameterize(train_loader)
+
             if use_ddp:
                 del train_model
                 train_model = DDP(model, device_ids=[args.local_rank],
                                   output_device=args.local_rank)
-            optimizer = torch.optim.AdamW(train_model.parameters(),
-                                          lr=args.lr, weight_decay=0.01)
+            optimizer = build_optimizer(model, args, reparam_manager)
             scheduler, step_per_batch = build_ft_scheduler(
                 optimizer, args.epochs - epoch, len(train_loader))
+
+        # Optional μ_x refresh (between prune steps, when model drifts)
+        elif (reparam_manager and reparam_manager.is_active
+              and args.reparam_refresh > 0
+              and epoch % args.reparam_refresh == 0):
+            reparam_manager.refresh_mu(train_loader)
 
         # Validate
         if is_main():
@@ -325,6 +374,10 @@ def main(argv):
     # Cleanup var hooks
     if var_hooks is not None:
         var_hooks.remove()
+
+    # Merge back for final eval / save (standard modules)
+    if reparam_manager and reparam_manager.is_active:
+        reparam_manager.merge_back()
 
     # Final summary
     if is_main():
@@ -391,14 +444,26 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=15,
                         help="Total training epochs")
     parser.add_argument("--lr", type=float, default=1.5e-5)
+    parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd"],
+                        help="Optimizer for PAT training")
+    parser.add_argument("--wd", type=float, default=0.01,
+                        help="Weight decay (applied to non-reparam params)")
     parser.add_argument("--var_loss_weight", type=float, default=0.0)
     parser.add_argument("--pruning_schedule", default="geometric",
                         choices=["geometric", "linear"],
                         help="Pruning schedule type")
 
+    # Mean-residual reparameterization
+    parser.add_argument("--reparam", action="store_true",
+                        help="Enable mean-residual reparameterization during PAT")
+    parser.add_argument("--reparam_lambda", type=float, default=0.01,
+                        help="L_{2,1} regularization strength for residual weights V")
+    parser.add_argument("--reparam_refresh", type=int, default=0,
+                        help="Refresh μ_x every N epochs (0 = never)")
+
     # Sparse pre-training
     parser.add_argument("--sparse_mode", default="none",
-                        choices=["l1_group", "gmp", "none"],
+                        choices=["l1_group", "gmp", "reparam", "none"],
                         help="Sparse pre-training mode (none = skip)")
     parser.add_argument("--epochs_sparse", type=int, default=0,
                         help="Sparse pre-training epochs (shifts pruning start)")

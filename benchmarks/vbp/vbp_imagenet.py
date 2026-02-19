@@ -403,6 +403,29 @@ class VarianceConcentrationHooks:
 
 
 # ---------------------------------------------------------------------------
+# Layer name helpers
+# ---------------------------------------------------------------------------
+def build_layers_to_prune(model, model_type, architecture=None, interior_only=True):
+    """Return list of module names to prune (fc1 / pwconv1 / interior convs)."""
+    layers = []
+    if model_type == "vit":
+        for name, m in model.named_modules():
+            if name.endswith(".intermediate.dense"):
+                layers.append(name)
+    elif model_type == "convnext":
+        for name, m in model.named_modules():
+            if hasattr(m, "pwconv1"):
+                layers.append(name + ".pwconv1")
+    elif model_type == "cnn":
+        from torch_pruning.pruner.importance import build_cnn_ignored_layers
+        ignored = build_cnn_ignored_layers(model, architecture, interior_only)
+        for name, m in model.named_modules():
+            if isinstance(m, nn.Conv2d) and m not in ignored:
+                layers.append(name)
+    return layers
+
+
+# ---------------------------------------------------------------------------
 # Sparse pre-training
 # ---------------------------------------------------------------------------
 def run_sparse_pretraining(model, teacher, train_loader, train_sampler,
@@ -475,6 +498,75 @@ def run_sparse_pretraining(model, teacher, train_loader, train_sampler,
     if is_main():
         acc_sparse, _ = validate(model, val_loader, device, args.model_type)
         log_info(f"Post-sparse accuracy: {acc_sparse:.4f}")
+
+
+def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
+                            val_loader, device, args):
+    """Mean-residual reparameterization sparse phase.
+
+    Decomposes target layers into m + V^T(x - μ_x), then trains with L_{2,1}
+    regularization on V to drive activation variance toward zero before pruning.
+    Merges back to standard modules after training.
+    """
+    from torch_pruning.utils.reparam import MeanResidualManager
+
+    target_names = build_layers_to_prune(
+        model, args.model_type,
+        architecture=getattr(args, 'cnn_arch', None),
+        interior_only=getattr(args, 'interior_only', True))
+    log_info(f"Reparam pre-training: {len(target_names)} layers, "
+             f"epochs={args.epochs_sparse}, λ={args.reparam_lambda}")
+
+    mgr = MeanResidualManager(
+        model, target_names, device,
+        lambda_reg=args.reparam_lambda,
+        max_batches=args.max_batches)
+    mgr.reparameterize(train_loader)
+
+    # Wrap in DDP for training
+    use_ddp = not args.disable_ddp and dist.is_initialized()
+    if use_ddp:
+        train_model = DDP(model, device_ids=[args.local_rank],
+                          output_device=args.local_rank)
+    else:
+        train_model = model
+
+    # Exclude reparam params from weight decay
+    reparam_ids = mgr.reparam_param_ids()
+    base_params = [p for p in train_model.parameters() if id(p) not in reparam_ids]
+    reparam_params = [p for p in train_model.parameters() if id(p) in reparam_ids]
+    optimizer = torch.optim.AdamW([
+        {"params": base_params, "weight_decay": 0.01},
+        {"params": reparam_params, "weight_decay": 0.0},
+    ], lr=args.lr_sparse)
+    scheduler, step_per_batch = build_ft_scheduler(
+        optimizer, args.epochs_sparse, len(train_loader))
+
+    for epoch in range(args.epochs_sparse):
+        train_loss = train_one_epoch(
+            train_model, train_loader, train_sampler, optimizer, scheduler,
+            device, epoch, args, teacher=teacher,
+            step_per_batch=step_per_batch, phase="Reparam",
+            aux_loss_fn=mgr.regularization_loss)
+
+        if is_main():
+            acc, _ = validate(model, val_loader, device, args.model_type)
+            log_info(f"Reparam {epoch+1}/{args.epochs_sparse}: "
+                     f"train_loss={train_loss:.4f}, val_acc={acc:.4f}")
+
+        if use_ddp:
+            dist.barrier()
+
+    # Cleanup DDP wrapper
+    if use_ddp:
+        del train_model
+
+    # Merge back to standard modules before pruning
+    mgr.merge_back()
+
+    if is_main():
+        acc_reparam, _ = validate(model, val_loader, device, args.model_type)
+        log_info(f"Post-reparam accuracy: {acc_reparam:.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -714,7 +806,8 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
                     scheduler, device, epoch, args,
                     teacher=None, fc1_modules=None,
                     step_per_batch=True, phase="Epoch",
-                    var_hooks=None, regularize_fn=None):
+                    var_hooks=None, regularize_fn=None,
+                    aux_loss_fn=None):
     """Unified training epoch: optional KD + optional L2,1 regularization + optional var loss.
 
     Args:
@@ -724,6 +817,8 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
         phase: Log prefix ("Epoch" for fine-tuning, "Sparse" for sparse phase).
         var_hooks: If not None and args.var_loss_weight > 0, compute variance
             concentration loss from hooked activations.
+        aux_loss_fn: Optional callable returning a scalar tensor (e.g. reparam
+            regularization). Added to loss before backward.
     """
     model.train()
     if train_sampler is not None:
@@ -736,6 +831,7 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
     total_loss = 0.0
     total_reg = 0.0
     total_var = 0.0
+    total_aux = 0.0
     num_batches = 0
 
     total = len(train_loader)
@@ -772,6 +868,12 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
             loss = loss + args.var_loss_weight * var_loss
             total_var += var_loss.item()
 
+        # Auxiliary loss (e.g. mean-residual regularization)
+        if aux_loss_fn is not None:
+            aux = aux_loss_fn()
+            loss = loss + aux
+            total_aux += aux.item()
+
         optimizer.zero_grad()
         loss.backward()
         if regularize_fn is not None:
@@ -791,6 +893,8 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
                 parts.append(f"L21={total_reg / num_batches:.2f}")
             if use_var_loss:
                 parts.append(f"var={total_var / num_batches:.4f}")
+            if aux_loss_fn is not None:
+                parts.append(f"aux={total_aux / num_batches:.4f}")
             log_info(f"{phase} {epoch+1} [{batch_idx+1}/{total}] {' '.join(parts)}")
 
     if not step_per_batch:
@@ -1072,7 +1176,10 @@ def main(argv):
         log_info("Created teacher model for knowledge distillation")
 
     # --- Sparse pre-training (optional, default: skip) ---
-    if args.sparse_mode != "none":
+    if args.sparse_mode == "reparam":
+        run_reparam_pretraining(model, teacher, train_loader, train_sampler,
+                                val_loader, device, args)
+    elif args.sparse_mode != "none":
         run_sparse_pretraining(model, teacher, train_loader, train_sampler,
                                val_loader, device, args)
 
@@ -1178,7 +1285,7 @@ def parse_args():
     # Sparse pre-training (optional, default: none = skip)
     sparse_group = parser.add_argument_group("Sparse Pre-training")
     sparse_group.add_argument("--sparse_mode", default="none",
-                              choices=["l1_group", "gmp", "none"],
+                              choices=["l1_group", "gmp", "reparam", "none"],
                               help="Sparse pre-training mode (none = skip)")
     sparse_group.add_argument("--epochs_sparse", type=int, default=5,
                               help="Sparse pre-training epochs")
@@ -1188,6 +1295,8 @@ def parse_args():
                               help="L2,1 regularization strength (l1_group mode)")
     sparse_group.add_argument("--gmp_target_sparsity", type=float, default=0.5,
                               help="Target weight sparsity for GMP mode")
+    sparse_group.add_argument("--reparam_lambda", type=float, default=0.01,
+                              help="L_{2,1} regularization strength for reparam mode")
 
     # DDP
     ddp_group = parser.add_argument_group("Distributed")
