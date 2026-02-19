@@ -1,63 +1,33 @@
 # step 1: init Pruner, at trainer.py:
 # a. import
 """
-from torch_pruning.utils import Pruning
+from torch_pruning.utils.pruning_utils import Pruning
 """
 # b. init:
 """
-self.do_qat = False
-
---->
 # init pruner
-self.pruner = Pruning(model, save_root, self.forward_pass_train, self._log, self.device)
-<---
-
-self.starting_qat_from_float = self.do_qat and self.model_is_float()
+if self.cfg.do_prun:
+    self.pruner = Pruning(model, save_root, self.forward_pass_train, self._log, self.device, train_loader=self.train_loader)
 """
 
 # c. prune at init (if needed):
 """
-self.save_model()
-
---->
 # channel pruning at initialization
-self.pruner.prune(self.model, self.i_epoch, self._log)
-<---
-
-for epoch in range(self.cfg.epoch_num):
+if self.cfg.do_prun:
+    self.pruner.prune(self.model, self.i_epoch, self._log)
 """
 
 # step 2: Regularization, at trainer.py:
 """
-# compute gradient and do optimization step
-self.optimizer.zero_grad()
-
---->
-slice_loss = self.pruner.slice_regularize(self.model)
-loss = loss + slice_loss
-<---
-                
-loss.backward()
-
---->
-self.pruner.channel_regularize(self.model)  # sparsity regularization
-<---
-
-self.loss_q.append(loss.item() - slice_loss.item())
+if self.cfg.do_prun:
+    reg_loss = self.pruner.channel_regularize(self.model)  # sparsity regularization
 """
 
 # step 3: Pruning/Masking, at trainer.py:
 """
-if self.cfg.get('check_nan', True) and mean_loss == -1:         # nan loss was detected
-    continue                                                    # skipping validation and model save
-
---->
 # pruning
-self.pruner.prune(self.model, self.i_epoch, self._log)
-<---
-
-if save_model and self.i_epoch % self.cfg.save_freq == 0:
-    self.save_model()
+if self.cfg.do_prun:
+    self.pruner.prune(self.model, self.i_epoch, self._log)
 """
 
 # load pruned model extension, at models.utils:
