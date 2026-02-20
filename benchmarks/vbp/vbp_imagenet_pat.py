@@ -167,19 +167,78 @@ def build_optimizer(model, args, reparam_manager=None):
 
 
 # ---------------------------------------------------------------------------
-# DDP sync — broadcast rank 0's model after structural changes
+# DDP sync helpers
 # ---------------------------------------------------------------------------
 def _broadcast_model_state(model):
     """Broadcast model parameters and buffers from rank 0.
 
-    Called after prune/reparameterize so all DDP ranks have identical
-    model state. Each rank may prune different channels (different stats
-    from DistributedSampler), but rank 0's result is authoritative.
+    Called after structural changes (reparameterize) so all DDP ranks
+    have identical model state.
     """
     for param in model.parameters():
         dist.broadcast(param.data, src=0)
     for buf in model.buffers():
         dist.broadcast(buf, src=0)
+
+
+def _make_stats_sync_hook(cp, device):
+    """Create a post-stats hook that broadcasts importance stats from rank 0.
+
+    In DDP, each rank collects stats from its own data subset (via
+    DistributedSampler). This hook ensures all ranks use rank 0's stats,
+    so pruning decisions are identical across ranks — preventing shape
+    divergence that would crash DDP.
+    """
+    def hook(model):
+        name_to_module = {n: m for n, m in model.named_modules()}
+        module_to_name = {m: n for n, m in model.named_modules()}
+
+        if is_main():
+            stats = {}
+            # VBP variance + means
+            if cp.vbp_importance is not None and cp.vbp_importance.variance:
+                stats["variance"] = {
+                    module_to_name[m]: v.cpu()
+                    for m, v in cp.vbp_importance.variance.items()
+                    if m in module_to_name
+                }
+                stats["means"] = {
+                    module_to_name[m]: v.cpu()
+                    for m, v in cp.vbp_importance.means.items()
+                    if m in module_to_name
+                }
+            # Compensation means (any criterion)
+            if cp._compensation_means:
+                stats["comp_means"] = {
+                    module_to_name[m]: v.cpu()
+                    for m, v in cp._compensation_means.items()
+                    if m in module_to_name
+                }
+        else:
+            stats = None
+
+        stats_list = [stats]
+        dist.broadcast_object_list(stats_list, src=0)
+
+        if not is_main():
+            stats = stats_list[0]
+            if "variance" in stats and cp.vbp_importance is not None:
+                for name, var in stats["variance"].items():
+                    if name in name_to_module:
+                        mod = name_to_module[name]
+                        cp.vbp_importance.variance[mod] = var.to(device)
+                        if name in stats.get("means", {}):
+                            cp.vbp_importance.means[mod] = stats["means"][name].to(device)
+            if "comp_means" in stats:
+                cp._compensation_means = {
+                    name_to_module[n]: v.to(device)
+                    for n, v in stats["comp_means"].items()
+                    if n in name_to_module
+                }
+
+        dist.barrier()
+
+    return hook
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +318,10 @@ def main(argv):
 
     # --- Unified training loop ---
     use_ddp = not args.disable_ddp and dist.is_initialized()
+
+    # Set DDP stats sync hook so all ranks use rank 0's importance stats
+    if use_ddp:
+        cp._post_stats_hook = _make_stats_sync_hook(cp, device)
 
     optimizer = build_optimizer(model, args, cp._reparam_manager)
     scheduler, step_per_batch = build_ft_scheduler(optimizer, total, len(train_loader))
