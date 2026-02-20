@@ -206,6 +206,7 @@ class ChannelPruning:
         self._model_changed = False
         self._reparam_manager = None
         self._reparam_lambda = self.channel_sparsity_args.get("reparam_lambda", 0.01)
+        self._post_stats_hook = None  # callable(model) — called after stats collection (e.g., DDP sync)
 
         # Build ignored_layers (needed before MAC estimation)
         self.set_layers_to_prune(model)
@@ -363,6 +364,10 @@ class ChannelPruning:
                 _log(log, f"Collected activation means for compensation ({len(self._compensation_means)} layers)")
                 self._stats_fresh = True
 
+        # Sync stats across ranks (e.g., DDP broadcast from rank 0)
+        if self._post_stats_hook is not None and self._stats_fresh:
+            self._post_stats_hook(model)
+
         # Set mean_dict on pruner for bias compensation
         if not self._no_compensation and self._compensation_means:
             self.pruner.set_mean_dict(self._compensation_means)
@@ -474,6 +479,7 @@ class ChannelPruning:
 
         # Re-collect stats before each step (critical for PAT correctness).
         # Skip if stats are fresh (just collected at init or previous re-init).
+        stats_collected = False
         if loader is not None and not self._stats_fresh:
             from torch_pruning.pruner.importance import build_target_layers, collect_activation_means
             target_layers = build_target_layers(model, self.pruner.DG)
@@ -486,15 +492,22 @@ class ChannelPruning:
                     max_batches=self._vbp_max_batches)
                 if not self._no_compensation:
                     self._compensation_means = dict(self.vbp_importance.means)
-                    self.pruner.set_mean_dict(self._compensation_means)
             elif not self._no_compensation and self.pruner.mean_dict is not None:
                 # Non-VBP: re-collect means only (model changed since last step)
                 self._compensation_means = collect_activation_means(
                     model, loader, self.device,
                     target_layers=target_layers,
                     max_batches=self._vbp_max_batches)
-                self.pruner.set_mean_dict(self._compensation_means)
+            stats_collected = True
         self._stats_fresh = False
+
+        # Sync stats across ranks (e.g., DDP broadcast from rank 0)
+        if stats_collected and self._post_stats_hook is not None:
+            self._post_stats_hook(model)
+
+        # Update pruner with (possibly synced) compensation means
+        if stats_collected and not self._no_compensation and self._compensation_means:
+            self.pruner.set_mean_dict(self._compensation_means)
 
         has_compensation = self.pruner.mean_dict is not None
 
