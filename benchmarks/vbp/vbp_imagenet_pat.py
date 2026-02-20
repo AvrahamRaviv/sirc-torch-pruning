@@ -167,6 +167,22 @@ def build_optimizer(model, args, reparam_manager=None):
 
 
 # ---------------------------------------------------------------------------
+# DDP sync — broadcast rank 0's model after structural changes
+# ---------------------------------------------------------------------------
+def _broadcast_model_state(model):
+    """Broadcast model parameters and buffers from rank 0.
+
+    Called after prune/reparameterize so all DDP ranks have identical
+    model state. Each rank may prune different channels (different stats
+    from DistributedSampler), but rank 0's result is authoritative.
+    """
+    for param in model.parameters():
+        dist.broadcast(param.data, src=0)
+    for buf in model.buffers():
+        dist.broadcast(buf, src=0)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main(argv):
@@ -259,7 +275,10 @@ def main(argv):
         pruner.prune(model, epoch, log=logger, mask_only=False)
 
         # 2. Rebuild optimizer if model structure changed
-        if cp.model_changed:
+        changed = cp.model_changed
+        if use_ddp and changed:
+            _broadcast_model_state(model)
+        if changed:
             optimizer = build_optimizer(model, args, cp._reparam_manager)
             scheduler, step_per_batch = build_ft_scheduler(
                 optimizer, total - epoch - 1, len(train_loader))
