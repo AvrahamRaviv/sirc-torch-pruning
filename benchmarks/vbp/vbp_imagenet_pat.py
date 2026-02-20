@@ -319,9 +319,11 @@ def main(argv):
     # --- Unified training loop ---
     use_ddp = not args.disable_ddp and dist.is_initialized()
 
-    # Set DDP stats sync hook so all ranks use rank 0's importance stats
+    # Set DDP stats sync hook so all ranks use rank 0's importance stats.
+    # Call immediately to sync the stats already collected during __init__.
     if use_ddp:
         cp._post_stats_hook = _make_stats_sync_hook(cp, device)
+        cp._post_stats_hook(model)
 
     optimizer = build_optimizer(model, args, cp._reparam_manager)
     scheduler, step_per_batch = build_ft_scheduler(optimizer, total, len(train_loader))
