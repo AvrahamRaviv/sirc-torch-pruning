@@ -273,82 +273,6 @@ class ChannelPruning:
         else:
             return "FT"
 
-    @staticmethod
-    def _is_ddp_active():
-        """Check if DDP is active with multiple ranks."""
-        return (torch.distributed.is_available()
-                and torch.distributed.is_initialized()
-                and torch.distributed.get_world_size() > 1)
-
-    def _broadcast_model_state(self, model):
-        """Broadcast model parameters and buffers from rank 0.
-
-        Called after data-dependent model modifications (reparameterize)
-        to ensure all DDP ranks have identical model state.
-        """
-        if not self._is_ddp_active():
-            return
-        for param in model.parameters():
-            torch.distributed.broadcast(param.data, src=0)
-        for buf in model.buffers():
-            torch.distributed.broadcast(buf, src=0)
-
-    def _sync_importance(self, model):
-        """Broadcast VBP stats and compensation means from rank 0.
-
-        Called after stats collection to ensure all DDP ranks make
-        identical pruning decisions.
-        """
-        if not self._is_ddp_active():
-            return
-
-        rank = torch.distributed.get_rank()
-        module_to_name = {m: n for n, m in model.named_modules()}
-        name_to_module = {n: m for n, m in model.named_modules()}
-
-        # Sync VBP variance + means
-        if self.vbp_importance is not None and len(self.vbp_importance.variance) > 0:
-            if rank == 0:
-                payload = {
-                    "var": {module_to_name[m]: v.cpu()
-                            for m, v in self.vbp_importance.variance.items()
-                            if m in module_to_name},
-                    "means": {module_to_name[m]: v.cpu()
-                              for m, v in self.vbp_importance.means.items()
-                              if m in module_to_name},
-                }
-            else:
-                payload = None
-            obj = [payload]
-            torch.distributed.broadcast_object_list(obj, src=0)
-            if rank != 0:
-                self.vbp_importance.variance.clear()
-                self.vbp_importance.means.clear()
-                for n, v in obj[0]["var"].items():
-                    if n in name_to_module:
-                        self.vbp_importance.variance[name_to_module[n]] = v.to(self.device)
-                for n, v in obj[0]["means"].items():
-                    if n in name_to_module:
-                        self.vbp_importance.means[name_to_module[n]] = v.to(self.device)
-                if not self._no_compensation:
-                    self._compensation_means = dict(self.vbp_importance.means)
-
-        # Sync non-VBP compensation means
-        elif self._compensation_means:
-            if rank == 0:
-                comp = {module_to_name[m]: v.cpu()
-                        for m, v in self._compensation_means.items()
-                        if m in module_to_name}
-            else:
-                comp = None
-            obj = [comp]
-            torch.distributed.broadcast_object_list(obj, src=0)
-            if rank != 0:
-                self._compensation_means = {}
-                for n, v in obj[0].items():
-                    if n in name_to_module:
-                        self._compensation_means[name_to_module[n]] = v.to(self.device)
-
     def init_channel_pruner(self, model, log=None, print_layers=False, collect_stats=True,
                              train_loader=None):
         """Build importance criterion, pruner, and optionally collect stats.
@@ -439,9 +363,6 @@ class ChannelPruning:
                 _log(log, f"Collected activation means for compensation ({len(self._compensation_means)} layers)")
                 self._stats_fresh = True
 
-        # Sync stats across DDP ranks before setting mean_dict
-        self._sync_importance(model)
-
         # Set mean_dict on pruner for bias compensation
         if not self._no_compensation and self._compensation_means:
             self.pruner.set_mean_dict(self._compensation_means)
@@ -519,7 +440,6 @@ class ChannelPruning:
                     lambda_reg=self._reparam_lambda,
                     max_batches=self._vbp_max_batches)
                 self._reparam_manager.reparameterize(loader)
-                self._broadcast_model_state(model)
                 self._model_changed = True
             return
 
@@ -554,7 +474,6 @@ class ChannelPruning:
 
         # Re-collect stats before each step (critical for PAT correctness).
         # Skip if stats are fresh (just collected at init or previous re-init).
-        _recollected = False
         if loader is not None and not self._stats_fresh:
             from torch_pruning.pruner.importance import build_target_layers, collect_activation_means
             target_layers = build_target_layers(model, self.pruner.DG)
@@ -567,21 +486,15 @@ class ChannelPruning:
                     max_batches=self._vbp_max_batches)
                 if not self._no_compensation:
                     self._compensation_means = dict(self.vbp_importance.means)
-                _recollected = True
+                    self.pruner.set_mean_dict(self._compensation_means)
             elif not self._no_compensation and self.pruner.mean_dict is not None:
                 # Non-VBP: re-collect means only (model changed since last step)
                 self._compensation_means = collect_activation_means(
                     model, loader, self.device,
                     target_layers=target_layers,
                     max_batches=self._vbp_max_batches)
-                _recollected = True
-        self._stats_fresh = False
-
-        # Sync re-collected stats across DDP ranks
-        if _recollected:
-            self._sync_importance(model)
-            if not self._no_compensation and self._compensation_means:
                 self.pruner.set_mean_dict(self._compensation_means)
+        self._stats_fresh = False
 
         has_compensation = self.pruner.mean_dict is not None
 
