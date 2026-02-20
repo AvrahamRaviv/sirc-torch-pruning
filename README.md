@@ -98,7 +98,7 @@ To reproduce VBP paper results:
   -q gpu_deep_train_high_q \
   -C execute -W working_dir -M benchmarks/vbp/vbp_imagenet_pat.py \
   -s 16gb -n 8 \
-  -A '--disable_ddp --model_type vit --model_name /algo/NetOptimization/outputs/VBP/DeiT_tiny --save_dir <output_dir> --epochs 10 --global_pruning --pat_steps 0' \
+  -A '--disable_ddp --model_type vit --model_name /algo/NetOptimization/outputs/VBP/DeiT_tiny --save_dir <output_dir> --epochs_ft 10 --global_pruning --pat_steps 1' \
   -p VISION \
   -v /algo/NetOptimization:/algo/NetOptimization \
   -R "select[gpu_hm48]" \
