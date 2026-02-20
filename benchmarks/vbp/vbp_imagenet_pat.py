@@ -13,7 +13,7 @@ Usage:
         --keep_ratio 0.65 \
         --global_pruning \
         --pat_steps 5 \
-        --epochs 15 \
+        --epochs_pat_ft 15 \
         --disable_ddp
 
     # Magnitude criterion
@@ -25,7 +25,7 @@ Usage:
         --keep_ratio 0.65 \
         --global_pruning \
         --pat_steps 5 \
-        --epochs 15 \
+        --epochs_pat_ft 15 \
         --disable_ddp
 """
 
@@ -80,7 +80,7 @@ def build_pruning_config(args, model, config_dir):
 
     # Sparse pre-training shifts the pruning start epoch
     start_epoch = args.epochs_sparse if args.sparse_mode != "none" else 0
-    pat_total = args.epochs - start_epoch
+    pat_total = args.epochs_pat_ft - start_epoch
 
     if args.pat_steps <= 1:
         # One-shot: single prune at start_epoch
@@ -275,7 +275,7 @@ def main(argv):
     # Optimizer + scheduler AFTER prune (parameters may have changed)
     optimizer = build_optimizer(model, args, reparam_manager)
     scheduler, step_per_batch = build_ft_scheduler(
-        optimizer, args.epochs, len(train_loader))
+        optimizer, args.epochs_pat_ft, len(train_loader))
 
     # Wrap in DDP after initial prune
     train_model = model
@@ -291,17 +291,18 @@ def main(argv):
         prev_step = pruner.channel_pruner.pruner.current_step if pruner.channel_pruner.pruner else 0
 
     best_acc = 0.0
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, args.epochs_pat_ft + 1):
         # Aux loss for reparam regularization
         aux_loss_fn = (reparam_manager.regularization_loss
                        if reparam_manager and reparam_manager.is_active else None)
 
         # Train
+        phase = "PAT" if pruner.channel_pruner.prune_channels else "FT"
         train_loss = train_one_epoch(
             train_model, train_loader, train_sampler,
             optimizer, scheduler, device, epoch, args,
             teacher=teacher, step_per_batch=step_per_batch,
-            phase="PAT", var_hooks=var_hooks,
+            phase=phase, var_hooks=var_hooks,
             regularize_fn=pruner.channel_regularize,
             aux_loss_fn=aux_loss_fn,
         )
@@ -346,7 +347,7 @@ def main(argv):
                                   output_device=args.local_rank)
             optimizer = build_optimizer(model, args, reparam_manager)
             scheduler, step_per_batch = build_ft_scheduler(
-                optimizer, args.epochs - epoch, len(train_loader))
+                optimizer, args.epochs_pat_ft - epoch, len(train_loader))
 
         # Optional μ_x refresh (between prune steps, when model drifts)
         elif (reparam_manager and reparam_manager.is_active
@@ -359,7 +360,7 @@ def main(argv):
             eval_model = train_model.module if isinstance(train_model, DDP) else train_model
             acc, val_loss = validate(eval_model, val_loader, device, args.model_type)
             pruned_macs, pruned_params = tp.utils.count_ops_and_params(eval_model, example_inputs)
-            log_info(f"Epoch {epoch}/{args.epochs}: train_loss={train_loss:.4f}, "
+            log_info(f"Epoch {epoch}/{args.epochs_pat_ft}: train_loss={train_loss:.4f}, "
                      f"val_acc={acc:.4f}, MACs={pruned_macs / 1e9:.2f}G")
 
             if acc > best_acc:
@@ -441,8 +442,8 @@ def parse_args():
     # PAT
     parser.add_argument("--pat_steps", type=int, default=5,
                         help="Number of prune steps (0 or 1 = one-shot, >1 = PAT)")
-    parser.add_argument("--epochs", type=int, default=15,
-                        help="Total training epochs")
+    parser.add_argument("--epochs_pat_ft", type=int, default=15,
+                        help="Total epochs for PAT pruning + post-prune fine-tuning")
     parser.add_argument("--lr", type=float, default=1.5e-5)
     parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd"],
                         help="Optimizer for PAT training")
@@ -467,6 +468,8 @@ def parse_args():
                         help="Sparse pre-training mode (none = skip)")
     parser.add_argument("--epochs_sparse", type=int, default=0,
                         help="Sparse pre-training epochs (shifts pruning start)")
+    parser.add_argument("--lr_sparse", type=float, default=1e-4,
+                        help="Learning rate for sparse pre-training")
     parser.add_argument("--l1_lambda", type=float, default=1e-4,
                         help="L2,1 regularization strength (l1_group mode)")
     parser.add_argument("--gmp_target_sparsity", type=float, default=0.5,
