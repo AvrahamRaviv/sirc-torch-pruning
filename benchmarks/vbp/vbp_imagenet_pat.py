@@ -1,11 +1,21 @@
 """
-Pruning-Aware Training (PAT) via the Pruning class from pruning_utils.py.
+Unified Pruning Pipeline via the Pruning class from pruning_utils.py.
 
-Supports multiple pruning criteria (variance/VBP, magnitude, LAMP, random)
-using the standard Pruning class interface with epoch-based gradual pruning.
+One training loop, three phases managed by ChannelPruning:
+  1. Sparse pre-training (optional): L2,1 / GMP / reparam
+  2. PAT: iterative prune-then-train steps
+  3. Post-prune fine-tuning
+
+Epoch math:
+    epoch_rate = max(1, pat_epochs_per_step + 1)
+    start_epoch = epochs_sparse  (if sparse_mode != none)
+    end_epoch   = start_epoch + (pat_steps - 1) * epoch_rate
+    total       = end_epoch + 1 + epochs_ft
+
+Supports multiple pruning criteria (variance/VBP, magnitude, LAMP, random).
 
 Usage:
-    # Single GPU (VBP, default)
+    # 5 PAT steps + 10 FT epochs (VBP, default)
     python benchmarks/vbp/vbp_imagenet_pat.py \
         --model_type vit \
         --model_name google/vit-base-patch16-224 \
@@ -13,20 +23,16 @@ Usage:
         --keep_ratio 0.65 \
         --global_pruning \
         --pat_steps 5 \
-        --epochs_pat_ft 15 \
+        --epochs_ft 10 \
         --disable_ddp
 
-    # Magnitude criterion
+    # Sparse (reparam) + PAT + FT
     python benchmarks/vbp/vbp_imagenet_pat.py \
-        --criterion magnitude \
-        --model_type vit \
-        --model_name /path/to/deit_tiny \
-        --data_path /path/to/imagenet \
-        --keep_ratio 0.65 \
-        --global_pruning \
-        --pat_steps 5 \
-        --epochs_pat_ft 15 \
-        --disable_ddp
+        --sparse_mode reparam --epochs_sparse 3 \
+        --pat_steps 5 --epochs_ft 10 \
+        --keep_ratio 0.65 --global_pruning --disable_ddp \
+        --model_type vit --model_name /path/to/deit_tiny \
+        --data_path /path/to/imagenet
 """
 
 import argparse
@@ -41,25 +47,24 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import torch_pruning as tp
 from torch_pruning.utils.pruning_utils import Pruning
-from torch_pruning.utils.reparam import MeanResidualManager
 
-# Reuse infrastructure from vbp_imagenet
+# Shared infrastructure
 try:
-    from .vbp_imagenet import (
-        build_dataloaders, load_model, forward_logits, validate,
-        setup_distributed, cleanup, is_main, log_info, setup_logging,
-        build_ft_scheduler, VarianceConcentrationHooks, train_one_epoch,
-        build_layers_to_prune, run_reparam_pretraining,
-        logger,
+    from .vbp_common import (
+        logger, is_main, log_info, setup_logging,
+        setup_distributed, cleanup,
+        build_dataloaders, load_model, validate,
+        train_one_epoch, build_ft_scheduler,
+        VarianceConcentrationHooks, build_layers_to_prune,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from vbp_imagenet import (
-        build_dataloaders, load_model, forward_logits, validate,
-        setup_distributed, cleanup, is_main, log_info, setup_logging,
-        build_ft_scheduler, VarianceConcentrationHooks, train_one_epoch,
-        build_layers_to_prune, run_reparam_pretraining,
-        logger,
+    from vbp_common import (
+        logger, is_main, log_info, setup_logging,
+        setup_distributed, cleanup,
+        build_dataloaders, load_model, validate,
+        train_one_epoch, build_ft_scheduler,
+        VarianceConcentrationHooks, build_layers_to_prune,
     )
 
 
@@ -78,18 +83,9 @@ def build_pruning_config(args, model, config_dir):
         architecture=getattr(args, 'cnn_arch', None),
         interior_only=getattr(args, 'interior_only', True))
 
-    # Sparse pre-training shifts the pruning start epoch
     start_epoch = args.epochs_sparse if args.sparse_mode != "none" else 0
-    pat_total = args.epochs_pat_ft - start_epoch
-
-    if args.pat_steps <= 1:
-        # One-shot: single prune at start_epoch
-        epoch_rate = 1
-        end_epoch = start_epoch
-    else:
-        # PAT: distribute pat_steps across available epochs
-        epoch_rate = max(1, pat_total // args.pat_steps)
-        end_epoch = start_epoch + (args.pat_steps - 1) * epoch_rate
+    epoch_rate = max(1, args.pat_epochs_per_step + 1)
+    end_epoch = start_epoch + (args.pat_steps - 1) * epoch_rate
 
     config = {
         "channel_sparsity_args": {
@@ -116,12 +112,15 @@ def build_pruning_config(args, model, config_dir):
             "norm_per_layer": args.norm_per_layer,
             "no_compensation": args.no_compensation,
             "verbose": 1,
-            # Schedule and internal features
+            # Schedule and features
             "pruning_schedule": args.pruning_schedule,
             "bn_recalibration": args.bn_recalibration,
             "sparse_mode": args.sparse_mode,
             "sparse_l1_lambda": args.l1_lambda,
             "sparse_gmp_target": args.gmp_target_sparsity,
+            # Unified pipeline
+            "epochs_ft": args.epochs_ft,
+            "reparam_lambda": args.reparam_lambda,
         },
         "slice_sparsity_args": None,
     }
@@ -131,12 +130,13 @@ def build_pruning_config(args, model, config_dir):
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
 
-    log_info(f"Pruning config written to {config_path}")
-    log_info(f"  Pruning layers ({args.criterion}): {len(layers)}, start={start_epoch}, end={end_epoch}, "
-             f"epoch_rate={epoch_rate}, keep_ratio={args.keep_ratio:.3f}, "
+    total = end_epoch + 1 + args.epochs_ft
+    log_info(f"Pruning config: {len(layers)} layers, start={start_epoch}, "
+             f"end={end_epoch}, epoch_rate={epoch_rate}, total={total}, "
+             f"keep_ratio={args.keep_ratio:.3f}, "
              f"mac_target={'yes' if args.mac_target else 'no'}")
     if args.sparse_mode != "none":
-        log_info(f"  Sparse: mode={args.sparse_mode}, start_epoch={start_epoch}")
+        log_info(f"  Sparse: mode={args.sparse_mode}, epochs={args.epochs_sparse}")
     return config_dir
 
 
@@ -190,7 +190,7 @@ def main(argv):
 
     if is_main():
         log_info("=" * 60)
-        log_info(f"PAT via Pruning class (criterion={args.criterion})")
+        log_info(f"Unified Pipeline (criterion={args.criterion})")
         log_info("=" * 60)
         for k, v in vars(args).items():
             logger.info(f"  {k}: {v}")
@@ -222,16 +222,13 @@ def main(argv):
             p.requires_grad = False
         log_info("Created teacher model for KD")
 
-    # --- Sparse pre-training (reparam mode uses MeanResidualManager) ---
-    if args.sparse_mode == "reparam" and args.epochs_sparse > 0:
-        run_reparam_pretraining(model, teacher, train_loader, train_sampler,
-                                val_loader, device, args)
-
     # Build pruning config and Pruning class
     config_dir = os.path.join(args.save_dir, "pruning_config")
     build_pruning_config(args, model, config_dir)
 
     pruner = Pruning(model, config_dir, device=device, train_loader=train_loader)
+    cp = pruner.channel_pruner
+    total = cp.total_epochs
 
     # Variance concentration hooks (optional, VBP only)
     var_hooks = None
@@ -244,123 +241,56 @@ def main(argv):
         var_hooks = VarianceConcentrationHooks(model, args.model_type,
                                                target_layers=cnn_target_layers)
 
-    # Training loop with epoch-based pruning
+    # --- Unified training loop ---
     use_ddp = not args.disable_ddp and dist.is_initialized()
 
-    # Pre-loop prune: one-shot prunes here; PAT does step 1
-    pruner.prune(model, epoch=0, log=logger, mask_only=False)
+    optimizer = build_optimizer(model, args, cp._reparam_manager)
+    scheduler, step_per_batch = build_ft_scheduler(optimizer, total, len(train_loader))
 
-    # Log retention accuracy after final pruning (one-shot finishes here)
-    retention_logged = False
-    if is_main() and not pruner.channel_pruner.prune_channels:
-        acc_ret, _ = validate(model, val_loader, device, args.model_type)
-        pruned_macs, pruned_params = tp.utils.count_ops_and_params(model, example_inputs)
-        log_info(f"Retention accuracy: {acc_ret:.4f} "
-                 f"(MACs={pruned_macs / 1e9:.2f}G, Params={pruned_params / 1e6:.2f}M)")
-        retention_logged = True
-
-    # --- Mean-residual reparameterization (optional) ---
-    reparam_manager = None
-    if args.reparam and pruner.channel_pruner.prune_channels:
-        target_names = build_layers_to_prune(
-            model, args.model_type,
-            architecture=getattr(args, 'cnn_arch', None),
-            interior_only=getattr(args, 'interior_only', True))
-        reparam_manager = MeanResidualManager(
-            model, target_names, device,
-            lambda_reg=args.reparam_lambda,
-            max_batches=args.max_batches)
-        reparam_manager.reparameterize(train_loader)
-
-    # Optimizer + scheduler AFTER prune (parameters may have changed)
-    optimizer = build_optimizer(model, args, reparam_manager)
-    scheduler, step_per_batch = build_ft_scheduler(
-        optimizer, args.epochs_pat_ft, len(train_loader))
-
-    # Wrap in DDP after initial prune
     train_model = model
     if use_ddp:
         train_model = DDP(model, device_ids=[args.local_rank],
                           output_device=args.local_rank)
         dist.barrier()
 
-    # Track pruning step for DDP rebuild detection
-    if pruner.channel_pruner.pruning_schedule == 'geometric':
-        prev_step = pruner.channel_pruner._geometric_step
-    else:
-        prev_step = pruner.channel_pruner.pruner.current_step if pruner.channel_pruner.pruner else 0
-
     best_acc = 0.0
-    for epoch in range(1, args.epochs_pat_ft + 1):
-        # Aux loss for reparam regularization
-        aux_loss_fn = (reparam_manager.regularization_loss
-                       if reparam_manager and reparam_manager.is_active else None)
-
-        # Train
-        phase = "PAT" if pruner.channel_pruner.prune_channels else "FT"
-        train_loss = train_one_epoch(
-            train_model, train_loader, train_sampler,
-            optimizer, scheduler, device, epoch, args,
-            teacher=teacher, step_per_batch=step_per_batch,
-            phase=phase, var_hooks=var_hooks,
-            regularize_fn=pruner.channel_regularize,
-            aux_loss_fn=aux_loss_fn,
-        )
-
-        # Check if pruning will happen this epoch
-        cp = pruner.channel_pruner
-        will_prune = (cp.prune_channels
-                      and cp.start_epoch <= epoch
-                      and (epoch - cp.start_epoch) % cp.epoch_rate == 0)
-
-        # Merge back before pruning so DG sees standard modules
-        if will_prune and reparam_manager and reparam_manager.is_active:
-            reparam_manager.merge_back()
-            cp.init_channel_pruner(model, logger, collect_stats=False)
-
-        # End-of-epoch prune (epoch 0 already done pre-loop)
+    for epoch in range(total):
+        # 1. Prune / sparse lifecycle / no-op (phase decided internally)
         pruner.prune(model, epoch, log=logger, mask_only=False)
 
-        # Log retention after final pruning step (PAT finishes here)
-        if is_main() and not retention_logged and not cp.prune_channels:
-            acc_ret, _ = validate(model, val_loader, device, args.model_type)
-            pruned_macs, pruned_params = tp.utils.count_ops_and_params(model, example_inputs)
-            log_info(f"Retention accuracy: {acc_ret:.4f} "
-                     f"(MACs={pruned_macs / 1e9:.2f}G, Params={pruned_params / 1e6:.2f}M)")
-            retention_logged = True
-
-        # Re-wrap DDP + rebuild optimizer if pruning step advanced
-        if pruner.channel_pruner.pruning_schedule == 'geometric':
-            cur_step = pruner.channel_pruner._geometric_step
-        else:
-            cur_step = pruner.channel_pruner.pruner.current_step if pruner.channel_pruner.pruner else 0
-        if cur_step > prev_step:
-            prev_step = cur_step
-
-            # Re-reparameterize after prune if more pruning ahead
-            if reparam_manager and cp.prune_channels:
-                reparam_manager.reparameterize(train_loader)
-
+        # 2. Rebuild optimizer if model structure changed
+        if cp.model_changed:
+            optimizer = build_optimizer(model, args, cp._reparam_manager)
+            scheduler, step_per_batch = build_ft_scheduler(
+                optimizer, total - epoch - 1, len(train_loader))
             if use_ddp:
                 del train_model
                 train_model = DDP(model, device_ids=[args.local_rank],
                                   output_device=args.local_rank)
-            optimizer = build_optimizer(model, args, reparam_manager)
-            scheduler, step_per_batch = build_ft_scheduler(
-                optimizer, args.epochs_pat_ft - epoch, len(train_loader))
 
-        # Optional μ_x refresh (between prune steps, when model drifts)
-        elif (reparam_manager and reparam_manager.is_active
-              and args.reparam_refresh > 0
-              and epoch % args.reparam_refresh == 0):
-            reparam_manager.refresh_mu(train_loader)
+        # 3. Train with phase-appropriate losses
+        phase = cp.phase
+        fc1 = cp._sparse_modules if phase == "Sparse" and args.sparse_mode == "l1_group" else None
+        aux_fn = (cp._reparam_manager.regularization_loss
+                  if phase == "Sparse" and cp._reparam_manager and cp._reparam_manager.is_active
+                  else None)
 
-        # Validate
+        train_loss = train_one_epoch(
+            train_model, train_loader, train_sampler,
+            optimizer, scheduler, device, epoch, args,
+            teacher=teacher, fc1_modules=fc1,
+            step_per_batch=step_per_batch, phase=phase,
+            var_hooks=var_hooks if phase == "PAT" else None,
+            regularize_fn=pruner.channel_regularize,
+            aux_loss_fn=aux_fn,
+        )
+
+        # 4. Validate + save best
         if is_main():
             eval_model = train_model.module if isinstance(train_model, DDP) else train_model
             acc, val_loss = validate(eval_model, val_loader, device, args.model_type)
             pruned_macs, pruned_params = tp.utils.count_ops_and_params(eval_model, example_inputs)
-            log_info(f"Epoch {epoch}/{args.epochs_pat_ft}: train_loss={train_loss:.4f}, "
+            log_info(f"[{phase}] Epoch {epoch+1}/{total}: train_loss={train_loss:.4f}, "
                      f"val_acc={acc:.4f}, MACs={pruned_macs / 1e9:.2f}G")
 
             if acc > best_acc:
@@ -375,10 +305,6 @@ def main(argv):
     # Cleanup var hooks
     if var_hooks is not None:
         var_hooks.remove()
-
-    # Merge back for final eval / save (standard modules)
-    if reparam_manager and reparam_manager.is_active:
-        reparam_manager.merge_back()
 
     # Final summary
     if is_main():
@@ -407,7 +333,7 @@ def main(argv):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="PAT via Pruning class (multi-criterion)",
+        description="Unified pruning pipeline (PAT/one-shot/sparse)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -439,28 +365,20 @@ def parse_args():
     parser.add_argument("--bn_recalibration", action="store_true",
                         help="Recalibrate BN running stats after each pruning step")
 
-    # PAT
+    # PAT schedule
     parser.add_argument("--pat_steps", type=int, default=5,
-                        help="Number of prune steps (0 or 1 = one-shot, >1 = PAT)")
-    parser.add_argument("--epochs_pat_ft", type=int, default=15,
-                        help="Total epochs for PAT pruning + post-prune fine-tuning")
+                        help="Number of prune steps")
+    parser.add_argument("--pat_epochs_per_step", type=int, default=0,
+                        help="FT epochs between prune steps (0 = prune every epoch)")
+    parser.add_argument("--epochs_ft", type=int, default=10,
+                        help="Post-prune fine-tuning epochs")
     parser.add_argument("--lr", type=float, default=1.5e-5)
-    parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd"],
-                        help="Optimizer for PAT training")
+    parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd"])
     parser.add_argument("--wd", type=float, default=0.01,
                         help="Weight decay (applied to non-reparam params)")
     parser.add_argument("--var_loss_weight", type=float, default=0.0)
     parser.add_argument("--pruning_schedule", default="geometric",
-                        choices=["geometric", "linear"],
-                        help="Pruning schedule type")
-
-    # Mean-residual reparameterization
-    parser.add_argument("--reparam", action="store_true",
-                        help="Enable mean-residual reparameterization during PAT")
-    parser.add_argument("--reparam_lambda", type=float, default=0.01,
-                        help="L_{2,1} regularization strength for residual weights V")
-    parser.add_argument("--reparam_refresh", type=int, default=0,
-                        help="Refresh μ_x every N epochs (0 = never)")
+                        choices=["geometric", "linear"])
 
     # Sparse pre-training
     parser.add_argument("--sparse_mode", default="none",
@@ -468,12 +386,12 @@ def parse_args():
                         help="Sparse pre-training mode (none = skip)")
     parser.add_argument("--epochs_sparse", type=int, default=0,
                         help="Sparse pre-training epochs (shifts pruning start)")
-    parser.add_argument("--lr_sparse", type=float, default=1e-4,
-                        help="Learning rate for sparse pre-training")
     parser.add_argument("--l1_lambda", type=float, default=1e-4,
                         help="L2,1 regularization strength (l1_group mode)")
     parser.add_argument("--gmp_target_sparsity", type=float, default=0.5,
                         help="Target weight sparsity for GMP mode")
+    parser.add_argument("--reparam_lambda", type=float, default=0.01,
+                        help="L_{2,1} regularization strength for reparam mode")
 
     # KD
     parser.add_argument("--use_kd", action="store_true")

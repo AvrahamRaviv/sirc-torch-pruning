@@ -201,6 +201,12 @@ class ChannelPruning:
         self._no_compensation = self.channel_sparsity_args.get("no_compensation", False)
         self._stats_fresh = False  # True after stats collected, False after prune step
 
+        # Unified pipeline state
+        self._epochs_ft = self.channel_sparsity_args.get("epochs_ft", 0)
+        self._model_changed = False
+        self._reparam_manager = None
+        self._reparam_lambda = self.channel_sparsity_args.get("reparam_lambda", 0.01)
+
         # Build ignored_layers (needed before MAC estimation)
         self.set_layers_to_prune(model)
 
@@ -239,7 +245,33 @@ class ChannelPruning:
         self._original_macs = count_ops_and_params(model, self.example_inputs)[0]
         _ = self.measure_macs_masked_model(model)
 
-        self.init_channel_pruner(model, log, print_layers=True)
+        # Skip stats at init when sparse pre-training precedes pruning
+        # (stats will be stale by the first prune epoch)
+        skip_stats = (self._sparse_mode != 'none' and self.start_epoch > 0)
+        self.init_channel_pruner(model, log, print_layers=True,
+                                 collect_stats=not skip_stats)
+
+    @property
+    def total_epochs(self):
+        """Total epochs across all phases: sparse + PAT + FT."""
+        return self.end_epoch + 1 + self._epochs_ft
+
+    @property
+    def model_changed(self):
+        """True if model structure changed since last check. Auto-resets."""
+        changed = self._model_changed
+        self._model_changed = False
+        return changed
+
+    @property
+    def phase(self):
+        """Current training phase based on epoch."""
+        if self._sparse_mode != 'none' and self.current_epoch < self.start_epoch:
+            return "Sparse"
+        elif self.prune_channels:
+            return "PAT"
+        else:
+            return "FT"
 
     def init_channel_pruner(self, model, log=None, print_layers=False, collect_stats=True,
                              train_loader=None):
@@ -390,13 +422,32 @@ class ChannelPruning:
                 back to self.train_loader if not provided.
         """
         log = log or self.log
+        self.current_epoch = epoch
+
         if not self.prune_channels:
             self.update_channel_mask_dict(model)
             return
 
-        self.current_epoch = epoch
         is_vbp = self.pruning_method == PruningMethod.VBP
         loader = train_loader or self.train_loader
+
+        # Reparam sparse pre-training lifecycle
+        if self._sparse_mode == "reparam" and epoch < self.start_epoch:
+            if self._reparam_manager is None:
+                from torch_pruning.utils.reparam import MeanResidualManager
+                self._reparam_manager = MeanResidualManager(
+                    model, self.layers_to_prune, self.device,
+                    lambda_reg=self._reparam_lambda,
+                    max_batches=self._vbp_max_batches)
+                self._reparam_manager.reparameterize(loader)
+                self._model_changed = True
+            return
+
+        # Merge reparam back at pruning start
+        if self._reparam_manager is not None and self._reparam_manager.is_active:
+            self._reparam_manager.merge_back()
+            self._model_changed = True
+            self.init_channel_pruner(model, log, collect_stats=True)
 
         # GMP masking for sparse pre-training (before start_epoch)
         if self._sparse_mode == "gmp" and epoch < self.start_epoch:
@@ -491,6 +542,10 @@ class ChannelPruning:
 
         if is_vbp and not use_mask:
             self.pruner.disable_meancheck()
+
+        # Signal structural change when physical pruning occurred
+        if not use_mask:
+            self._model_changed = True
 
         # BN recalibration after pruning step
         if self._bn_recalibration and self.train_loader is not None:
