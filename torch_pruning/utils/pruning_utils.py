@@ -88,7 +88,7 @@ class Pruning:
     """
     def __init__(self, model: nn.Module, config_folder: str, forward_fn: Optional[Any] = None,
                  log: Optional[Any] = None, device: Optional[torch.device] = None,
-                 train_loader=None) -> None:
+                 train_loader=None, post_stats_hook=None) -> None:
         self.version = "1.1.5"
         try:
             config_path = os.path.join(config_folder, "pruning_config.json")
@@ -107,7 +107,7 @@ class Pruning:
             _log(log, "=> Unable to find a valid pruning configuration.")
 
         self.channel_pruner = ChannelPruning(channel_sa, model, config_folder, forward_fn, log, device,
-                                             train_loader=train_loader)
+                                             train_loader=train_loader, post_stats_hook=post_stats_hook)
         self.slice_pruner = SlicePruning(slice_sa, model, log)
         # Synchronize slice block size and channel mask dictionary between pruners.
         self.channel_pruner.slice_block_size = self.slice_pruner.block_size
@@ -135,7 +135,8 @@ class ChannelPruning:
     """
     def __init__(self, channel_sparsity_args: Optional[Dict[str, Any]], model: nn.Module,
                  config_folder: str, forward_fn: Any, log: Optional[Any] = None,
-                 device: Optional[torch.device] = None, train_loader=None) -> None:
+                 device: Optional[torch.device] = None, train_loader=None,
+                 post_stats_hook=None) -> None:
         self.channel_mask_dict: Dict[str, torch.Tensor] = {}
         self.log = log
         if channel_sparsity_args is None:
@@ -206,7 +207,7 @@ class ChannelPruning:
         self._model_changed = False
         self._reparam_manager = None
         self._reparam_lambda = self.channel_sparsity_args.get("reparam_lambda", 0.01)
-        self._post_stats_hook = None  # callable(model) — called after stats collection (e.g., DDP sync)
+        self._post_stats_hook = post_stats_hook  # callable(cp, model) — called after stats collection (e.g., DDP sync)
 
         # Build ignored_layers (needed before MAC estimation)
         self.set_layers_to_prune(model)
@@ -366,7 +367,7 @@ class ChannelPruning:
 
         # Sync stats across ranks (e.g., DDP broadcast from rank 0)
         if self._post_stats_hook is not None and self._stats_fresh:
-            self._post_stats_hook(model)
+            self._post_stats_hook(self, model)
 
         # Set mean_dict on pruner for bias compensation
         if not self._no_compensation and self._compensation_means:
@@ -503,7 +504,7 @@ class ChannelPruning:
 
         # Sync stats across ranks (e.g., DDP broadcast from rank 0)
         if stats_collected and self._post_stats_hook is not None:
-            self._post_stats_hook(model)
+            self._post_stats_hook(self, model)
 
         # Update pruner with (possibly synced) compensation means
         if stats_collected and not self._no_compensation and self._compensation_means:

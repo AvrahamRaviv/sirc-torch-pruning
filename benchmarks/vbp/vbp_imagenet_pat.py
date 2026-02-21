@@ -181,15 +181,18 @@ def _broadcast_model_state(model):
         dist.broadcast(buf, src=0)
 
 
-def _make_stats_sync_hook(cp, device):
+def _make_stats_sync_hook(device):
     """Create a post-stats hook that broadcasts importance stats from rank 0.
 
     In DDP, each rank collects stats from its own data subset (via
     DistributedSampler). This hook ensures all ranks use rank 0's stats,
     so pruning decisions are identical across ranks — preventing shape
     divergence that would crash DDP.
+
+    Hook signature: hook(cp, model) — called by ChannelPruning after stats
+    collection, both at init and before each pruning step.
     """
-    def hook(model):
+    def hook(cp, model):
         name_to_module = {n: m for n, m in model.named_modules()}
         module_to_name = {m: n for n, m in model.named_modules()}
 
@@ -301,7 +304,12 @@ def main(argv):
     config_dir = os.path.join(args.save_dir, "pruning_config")
     build_pruning_config(args, model, config_dir)
 
-    pruner = Pruning(model, config_dir, device=device, train_loader=train_loader)
+    use_ddp = not args.disable_ddp and dist.is_initialized()
+    stats_hook = _make_stats_sync_hook(device) if use_ddp else None
+    prune_log = logger if is_main() else None
+
+    pruner = Pruning(model, config_dir, device=device, train_loader=train_loader,
+                     log=prune_log, post_stats_hook=stats_hook)
     cp = pruner.channel_pruner
     total = cp.total_epochs
 
@@ -317,14 +325,6 @@ def main(argv):
                                                target_layers=cnn_target_layers)
 
     # --- Unified training loop ---
-    use_ddp = not args.disable_ddp and dist.is_initialized()
-
-    # Set DDP stats sync hook so all ranks use rank 0's importance stats.
-    # Call immediately to sync the stats already collected during __init__.
-    if use_ddp:
-        cp._post_stats_hook = _make_stats_sync_hook(cp, device)
-        cp._post_stats_hook(model)
-
     optimizer = build_optimizer(model, args, cp._reparam_manager)
     scheduler, step_per_batch = build_ft_scheduler(optimizer, total, len(train_loader))
 
@@ -337,10 +337,18 @@ def main(argv):
     best_acc = 0.0
     for epoch in range(total):
         # 1. Prune / sparse lifecycle / no-op (phase decided internally)
-        pruner.prune(model, epoch, log=logger, mask_only=False)
+        pruner.prune(model, epoch, log=prune_log, mask_only=False)
 
-        # 2. Rebuild optimizer if model structure changed
+        # 2. Evaluate retention right after physical pruning
         changed = cp.model_changed
+        if changed and is_main():
+            eval_model = train_model.module if isinstance(train_model, DDP) else train_model
+            acc_ret, loss_ret = validate(eval_model, val_loader, device, args.model_type)
+            pruned_macs, _ = tp.utils.count_ops_and_params(eval_model, example_inputs)
+            log_info(f"Step retention: acc={acc_ret:.4f}, loss={loss_ret:.4f}, "
+                     f"MACs={pruned_macs / 1e9:.2f}G")
+
+        # 3. Rebuild optimizer if model structure changed
         if use_ddp and changed:
             _broadcast_model_state(model)
         if changed:
@@ -352,7 +360,7 @@ def main(argv):
                 train_model = DDP(model, device_ids=[args.local_rank],
                                   output_device=args.local_rank)
 
-        # 3. Train with phase-appropriate losses
+        # 4. Train with phase-appropriate losses
         phase = cp.phase
         fc1 = cp._sparse_modules if phase == "Sparse" and args.sparse_mode == "l1_group" else None
         aux_fn = (cp._reparam_manager.regularization_loss
@@ -369,7 +377,7 @@ def main(argv):
             aux_loss_fn=aux_fn,
         )
 
-        # 4. Validate + save best
+        # 5. Validate + save best
         if is_main():
             eval_model = train_model.module if isinstance(train_model, DDP) else train_model
             acc, val_loss = validate(eval_model, val_loader, device, args.model_type)
@@ -404,8 +412,8 @@ def main(argv):
         log_info(f"Base Params:  {base_params / 1e6:.2f}M -> Pruned: {pruned_params / 1e6:.2f}M "
                  f"({pruned_params / base_params * 100:.1f}%)")
         log_info(f"Original Acc: {acc_orig:.4f}")
-        log_info(f"Final Acc:    {acc_final:.4f}")
-        log_info(f"Best Acc:     {best_acc:.4f}")
+        log_info(f"Final Acc:    {acc_final:.4f} (retention: {acc_final / acc_orig * 100:.2f}%)")
+        log_info(f"Best Acc:     {best_acc:.4f} (retention: {best_acc / acc_orig * 100:.2f}%)")
 
         save_path = os.path.join(args.save_dir, f"{args.criterion}_pat_final.pth")
         torch.save(eval_model.state_dict(), save_path)
