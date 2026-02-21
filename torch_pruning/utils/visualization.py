@@ -490,7 +490,7 @@ def visualize_graph(
         output_dir = os.path.dirname(output_path)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
-        dot.render(output_path, cleanup=True)
+        dot.render(output_path, cleanup=False)
 
     return dot
 
