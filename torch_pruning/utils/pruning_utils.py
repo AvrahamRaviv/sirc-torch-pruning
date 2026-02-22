@@ -205,6 +205,7 @@ class ChannelPruning:
         # Unified pipeline state
         self._epochs_ft = self.channel_sparsity_args.get("epochs_ft", 0)
         self._model_changed = False
+        self._step_completed = False
         self._reparam_manager = None
         self._reparam_lambda = self.channel_sparsity_args.get("reparam_lambda", 0.01)
         self._post_stats_hook = post_stats_hook  # callable(cp, model) — called after stats collection (e.g., DDP sync)
@@ -225,8 +226,10 @@ class ChannelPruning:
         self._total_steps = self.iterative_steps
         self._geometric_step = 0
         if self.pruning_schedule == 'geometric':
+            from torch_pruning.pruner.algorithms.scheduler import geometric_scheduler
             total_keep = 1.0 - self.global_prune_rate
             self._per_step_prune = 1.0 - (total_keep ** (1.0 / self._total_steps))
+            self._geometric_cumulative = geometric_scheduler(self.global_prune_rate, self._total_steps)
             self.iterative_steps = 1  # single-step pruner, reinit after each
             self._total_prune_rate = self.global_prune_rate
             self.global_prune_rate = self._per_step_prune
@@ -264,6 +267,13 @@ class ChannelPruning:
         changed = self._model_changed
         self._model_changed = False
         return changed
+
+    @property
+    def step_completed(self):
+        """True if a pruning step (mask or physical) completed since last check. Auto-resets."""
+        completed = self._step_completed
+        self._step_completed = False
+        return completed
 
     @property
     def phase(self):
@@ -565,10 +575,19 @@ class ChannelPruning:
         if self._bn_recalibration and self.train_loader is not None:
             _recalibrate_bn(model, self.train_loader, self.device, log)
 
+        # Signal that a pruning step (mask or physical) completed
+        self._step_completed = True
+
         # Track step completion and handle schedule
         if self.pruning_schedule == 'geometric':
             self._geometric_step += 1
             if self._geometric_step < self._total_steps:
+                if use_mask:
+                    # Masking: cumulative ratio for next step (model unchanged → must compound)
+                    self.global_prune_rate = self._geometric_cumulative[self._geometric_step + 1]
+                else:
+                    # Physical: keep per-step ratio (model shrinks → compounds naturally)
+                    self.global_prune_rate = self._per_step_prune
                 self.init_channel_pruner(model, log, collect_stats=False)
             else:
                 self.prune_channels = False

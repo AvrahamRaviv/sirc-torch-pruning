@@ -337,18 +337,19 @@ def main(argv):
     best_acc = 0.0
     for epoch in range(total):
         # 1. Prune / sparse lifecycle / no-op (phase decided internally)
-        pruner.prune(model, epoch, log=prune_log, mask_only=False)
+        pruner.prune(model, epoch, log=prune_log, mask_only=args.mask_only)
 
-        # 2. Evaluate retention right after physical pruning
+        # 2. Evaluate retention after any pruning step (mask or physical)
+        stepped = cp.step_completed
         changed = cp.model_changed
-        if changed and is_main():
+        if stepped and is_main():
             eval_model = train_model.module if isinstance(train_model, DDP) else train_model
             acc_ret, loss_ret = validate(eval_model, val_loader, device, args.model_type)
             pruned_macs, _ = tp.utils.count_ops_and_params(eval_model, example_inputs)
             log_info(f"Step retention: acc={acc_ret:.4f}, loss={loss_ret:.4f}, "
                      f"MACs={pruned_macs / 1e9:.2f}G")
 
-        # 3. Rebuild optimizer if model structure changed
+        # 3. Rebuild optimizer/DDP only after physical removal
         if use_ddp and changed:
             _broadcast_model_state(model)
         if changed:
@@ -471,6 +472,8 @@ def parse_args():
     parser.add_argument("--var_loss_weight", type=float, default=0.0)
     parser.add_argument("--pruning_schedule", default="geometric",
                         choices=["geometric", "linear"])
+    parser.add_argument("--mask_only", action=argparse.BooleanOptionalAction, default=True,
+                        help="Mask during PAT, physical prune at last step (default: True)")
 
     # Sparse pre-training
     parser.add_argument("--sparse_mode", default="none",
