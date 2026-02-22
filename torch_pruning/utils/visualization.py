@@ -493,7 +493,8 @@ def visualize_graph(
         try:
             dot.render(output_path, cleanup=False)
         except Exception as e:
-            print(f"Warning: Failed to render graph to {output_path}.{format}: {e}")
+            print(f"Warning: Failed to render graph to {output_path}.{format}: {e}\n"
+                  f"  DOT source saved at: {output_path} (inspect for syntax errors)")
     return dot
 
 

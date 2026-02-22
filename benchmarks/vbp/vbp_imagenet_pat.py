@@ -337,7 +337,7 @@ def main(argv):
     best_acc = 0.0
     for epoch in range(total):
         # 1. Prune / sparse lifecycle / no-op (phase decided internally)
-        pruner.prune(model, epoch, log=prune_log, mask_only=args.mask_only)
+        pruner.prune(model, epoch, log=prune_log, mask_only=not args.no_mask_only)
 
         # 2. Evaluate retention after any pruning step (mask or physical)
         stepped = cp.step_completed
@@ -472,8 +472,8 @@ def parse_args():
     parser.add_argument("--var_loss_weight", type=float, default=0.0)
     parser.add_argument("--pruning_schedule", default="geometric",
                         choices=["geometric", "linear"])
-    parser.add_argument("--mask_only", action=argparse.BooleanOptionalAction, default=True,
-                        help="Mask during PAT, physical prune at last step (default: True)")
+    parser.add_argument("--no_mask_only", action="store_true",
+                        help="Disable masking: physical prune at every step (default: mask during PAT)")
 
     # Sparse pre-training
     parser.add_argument("--sparse_mode", default="none",
