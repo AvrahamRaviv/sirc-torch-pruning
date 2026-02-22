@@ -490,8 +490,10 @@ def visualize_graph(
         output_dir = os.path.dirname(output_path)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
-        dot.render(output_path, cleanup=False)
-
+        try:
+            dot.render(output_path, cleanup=False)
+        except Exception as e:
+            print(f"Warning: Failed to render graph to {output_path}.{format}: {e}")
     return dot
 
 
