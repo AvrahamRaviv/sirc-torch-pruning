@@ -595,8 +595,9 @@ class ChannelPruning:
             if self.pruner.current_step >= self.iterative_steps:
                 self.prune_channels = False
 
-        # After final step, persist is_prune=False so future loads skip pruning
-        if not self.prune_channels:
+        # After final step, persist is_prune=False so future loads skip pruning.
+        # Only write from main rank (log is non-None) to avoid DDP race on the file.
+        if not self.prune_channels and log is not None:
             config_path = os.path.join(self.config_folder, "pruning_config.json")
             with open(config_path, "r") as f:
                 sparsity_args = json.load(f)
