@@ -208,6 +208,7 @@ class ChannelPruning:
         self._step_completed = False
         self._reparam_manager = None
         self._reparam_lambda = self.channel_sparsity_args.get("reparam_lambda", 0.01)
+        self._reparam_layers = self.channel_sparsity_args.get("reparam_layers", self.layers_to_prune)
         self._post_stats_hook = post_stats_hook  # callable(cp, model) — called after stats collection (e.g., DDP sync)
 
         # Build ignored_layers (needed before MAC estimation)
@@ -452,7 +453,7 @@ class ChannelPruning:
             if self._reparam_manager is None:
                 from torch_pruning.utils.reparam import MeanResidualManager
                 self._reparam_manager = MeanResidualManager(
-                    model, self.layers_to_prune, self.device,
+                    model, self._reparam_layers, self.device,
                     lambda_reg=self._reparam_lambda,
                     max_batches=self._vbp_max_batches)
                 self._reparam_manager.reparameterize(loader)

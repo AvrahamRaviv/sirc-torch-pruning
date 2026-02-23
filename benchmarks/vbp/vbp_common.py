@@ -354,6 +354,20 @@ class VarianceConcentrationHooks:
 # ---------------------------------------------------------------------------
 # Layer name helpers
 # ---------------------------------------------------------------------------
+def build_reparam_layers(model, model_type, architecture=None):
+    """Return downstream layer names for reparam (fc2 / pwconv2)."""
+    layers = []
+    if model_type == "vit":
+        for name, m in model.named_modules():
+            if name.endswith(".output.dense") and ".attention." not in name:
+                layers.append(name)
+    elif model_type == "convnext":
+        for name, m in model.named_modules():
+            if hasattr(m, "pwconv2"):
+                layers.append(name + ".pwconv2")
+    return layers
+
+
 def build_layers_to_prune(model, model_type, architecture=None, interior_only=True):
     """Return list of module names to prune (fc1 / pwconv1 / interior convs)."""
     layers = []
