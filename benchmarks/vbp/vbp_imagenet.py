@@ -514,8 +514,12 @@ def collect_and_sync_stats(model, train_loader, device, imp, args):
 # ---------------------------------------------------------------------------
 def finetune(model, teacher, train_loader, train_sampler, val_loader,
              device, args, epochs, epoch_offset=0, phase="FT",
-             use_var_loss=False):
+             use_var_loss=False, aux_loss_fn=None, reparam_manager=None):
     """Fine-tune model for a given number of epochs.
+
+    Args:
+        aux_loss_fn: Optional callable returning a scalar tensor (e.g. reparam reg).
+        reparam_manager: If provided, exclude its params from weight decay.
 
     Returns:
         best_acc achieved during fine-tuning (0.0 if epochs=0).
@@ -531,13 +535,22 @@ def finetune(model, teacher, train_loader, train_sampler, val_loader,
                           output_device=args.local_rank)
         dist.barrier()
 
+    # Build optimizer with optional reparam param group splitting
     wd = args.wd_ft if args.wd_ft is not None else (1e-4 if args.opt_ft == "sgd" else 0.01)
-    if args.opt_ft == "sgd":
-        optimizer = torch.optim.SGD(train_model.parameters(), lr=args.lr_ft,
-                                    momentum=args.momentum_ft, weight_decay=wd)
+    params = list(train_model.parameters())
+    if reparam_manager and reparam_manager.is_active:
+        reparam_ids = reparam_manager.reparam_param_ids()
+        base = [p for p in params if id(p) not in reparam_ids]
+        reparam_p = [p for p in params if id(p) in reparam_ids]
+        groups = [{"params": base, "weight_decay": wd},
+                  {"params": reparam_p, "weight_decay": 0.0}]
     else:
-        optimizer = torch.optim.AdamW(train_model.parameters(),
-                                      lr=args.lr_ft, weight_decay=wd)
+        groups = [{"params": params, "weight_decay": wd}]
+
+    if args.opt_ft == "sgd":
+        optimizer = torch.optim.SGD(groups, lr=args.lr_ft, momentum=args.momentum_ft)
+    else:
+        optimizer = torch.optim.AdamW(groups, lr=args.lr_ft)
     scheduler, step_per_batch = build_ft_scheduler(
         optimizer, epochs, len(train_loader))
 
@@ -560,7 +573,12 @@ def finetune(model, teacher, train_loader, train_sampler, val_loader,
             optimizer, scheduler, device, global_epoch, args,
             teacher=teacher, step_per_batch=step_per_batch,
             phase=phase, var_hooks=var_hooks,
+            aux_loss_fn=aux_loss_fn,
         )
+
+        # Log reparam stats if active
+        if is_main() and reparam_manager and reparam_manager.is_active:
+            reparam_manager.log_channel_stats()
 
         if is_main():
             eval_model = train_model.module if isinstance(train_model, DDP) else train_model
@@ -654,13 +672,40 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
                      f"MACs={pruned_macs / 1e9:.2f}G, params={pruned_params / 1e6:.2f}M")
 
         # 5. Per-step fine-tuning (var_loss only for VBP)
+        #    Optionally re-reparameterize for continued V-regularization during PAT
+        pat_reparam_mgr = None
+        pat_aux_fn = None
+        use_reparam_pat = (getattr(args, 'reparam_during_pat', False)
+                           and getattr(args, 'sparse_mode', 'none') == 'reparam'
+                           and epochs_per_step > 0)
+        if use_reparam_pat:
+            from torch_pruning.utils.reparam import MeanResidualManager
+            target_names = build_reparam_layers(
+                model, args.model_type,
+                architecture=getattr(args, 'cnn_arch', None))
+            pat_reparam_mgr = MeanResidualManager(
+                model, target_names, device,
+                lambda_reg=args.reparam_lambda,
+                max_batches=args.max_batches,
+                normalize=getattr(args, 'reparam_normalize', False))
+            pat_reparam_mgr.reparameterize(train_loader)
+            pat_aux_fn = pat_reparam_mgr.regularization_loss
+            log_info(f"PAT-{step_i+1}: reparam active with λ={args.reparam_lambda}")
+
         epoch_offset = step_i * epochs_per_step
         step_best = finetune(
             model, teacher, train_loader, train_sampler, val_loader,
             device, args, epochs=epochs_per_step, epoch_offset=epoch_offset,
             phase=f"PAT-{step_i+1}", use_var_loss=is_vbp,
+            aux_loss_fn=pat_aux_fn, reparam_manager=pat_reparam_mgr,
         )
         best_acc = max(best_acc, step_best)
+
+        # Merge reparam back before next prune step
+        if pat_reparam_mgr is not None and pat_reparam_mgr.is_active:
+            if is_main():
+                pat_reparam_mgr.save_vnorm_snapshot(args.save_dir)
+            pat_reparam_mgr.merge_back()
 
     # 6. Post-prune fine-tuning
     if args.epochs_ft > 0:
@@ -866,6 +911,8 @@ def parse_args():
                            help="Fine-tuning epochs between prune steps")
     pat_group.add_argument("--var_loss_weight", type=float, default=0.0,
                            help="Weight for variance concentration loss (0 = disabled)")
+    pat_group.add_argument("--reparam_during_pat", action="store_true",
+                           help="Keep reparam active during PAT per-step fine-tuning")
 
     # Sparse pre-training (optional, default: none = skip)
     sparse_group = parser.add_argument_group("Sparse Pre-training")
