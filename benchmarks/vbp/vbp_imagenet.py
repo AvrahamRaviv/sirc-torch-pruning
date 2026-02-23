@@ -222,14 +222,19 @@ def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
     if use_ddp:
         del train_model
 
-    # Save V-norm snapshot and merge back to standard modules before pruning
+    # Save V-norm snapshot, validate pre/post merge-back for numerical verification
     if is_main():
         mgr.save_vnorm_snapshot(args.save_dir)
+        acc_pre, _ = validate(model, val_loader, device, args.model_type)
+
     mgr.merge_back()
 
     if is_main():
-        acc_reparam, _ = validate(model, val_loader, device, args.model_type)
-        log_info(f"Post-reparam accuracy: {acc_reparam:.4f}")
+        acc_post, _ = validate(model, val_loader, device, args.model_type)
+        log_info(f"Merge-back delta: pre={acc_pre:.4f}, post={acc_post:.4f}, "
+                 f"Δ={acc_post - acc_pre:+.4f}")
+        if abs(acc_post - acc_pre) > 1e-4:
+            log_info("WARNING: merge-back delta exceeds 1e-4 — possible numerical issue")
 
 
 # ---------------------------------------------------------------------------
