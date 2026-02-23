@@ -182,14 +182,18 @@ class MeanResidualManager:
         logger.info("MeanResidualManager: refreshed μ_x (function-preserving)")
 
     def regularization_loss(self):
-        """L_{2,1} regularization on V: λ · Σ_l Σ_k ||v_k^(l)||_2.
+        """Column-wise L_{2,1} regularization on V: λ · Σ_l Σ_k ||V[:,k]^(l)||_2.
+
+        Penalizes per input-channel (intermediate dim) column norms of V.
+        When ||V[:,k]|| → 0, the layer ignores variation in input channel k,
+        directly aligned with what VBP prunes (fc1 output = fc2 input channels).
 
         Returns a scalar tensor on device (all GPU, no CPU transfers).
         """
         loss = torch.tensor(0.0, device=self.device)
         for reparam in self._reparam_modules.values():
             v = reparam.v  # [out, in] or [C_out, C_in, kH, kW]
-            loss = loss + v.flatten(1).norm(p=2, dim=1).sum()
+            loss = loss + v.flatten(1).norm(p=2, dim=0).sum()
         return self.lambda_reg * loss
 
     def reparam_param_ids(self):
