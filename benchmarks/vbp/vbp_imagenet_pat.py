@@ -125,6 +125,7 @@ def build_pruning_config(args, model, config_dir):
             # Unified pipeline
             "epochs_ft": args.epochs_ft,
             "reparam_lambda": args.reparam_lambda,
+            "reparam_normalize": getattr(args, 'reparam_normalize', False),
         },
         "slice_sparsity_args": None,
     }
@@ -501,6 +502,8 @@ def parse_args():
                         help="L_{2,1} regularization strength for reparam mode")
     parser.add_argument("--reparam_refresh_interval", type=int, default=0,
                         help="Re-estimate μ_x every N epochs (0 = never)")
+    parser.add_argument("--reparam_normalize", action="store_true",
+                        help="Normalize L_{2,1} by initial column norms (scale-invariant)")
 
     # KD
     parser.add_argument("--use_kd", action="store_true")
