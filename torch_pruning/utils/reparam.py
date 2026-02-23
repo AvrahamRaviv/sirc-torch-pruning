@@ -196,6 +196,41 @@ class MeanResidualManager:
             loss = loss + v.flatten(1).norm(p=2, dim=0).sum()
         return self.lambda_reg * loss
 
+    def channel_stats(self):
+        """Per-layer V-norm statistics (column-wise, per input channel).
+
+        Returns dict of {layer_name: {stat_name: value}}.
+        """
+        stats = OrderedDict()
+        for name, reparam in self._reparam_modules.items():
+            v = reparam.v.detach()
+            col_norms = v.flatten(1).norm(p=2, dim=0)  # [n_in]
+            m = reparam.m.detach()
+            stats[name] = {
+                'v_col_norm_mean': col_norms.mean().item(),
+                'v_col_norm_std': col_norms.std().item(),
+                'v_col_norm_min': col_norms.min().item(),
+                'v_col_norm_max': col_norms.max().item(),
+                'frac_below_0.01': (col_norms < 0.01).float().mean().item(),
+                'frac_below_0.1': (col_norms < 0.1).float().mean().item(),
+                'm_mean': m.mean().item(),
+                'm_std': m.std().item(),
+            }
+        return stats
+
+    def log_channel_stats(self):
+        """Log per-layer V-norm summary (one line per layer)."""
+        stats = self.channel_stats()
+        logger.info("V-norm stats (column-wise, per input channel):")
+        for name, s in stats.items():
+            short = name.split('.')[-2] + '.' + name.split('.')[-1] if '.' in name else name
+            logger.info(
+                f"  {short}: mean={s['v_col_norm_mean']:.4f} std={s['v_col_norm_std']:.4f} "
+                f"min={s['v_col_norm_min']:.4f} max={s['v_col_norm_max']:.4f} "
+                f"<0.01={s['frac_below_0.01']:.1%} <0.1={s['frac_below_0.1']:.1%} "
+                f"m={s['m_mean']:.4f}±{s['m_std']:.4f}"
+            )
+
     def reparam_param_ids(self):
         """Return set of id(p) for all m, v parameters (for optimizer grouping)."""
         ids = set()

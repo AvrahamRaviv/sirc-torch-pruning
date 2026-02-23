@@ -382,7 +382,11 @@ def main(argv):
             aux_loss_fn=aux_fn,
         )
 
-        # 5. Validate + save best
+        # 5. Log reparam stats if active
+        if is_main() and cp._reparam_manager and cp._reparam_manager.is_active:
+            cp._reparam_manager.log_channel_stats()
+
+        # 6. Validate + save best
         if is_main():
             eval_model = train_model.module if isinstance(train_model, DDP) else train_model
             acc, val_loss = validate(eval_model, val_loader, device, args.model_type)

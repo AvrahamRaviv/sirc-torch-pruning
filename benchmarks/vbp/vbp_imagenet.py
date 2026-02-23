@@ -213,6 +213,7 @@ def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
             acc, _ = validate(model, val_loader, device, args.model_type)
             log_info(f"Reparam {epoch+1}/{args.epochs_sparse}: "
                      f"train_loss={train_loss:.4f}, val_acc={acc:.4f}")
+            mgr.log_channel_stats()
 
         if use_ddp:
             dist.barrier()
