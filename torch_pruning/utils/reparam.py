@@ -13,6 +13,7 @@ Overhead is O(out × in) per layer per batch for the bias, negligible vs matmul.
 """
 
 import logging
+import os
 from collections import OrderedDict
 
 import torch
@@ -230,6 +231,22 @@ class MeanResidualManager:
                 f"<0.01={s['frac_below_0.01']:.1%} <0.1={s['frac_below_0.1']:.1%} "
                 f"m={s['m_mean']:.4f}±{s['m_std']:.4f}"
             )
+
+    def save_vnorm_snapshot(self, save_dir):
+        """Save per-input-channel V-norms as .pt file for later analysis.
+
+        Also stores on instance as self._last_vnorms for in-process retrieval.
+        """
+        vnorms = OrderedDict()
+        for name, reparam in self._reparam_modules.items():
+            v = reparam.v.detach()
+            vnorms[name] = v.flatten(1).norm(p=2, dim=0).cpu()  # [d_intermediate]
+        self._last_vnorms = vnorms
+
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, "reparam_vnorms.pt")
+        torch.save(vnorms, path)
+        logger.info(f"Saved V-norm snapshot to {path} ({len(vnorms)} layers)")
 
     def reparam_param_ids(self):
         """Return set of id(p) for all m, v parameters (for optimizer grouping)."""

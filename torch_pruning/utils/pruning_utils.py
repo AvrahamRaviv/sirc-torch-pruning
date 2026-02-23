@@ -462,6 +462,7 @@ class ChannelPruning:
 
         # Merge reparam back at pruning start
         if self._reparam_manager is not None and self._reparam_manager.is_active:
+            self._reparam_manager.save_vnorm_snapshot(self.config_folder)
             self._reparam_manager.merge_back()
             self._model_changed = True
             self.init_channel_pruner(model, log, collect_stats=True)
