@@ -56,23 +56,23 @@ def log_info(msg: str):
 
 
 def setup_logging(save_dir: str):
-    """Configure logging with console and file handlers."""
+    """Configure logging with console and file handlers (main rank only)."""
     logger.handlers.clear()
+    if not is_main():
+        # Non-main ranks: no handlers → silent
+        return
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-    # Console handler
     ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(fmt)
     logger.addHandler(ch)
 
-    # File handler (main rank only)
-    if is_main():
-        os.makedirs(save_dir, exist_ok=True)
-        log_path = os.path.join(save_dir, "vbp_imagenet.log")
-        fh = logging.FileHandler(log_path)
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
-        logger.info(f"Logging to {log_path}")
+    os.makedirs(save_dir, exist_ok=True)
+    log_path = os.path.join(save_dir, "vbp_imagenet.log")
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.info(f"Logging to {log_path}")
 
 
 # ---------------------------------------------------------------------------
