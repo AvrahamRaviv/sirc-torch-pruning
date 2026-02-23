@@ -69,6 +69,10 @@ ELEMENTWISE_NAMES = {
     'adaptiveavgpool2dbackward': 'AdaptiveAvgPool2d',
 }
 
+# F.linear autograd internals to collapse (unnamed nodes with these labels are hidden)
+COLLAPSIBLE_OPS = {'T', 'Addmm', 'Clone'}
+COLLAPSIBLE_CLASSES = {'_ReshapeOp', '_ExpandOp'}
+
 # Structural op types (force-shape-match dependencies)
 STRUCTURAL_TYPES = {
     OPTYPE.CONCAT, OPTYPE.SPLIT, OPTYPE.RESHAPE,
@@ -148,6 +152,35 @@ def _should_skip_node(node, ignored_types: Optional[Set[OPTYPE]]) -> bool:
     return node.type in ignored_types
 
 
+def _is_collapsible(node, ignored_set: Optional[Set[OPTYPE]]) -> bool:
+    """Check if node is an unnamed autograd internal that should be collapsed."""
+    if node._name is not None:
+        return False  # named modules are always shown
+    if _should_skip_node(node, ignored_set):
+        return True  # already skipped
+    if node.type == OPTYPE.ELEMENTWISE:
+        label = _get_elementwise_name(node.module)
+        return label in COLLAPSIBLE_OPS
+    return node.module_class.__name__ in COLLAPSIBLE_CLASSES
+
+
+def _resolve_visible_neighbors(node, direction, collapse_set, ignored_set):
+    """Follow 'inputs'/'outputs' through collapsed nodes to find visible endpoints."""
+    visited = set()
+    queue = list(getattr(node, direction))
+    result = []
+    while queue:
+        n = queue.pop()
+        if n in visited:
+            continue
+        visited.add(n)
+        if n in collapse_set or _should_skip_node(n, ignored_set):
+            queue.extend(getattr(n, direction))
+        else:
+            result.append(n)
+    return result
+
+
 def _build_group_assignment(
     DG: "DependencyGraph",
     node_ids: Dict[Any, str],
@@ -194,20 +227,36 @@ def _collect_edges(
     ignored_set: Optional[Set[OPTYPE]],
     collect_deps: bool,
     differentiate_dependencies: bool,
+    collapse_set: Optional[Set] = None,
 ) -> Dict[tuple, Dict]:
     """Collect computational and dependency edges into a unified registry."""
 
     edge_registry: Dict[tuple, Dict] = {}
+    if collapse_set is None:
+        collapse_set = set()
 
     def canonical_key(a: str, b: str):
         return (a, b, True) if a <= b else (b, a, False)
 
     # Always collect computational edges (layout backbone)
     for node in DG.module2node.values():
-        if _should_skip_node(node, ignored_set):
+        if _should_skip_node(node, ignored_set) or node in collapse_set:
             continue
         node_id = node_ids[node]
         for out_node in node.outputs:
+            # Resolve through collapsed nodes to find visible successors
+            if out_node in collapse_set:
+                visible_successors = _resolve_visible_neighbors(out_node, 'outputs', collapse_set, ignored_set)
+                for vis_node in visible_successors:
+                    vis_id = node_ids.get(vis_node)
+                    if vis_id is None:
+                        continue
+                    ck = canonical_key(node_id, vis_id)
+                    key, is_fwd = (ck[0], ck[1]), ck[2]
+                    if key not in edge_registry:
+                        edge_registry[key] = {'computational': set(), 'dependencies': []}
+                    edge_registry[key]['computational'].add(is_fwd)
+                continue
             if _should_skip_node(out_node, ignored_set):
                 continue
             out_id = node_ids.get(out_node)
@@ -327,6 +376,7 @@ def visualize_graph(
     differentiate_dependencies: bool = True,
     group_root_types=None,
     ignored_layers: Optional[List] = None,
+    collapse_unnamed: bool = True,
 ) -> graphviz.Digraph:
     """Visualize the dependency graph using Graphviz.
 
@@ -351,6 +401,8 @@ def visualize_graph(
         show_groups: Whether to wrap nodes in cluster subgraphs by pruning group.
         differentiate_dependencies: Style direct (green) vs force-shape-match (red) differently.
         group_root_types: Module types to use as group roots (default: Conv2d, Linear).
+        collapse_unnamed: Hide unnamed autograd-internal nodes (T, Addmm, Clone, _ReshapeOp,
+            _ExpandOp) and reconnect edges through them. Default True.
 
     Returns:
         The graphviz.Digraph object.
@@ -405,15 +457,22 @@ def visualize_graph(
             DG, node_ids, ignored_set, group_root_types, ignored_layers
         )
 
+    # Build collapse set for unnamed autograd internals
+    collapse_set: Set = set()
+    if collapse_unnamed:
+        for node in DG.module2node.values():
+            if _is_collapsible(node, ignored_set):
+                collapse_set.add(node)
+
     # Collect edges
     collect_deps = view in ("dependency", "both")
-    edge_registry = _collect_edges(DG, node_ids, ignored_set, collect_deps, differentiate_dependencies)
+    edge_registry = _collect_edges(DG, node_ids, ignored_set, collect_deps, differentiate_dependencies, collapse_set)
 
     # Build per-group node lists and ungrouped list
     group_nodes: Dict[int, list] = {i: [] for i in range(num_groups)}
     ungrouped_nodes: list = []
     for node in DG.module2node.values():
-        if _should_skip_node(node, ignored_set):
+        if _should_skip_node(node, ignored_set) or node in collapse_set:
             continue
         nid = node_ids[node]
         if nid in node_id_to_group:
@@ -510,6 +569,7 @@ def visualize_all_views(
     differentiate_dependencies: bool = True,
     show_edge_labels: bool = False,
     ignored_layers: Optional[List] = None,
+    collapse_unnamed: bool = True,
 ) -> Dict[str, graphviz.Digraph]:
     """Generate computational, dependency, and combined views with consistent layout.
 
@@ -528,6 +588,7 @@ def visualize_all_views(
         differentiate_dependencies: Style direct vs force-shape-match differently.
         show_edge_labels: Whether to show trigger/handler labels on dependency edges.
         ignored_layers: Layers to exclude from group assignment.
+        collapse_unnamed: Hide unnamed autograd-internal nodes. Default True.
 
     Returns:
         Dict mapping view name to its graphviz.Digraph object.
@@ -550,5 +611,6 @@ def visualize_all_views(
             differentiate_dependencies=differentiate_dependencies,
             group_root_types=group_root_types,
             ignored_layers=ignored_layers,
+            collapse_unnamed=collapse_unnamed,
         )
     return results
