@@ -55,7 +55,7 @@ try:
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate,
         train_one_epoch, build_ft_scheduler,
-        VarianceConcentrationHooks, build_layers_to_prune,
+        VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -64,7 +64,7 @@ except ImportError:
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate,
         train_one_epoch, build_ft_scheduler,
-        VarianceConcentrationHooks, build_layers_to_prune,
+        VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
     )
 
 
@@ -87,6 +87,9 @@ def build_pruning_config(args, model, config_dir):
     epoch_rate = max(1, args.pat_epochs_per_step + 1)
     end_epoch = start_epoch + (args.pat_steps - 1) * epoch_rate
 
+    reparam_layers = build_reparam_layers(model, args.model_type,
+                                           getattr(args, 'cnn_arch', None))
+
     config = {
         "channel_sparsity_args": {
             "is_prune": True,
@@ -103,6 +106,7 @@ def build_pruning_config(args, model, config_dir):
             "infer": False,
             "input_shape": [1, 3, 224, 224],
             "layers": layers,
+            "reparam_layers": reparam_layers,
             "regularize": {"reg": 0, "mac_reg": 0},
             "MAC_params": {},
             # VBP-specific

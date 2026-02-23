@@ -64,7 +64,7 @@ try:
         setup_distributed, cleanup,
         build_dataloaders, load_model, forward_logits,
         validate, train_one_epoch, build_ft_scheduler,
-        VarianceConcentrationHooks, build_layers_to_prune,
+        VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -73,7 +73,7 @@ except ImportError:
         setup_distributed, cleanup,
         build_dataloaders, load_model, forward_logits,
         validate, train_one_epoch, build_ft_scheduler,
-        VarianceConcentrationHooks, build_layers_to_prune,
+        VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
     )
 
 # ---------------------------------------------------------------------------
@@ -171,10 +171,9 @@ def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
     """
     from torch_pruning.utils.reparam import MeanResidualManager
 
-    target_names = build_layers_to_prune(
+    target_names = build_reparam_layers(
         model, args.model_type,
-        architecture=getattr(args, 'cnn_arch', None),
-        interior_only=getattr(args, 'interior_only', True))
+        architecture=getattr(args, 'cnn_arch', None))
     log_info(f"Reparam pre-training: {len(target_names)} layers, "
              f"epochs={args.epochs_sparse}, λ={args.reparam_lambda}")
 
