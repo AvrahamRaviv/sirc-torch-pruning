@@ -39,6 +39,7 @@ from torch_pruning.utils.sparse_utils import l21_regularization
 # ---------------------------------------------------------------------------
 logger = logging.getLogger("vbp_imagenet")
 logger.setLevel(logging.INFO)
+logger.propagate = False  # prevent duplicate output via root logger
 
 
 def is_main():

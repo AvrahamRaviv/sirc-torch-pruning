@@ -1088,7 +1088,12 @@ class VarianceImportance(Importance):
 
         model.eval()
         total = min(len(train_loader), max_batches) if max_batches else len(train_loader)
-        pbar = tqdm(train_loader, desc="Collecting stats", total=total, miniters=max(total // 20, 1))
+        try:
+            import torch.distributed as _dist
+            _disable_tqdm = _dist.is_available() and _dist.is_initialized() and _dist.get_rank() != 0
+        except Exception:
+            _disable_tqdm = False
+        pbar = tqdm(train_loader, desc="Collecting stats", total=total, miniters=max(total // 20, 1), disable=_disable_tqdm)
         for batch_idx, batch in enumerate(pbar):
             from torch_pruning.utils.pruning_utils import _unpack_images
             images = _unpack_images(batch)
