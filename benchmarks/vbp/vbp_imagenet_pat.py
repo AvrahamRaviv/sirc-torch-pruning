@@ -483,6 +483,8 @@ def parse_args():
     parser.add_argument("--wd", type=float, default=0.01,
                         help="Weight decay (applied to non-reparam params)")
     parser.add_argument("--var_loss_weight", type=float, default=0.0)
+    parser.add_argument("--reparam_during_pat", action="store_true",
+                        help="Keep reparam active during PAT per-step fine-tuning")
     parser.add_argument("--pruning_schedule", default="geometric",
                         choices=["geometric", "linear"])
     parser.add_argument("--no_mask_only", action="store_true",
