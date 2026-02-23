@@ -259,6 +259,11 @@ def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
             step_per_batch=step_per_batch, phase="Reparam",
             aux_loss_fn=mgr.regularization_loss)
 
+        # Periodic μ_x refresh (function-preserving)
+        refresh = getattr(args, 'reparam_refresh_interval', 0)
+        if refresh > 0 and (epoch + 1) % refresh == 0:
+            mgr.refresh_mu(train_loader)
+
         if is_main():
             acc, _ = validate(model, val_loader, device, args.model_type)
             log_info(f"Reparam {epoch+1}/{args.epochs_sparse}: "
@@ -876,6 +881,8 @@ def parse_args():
                               help="Target weight sparsity for GMP mode")
     sparse_group.add_argument("--reparam_lambda", type=float, default=0.01,
                               help="L_{2,1} regularization strength for reparam mode")
+    sparse_group.add_argument("--reparam_refresh_interval", type=int, default=0,
+                              help="Re-estimate μ_x every N epochs (0 = never)")
 
     # DDP
     ddp_group = parser.add_argument_group("Distributed")
