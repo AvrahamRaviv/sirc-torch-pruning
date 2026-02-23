@@ -382,9 +382,13 @@ def main(argv):
             aux_loss_fn=aux_fn,
         )
 
-        # 5. Log reparam stats if active
-        if is_main() and cp._reparam_manager and cp._reparam_manager.is_active:
-            cp._reparam_manager.log_channel_stats()
+        # 5. Periodic μ_x refresh + log reparam stats if active
+        if cp._reparam_manager and cp._reparam_manager.is_active:
+            refresh = getattr(args, 'reparam_refresh_interval', 0)
+            if refresh > 0 and (epoch + 1) % refresh == 0:
+                cp._reparam_manager.refresh_mu(train_loader)
+            if is_main():
+                cp._reparam_manager.log_channel_stats()
 
         # 6. Validate + save best
         if is_main():
@@ -495,6 +499,8 @@ def parse_args():
                         help="Target weight sparsity for GMP mode")
     parser.add_argument("--reparam_lambda", type=float, default=0.01,
                         help="L_{2,1} regularization strength for reparam mode")
+    parser.add_argument("--reparam_refresh_interval", type=int, default=0,
+                        help="Re-estimate μ_x every N epochs (0 = never)")
 
     # KD
     parser.add_argument("--use_kd", action="store_true")
