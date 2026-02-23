@@ -222,7 +222,9 @@ def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
     if use_ddp:
         del train_model
 
-    # Merge back to standard modules before pruning
+    # Save V-norm snapshot and merge back to standard modules before pruning
+    if is_main():
+        mgr.save_vnorm_snapshot(args.save_dir)
     mgr.merge_back()
 
     if is_main():
