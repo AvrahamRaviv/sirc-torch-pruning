@@ -230,7 +230,8 @@ def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
     mgr = MeanResidualManager(
         model, target_names, device,
         lambda_reg=args.reparam_lambda,
-        max_batches=args.max_batches)
+        max_batches=args.max_batches,
+        normalize=getattr(args, 'reparam_normalize', False))
     mgr.reparameterize(train_loader)
 
     # Wrap in DDP for training
@@ -883,6 +884,8 @@ def parse_args():
                               help="L_{2,1} regularization strength for reparam mode")
     sparse_group.add_argument("--reparam_refresh_interval", type=int, default=0,
                               help="Re-estimate μ_x every N epochs (0 = never)")
+    sparse_group.add_argument("--reparam_normalize", action="store_true",
+                              help="Normalize L_{2,1} by initial column norms (scale-invariant)")
 
     # DDP
     ddp_group = parser.add_argument_group("Distributed")

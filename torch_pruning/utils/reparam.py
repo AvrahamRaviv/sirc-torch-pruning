@@ -98,7 +98,8 @@ class MeanResidualManager:
         mgr.merge_back()                   # restore standard modules before pruning
     """
 
-    def __init__(self, model, target_names, device, lambda_reg=0.01, max_batches=200):
+    def __init__(self, model, target_names, device, lambda_reg=0.01, max_batches=200,
+                 normalize=False):
         """
         Args:
             model: The nn.Module to reparameterize.
@@ -107,12 +108,15 @@ class MeanResidualManager:
             device: Torch device (all buffers stay on this device).
             lambda_reg: L_{2,1} regularization strength for V.
             max_batches: Max batches for μ_x calibration.
+            normalize: If True, normalize column norms by their initial values
+                       so each layer/channel contributes equally.
         """
         self.model = model
         self.target_names = target_names
         self.device = device
         self.lambda_reg = lambda_reg
         self.max_batches = max_batches
+        self.normalize = normalize
         self._active = False
         self._reparam_modules = OrderedDict()  # name → MeanResidual* module
 
@@ -135,11 +139,16 @@ class MeanResidualManager:
         for name, module in targets.items():
             mu_x = mu_dict[name]
             reparam = self._make_reparam(module, mu_x)
+            # Store initial column norms for normalized L_{2,1}
+            if self.normalize:
+                init_col_norms = reparam.v.detach().flatten(1).norm(p=2, dim=0).clamp(min=1e-8)
+                reparam.register_buffer('v_init_col_norms', init_col_norms)
             self._replace_module(name, reparam)
             self._reparam_modules[name] = reparam
 
         self._active = True
-        logger.info(f"MeanResidualManager: reparameterized {len(targets)} modules")
+        logger.info(f"MeanResidualManager: reparameterized {len(targets)} modules"
+                     f"{' (normalized)' if self.normalize else ''}")
 
     def merge_back(self):
         """Restore standard nn.Linear/nn.Conv2d from MeanResidual* modules."""
@@ -189,12 +198,20 @@ class MeanResidualManager:
         When ||V[:,k]|| → 0, the layer ignores variation in input channel k,
         directly aligned with what VBP prunes (fc1 output = fc2 input channels).
 
+        If normalize=True, each column norm is divided by its initial value
+        and averaged over n_in, so layers contribute equally regardless of scale:
+            λ · Σ_l (1/n_in^l) · Σ_k ||V[:,k]|| / ||V[:,k]^init||
+
         Returns a scalar tensor on device (all GPU, no CPU transfers).
         """
         loss = torch.tensor(0.0, device=self.device)
         for reparam in self._reparam_modules.values():
             v = reparam.v  # [out, in] or [C_out, C_in, kH, kW]
-            loss = loss + v.flatten(1).norm(p=2, dim=0).sum()
+            col_norms = v.flatten(1).norm(p=2, dim=0)  # [n_in]
+            if self.normalize and hasattr(reparam, 'v_init_col_norms'):
+                loss = loss + (col_norms / reparam.v_init_col_norms).sum() / col_norms.shape[0]
+            else:
+                loss = loss + col_norms.sum()
         return self.lambda_reg * loss
 
     def channel_stats(self):
