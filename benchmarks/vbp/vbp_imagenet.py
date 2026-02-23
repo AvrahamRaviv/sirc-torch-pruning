@@ -87,6 +87,56 @@ def _make_post_gelu_nchw(act_fn):
 
 
 # ---------------------------------------------------------------------------
+# V-norm vs VBP correlation
+# ---------------------------------------------------------------------------
+def _log_vnorm_vbp_correlation(vnorm_path, model, imp, model_type):
+    """Log Spearman rank correlation between V-norms and VBP importance.
+
+    Both are per input-channel (d_intermediate) vectors — direct 1:1 mapping.
+    For ViT: fc2 V-norm ↔ fc1 VBP importance for same block.
+    """
+    from scipy.stats import spearmanr
+
+    vnorms = torch.load(vnorm_path, map_location="cpu", weights_only=True)
+
+    # Build module→name map for VBP importance
+    module_to_name = {m: n for n, m in model.named_modules()}
+
+    correlations = []
+    for fc2_name, v_col_norms in vnorms.items():
+        # Map fc2 → fc1: "vit.encoder.layer.N.output.dense" → "vit.encoder.layer.N.intermediate.dense"
+        if model_type == "vit":
+            fc1_name = fc2_name.replace(".output.dense", ".intermediate.dense")
+        elif model_type == "convnext":
+            fc1_name = fc2_name.replace("pwconv2", "pwconv1")
+        else:
+            continue
+
+        # Find fc1 module in imp.variance
+        fc1_mod = None
+        for mod, name in module_to_name.items():
+            if name == fc1_name:
+                fc1_mod = mod
+                break
+        if fc1_mod is None or fc1_mod not in imp.variance:
+            continue
+
+        vbp_imp = imp.variance[fc1_mod].cpu()
+        if vbp_imp.shape != v_col_norms.shape:
+            continue
+
+        rho, pval = spearmanr(v_col_norms.numpy(), vbp_imp.numpy())
+        correlations.append(rho)
+        short = fc2_name.split('.')[-2] + '.' + fc2_name.split('.')[-1]
+        log_info(f"V-norm↔VBP {short}: spearman_r={rho:.4f} (p={pval:.2e})")
+
+    if correlations:
+        import numpy as np
+        log_info(f"V-norm↔VBP aggregate: mean_r={np.mean(correlations):.4f}, "
+                 f"median_r={np.median(correlations):.4f}")
+
+
+# ---------------------------------------------------------------------------
 # Sparse pre-training
 # ---------------------------------------------------------------------------
 def run_sparse_pretraining(model, teacher, train_loader, train_sampler,
@@ -565,6 +615,11 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
                 var_metrics = compute_variance_entropy(imp)
                 log_info(f"Variance — entropy={var_metrics['entropy']:.4f}, "
                          f"cv={var_metrics['cv']:.4f}, gini={var_metrics['gini']:.4f}")
+
+                # V-norm vs VBP importance correlation (if reparam snapshot exists)
+                vnorm_path = os.path.join(args.save_dir, "reparam_vnorms.pt")
+                if os.path.exists(vnorm_path) and step_i == 0:
+                    _log_vnorm_vbp_correlation(vnorm_path, model, imp, args.model_type)
 
         # 2. Create pruner with per-step ratio
         step_args = argparse.Namespace(**vars(args))
