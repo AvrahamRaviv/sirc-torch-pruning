@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger("vbp_imagenet")
+logger.propagate = False  # prevent duplicate output via root logger
 
 
 class MeanResidualLinear(nn.Module):
