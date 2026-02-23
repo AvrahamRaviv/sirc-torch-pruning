@@ -929,7 +929,7 @@ def parse_args():
                               help="Target weight sparsity for GMP mode")
     sparse_group.add_argument("--reparam_lambda", type=float, default=0.01,
                               help="L_{2,1} regularization strength for reparam mode")
-    sparse_group.add_argument("--reparam_refresh_interval", type=int, default=0,
+    sparse_group.add_argument("--reparam_refresh_interval", type=int, default=1,
                               help="Re-estimate μ_x every N epochs (0 = never)")
     sparse_group.add_argument("--reparam_normalize", action="store_true",
                               help="Normalize L_{2,1} by initial column norms (scale-invariant)")
