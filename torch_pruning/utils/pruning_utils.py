@@ -55,16 +55,16 @@ def _unpack_images(batch):
                      f"Expected Tensor, tuple/list, or dict with one of {_IMAGE_KEYS}.")
 
 
-def _recalibrate_bn(model, train_loader, device, log=None):
+def _recalibrate_bn(model, train_loader, device, log=None, max_batches=100):
     """Recalibrate BN running stats after structural pruning."""
     for m in model.modules():
         if isinstance(m, nn.BatchNorm2d):
             m.reset_running_stats()
     model.train()
-    total = min(100, len(train_loader))
+    total = min(max_batches, len(train_loader))
     with torch.no_grad():
         for batch_idx, batch in enumerate(train_loader):
-            if batch_idx >= 100:
+            if batch_idx >= max_batches:
                 break
             images = _unpack_images(batch)
             model(images.to(device, non_blocking=True))
@@ -238,6 +238,7 @@ class ChannelPruning:
 
         # BN recalibration after pruning steps
         self._bn_recalibration = channel_sparsity_args.get('bn_recalibration', False)
+        self._bn_recalib_batches = channel_sparsity_args.get('bn_recalib_batches', 100)
 
         # Sparse pre-training config
         self._sparse_mode = channel_sparsity_args.get('sparse_mode', 'none')
@@ -578,7 +579,8 @@ class ChannelPruning:
 
         # BN recalibration after pruning step
         if self._bn_recalibration and self.train_loader is not None:
-            _recalibrate_bn(model, self.train_loader, self.device, log)
+            _recalibrate_bn(model, self.train_loader, self.device, log,
+                            max_batches=self._bn_recalib_batches)
 
         # Signal that a pruning step (mask or physical) completed
         self._step_completed = True
