@@ -89,7 +89,7 @@ def _make_post_gelu_nchw(act_fn):
 # ---------------------------------------------------------------------------
 # V-norm vs VBP correlation
 # ---------------------------------------------------------------------------
-def _log_vnorm_vbp_correlation(vnorm_path, model, imp, model_type):
+def _log_vnorm_vbp_correlation(vnorm_path, model, imp, model_type, architecture=None):
     """Log Spearman rank correlation between V-norms and VBP importance.
 
     Both are per input-channel (d_intermediate) vectors — direct 1:1 mapping.
@@ -109,6 +109,16 @@ def _log_vnorm_vbp_correlation(vnorm_path, model, imp, model_type):
             fc1_name = fc2_name.replace(".output.dense", ".intermediate.dense")
         elif model_type == "convnext":
             fc1_name = fc2_name.replace("pwconv2", "pwconv1")
+        elif model_type == "cnn":
+            if architecture and "mobilenet" in architecture.lower():
+                # features.N.conv.2 → features.N.conv.0.0 (projection → expand)
+                parts = fc2_name.rsplit('.conv.', 1)
+                if len(parts) != 2:
+                    continue
+                fc1_name = parts[0] + ".conv.0.0"
+            else:
+                # ResNet: layerX.N.conv3 → layerX.N.conv1
+                fc1_name = fc2_name.replace("conv3", "conv1")
         else:
             continue
 
@@ -643,7 +653,8 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
                 # V-norm vs VBP importance correlation (if reparam snapshot exists)
                 vnorm_path = os.path.join(args.save_dir, "reparam_vnorms.pt")
                 if os.path.exists(vnorm_path) and step_i == 0:
-                    _log_vnorm_vbp_correlation(vnorm_path, model, imp, args.model_type)
+                    _log_vnorm_vbp_correlation(vnorm_path, model, imp, args.model_type,
+                                               architecture=getattr(args, 'cnn_arch', None))
 
         # 2. Create pruner with per-step ratio
         step_args = argparse.Namespace(**vars(args))
