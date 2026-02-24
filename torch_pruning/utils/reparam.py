@@ -209,7 +209,7 @@ class MeanResidualManager:
             v = reparam.v  # [out, in] or [C_out, C_in, kH, kW]
             col_norms = v.flatten(1).norm(p=2, dim=0)  # [n_in]
             if self.normalize and hasattr(reparam, 'v_init_col_norms'):
-                loss = loss + (col_norms / reparam.v_init_col_norms).sum() / col_norms.shape[0]
+                loss = loss + (col_norms / reparam.v_init_col_norms).sum()
             else:
                 loss = loss + col_norms.sum()
         return self.lambda_reg * loss
