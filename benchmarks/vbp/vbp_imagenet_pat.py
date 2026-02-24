@@ -118,7 +118,8 @@ def build_pruning_config(args, model, config_dir):
             "verbose": 1,
             # Schedule and features
             "pruning_schedule": args.pruning_schedule,
-            "bn_recalibration": args.bn_recalibration,
+            "bn_recalibration": args.bn_recalibration or (args.model_type == "cnn"),
+            "bn_recalib_batches": args.bn_recalib_batches,
             "sparse_mode": args.sparse_mode,
             "sparse_l1_lambda": args.l1_lambda,
             "sparse_gmp_target": args.gmp_target_sparsity,
@@ -470,6 +471,8 @@ def parse_args():
                         help="Disable bias compensation after pruning")
     parser.add_argument("--bn_recalibration", action="store_true",
                         help="Recalibrate BN running stats after each pruning step")
+    parser.add_argument("--bn_recalib_batches", type=int, default=100,
+                        help="Number of batches for BN recalibration (CNN only)")
 
     # PAT schedule
     parser.add_argument("--pat_steps", type=int, default=5,
