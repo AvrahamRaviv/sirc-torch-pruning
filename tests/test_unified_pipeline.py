@@ -400,3 +400,128 @@ class TestGMPLifecycle:
 
         # At epoch 3: bakes masks and starts pruning
         p.prune(model, epoch=3, mask_only=False)
+
+
+# ---------------------------------------------------------------------------
+# Test: Conv2d reparam and build_reparam_layers for CNN
+# ---------------------------------------------------------------------------
+
+class TinyCNN(nn.Module):
+    """Minimal expand→BN→ReLU→project→pool→fc for Conv2d reparam tests."""
+    def __init__(self):
+        super().__init__()
+        self.expand = nn.Conv2d(3, 16, 1)
+        self.bn = nn.BatchNorm2d(16)
+        self.relu = nn.ReLU()
+        self.project = nn.Conv2d(16, 8, 1)  # 16>8 → matches MNV2-style filter
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(8, 2)
+
+    def forward(self, x):
+        x = self.relu(self.bn(self.expand(x)))
+        x = self.project(x)
+        return self.fc(self.pool(x).flatten(1))
+
+
+def _make_image_dataloader():
+    """Tiny image dataloader (4 batches of 2 samples, 8×8)."""
+    data = torch.randn(8, 3, 8, 8)
+    labels = torch.randint(0, 2, (8,))
+    ds = torch.utils.data.TensorDataset(data, labels)
+    return torch.utils.data.DataLoader(ds, batch_size=2)
+
+
+class TestConv2dReparam:
+    """Test MeanResidualConv2d reparameterize/merge numerics and regularization."""
+
+    def test_conv2d_reparam_numerically_exact(self):
+        """Forward output identical before reparam, during reparam, and after merge."""
+        from torch_pruning.utils.reparam import MeanResidualManager
+
+        model = TinyCNN()
+        loader = _make_image_dataloader()
+        x = torch.randn(4, 3, 8, 8)
+
+        model.eval()
+        with torch.no_grad():
+            y_before = model(x).clone()
+
+        mgr = MeanResidualManager(model, ["project"], torch.device("cpu"),
+                                  lambda_reg=0.01)
+        mgr.reparameterize(loader)
+
+        model.eval()
+        with torch.no_grad():
+            y_during = model(x)
+        assert torch.allclose(y_before, y_during, atol=1e-5), \
+            f"Max diff during reparam: {(y_before - y_during).abs().max()}"
+
+        mgr.merge_back()
+
+        model.eval()
+        with torch.no_grad():
+            y_after = model(x)
+        assert torch.allclose(y_before, y_after, atol=1e-5), \
+            f"Max diff after merge: {(y_before - y_after).abs().max()}"
+
+    def test_conv2d_regularization_loss(self):
+        """Regularization loss is scalar, positive, and differentiable."""
+        from torch_pruning.utils.reparam import MeanResidualManager
+
+        model = TinyCNN()
+        loader = _make_image_dataloader()
+
+        mgr = MeanResidualManager(model, ["project"], torch.device("cpu"),
+                                  lambda_reg=0.01)
+        mgr.reparameterize(loader)
+
+        loss = mgr.regularization_loss()
+        assert loss.dim() == 0, "Loss should be scalar"
+        assert loss.item() > 0, "Loss should be positive"
+        assert loss.requires_grad, "Loss should require grad"
+        loss.backward()  # should not error
+
+
+class TestBuildReparamLayersCNN:
+    """Test build_reparam_layers for ResNet-50 and MobileNet V2."""
+
+    def test_build_reparam_layers_resnet50(self):
+        import torchvision.models as tv_models
+
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+            os.path.realpath(__file__))), "benchmarks", "vbp"))
+        from vbp_common import build_reparam_layers
+
+        model = tv_models.resnet50(weights=None)
+        layers = build_reparam_layers(model, "cnn", "resnet50")
+        assert len(layers) == 16, f"Expected 16, got {len(layers)}: {layers}"
+        for name in layers:
+            assert name.endswith("conv3"), f"Expected conv3, got {name}"
+            parts = name.split('.')
+            parent = model
+            for p in parts:
+                parent = getattr(parent, p)
+            assert isinstance(parent, nn.Conv2d)
+            assert parent.kernel_size == (1, 1)
+            assert parent.groups == 1
+
+    def test_build_reparam_layers_mobilenet_v2(self):
+        import torchvision.models as tv_models
+
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+            os.path.realpath(__file__))), "benchmarks", "vbp"))
+        from vbp_common import build_reparam_layers
+
+        model = tv_models.mobilenet_v2(weights=None)
+        layers = build_reparam_layers(model, "cnn", "mobilenet_v2")
+        assert len(layers) == 17, f"Expected 17, got {len(layers)}: {layers}"
+        for name in layers:
+            parts = name.split('.')
+            parent = model
+            for p in parts:
+                parent = getattr(parent, p)
+            assert isinstance(parent, nn.Conv2d)
+            assert parent.kernel_size == (1, 1)
+            assert parent.groups == 1
+            assert parent.in_channels > parent.out_channels, \
+                f"{name}: in={parent.in_channels} should be > out={parent.out_channels}"
