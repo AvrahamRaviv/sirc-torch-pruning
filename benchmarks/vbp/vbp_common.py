@@ -366,6 +366,19 @@ def build_reparam_layers(model, model_type, architecture=None):
         for name, m in model.named_modules():
             if hasattr(m, "pwconv2"):
                 layers.append(name + ".pwconv2")
+    elif model_type == "cnn":
+        if architecture and "mobilenet" in architecture.lower():
+            # MNV2 projection convs: 1×1 pointwise that narrows expanded → residual
+            for name, m in model.named_modules():
+                if isinstance(m, nn.Conv2d) and m.groups == 1 \
+                   and m.kernel_size == (1, 1) and m.in_channels > m.out_channels:
+                    layers.append(name)
+        else:
+            # ResNet Bottleneck: conv3 = 1×1 that expands mid → residual
+            for name, m in model.named_modules():
+                if isinstance(m, nn.Conv2d) and name.endswith("conv3") \
+                   and m.kernel_size == (1, 1) and m.groups == 1:
+                    layers.append(name)
     return layers
 
 
