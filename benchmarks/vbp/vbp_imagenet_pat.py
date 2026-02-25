@@ -115,6 +115,7 @@ def build_pruning_config(args, model, config_dir):
             "var_loss_weight": args.var_loss_weight,
             "norm_per_layer": args.norm_per_layer,
             "no_compensation": args.no_compensation,
+            "similarity_discount": getattr(args, 'similarity_discount', False),
             "verbose": 1,
             # Schedule and features
             "pruning_schedule": args.pruning_schedule,
@@ -127,6 +128,7 @@ def build_pruning_config(args, model, config_dir):
             "epochs_ft": args.epochs_ft,
             "reparam_lambda": args.reparam_lambda,
             "reparam_normalize": getattr(args, 'reparam_normalize', False),
+            "reparam_entropy_lambda": getattr(args, 'reparam_entropy_lambda', 0.0),
         },
         "slice_sparsity_args": None,
     }
@@ -370,9 +372,14 @@ def main(argv):
         # 4. Train with phase-appropriate losses
         phase = cp.phase
         fc1 = cp._sparse_modules if phase == "Sparse" and args.sparse_mode == "l1_group" else None
-        aux_fn = (cp._reparam_manager.regularization_loss
-                  if phase == "Sparse" and cp._reparam_manager and cp._reparam_manager.is_active
-                  else None)
+        aux_fn = None
+        if phase == "Sparse" and cp._reparam_manager and cp._reparam_manager.is_active:
+            mgr = cp._reparam_manager
+            def aux_fn(m=mgr):
+                loss = m.regularization_loss()
+                if hasattr(m, 'entropy_loss'):
+                    loss = loss + m.entropy_loss()
+                return loss
 
         train_loss = train_one_epoch(
             train_model, train_loader, train_sampler,
@@ -388,7 +395,7 @@ def main(argv):
         if cp._reparam_manager and cp._reparam_manager.is_active:
             refresh = getattr(args, 'reparam_refresh_interval', 0)
             if refresh > 0 and (epoch + 1) % refresh == 0:
-                cp._reparam_manager.refresh_mu(train_loader)
+                cp._reparam_manager.refresh_stats(train_loader)
             if is_main():
                 cp._reparam_manager.log_channel_stats()
 
@@ -469,6 +476,8 @@ def parse_args():
                         help="Use MAC-target mode: analytically compute channel ratio from keep_ratio")
     parser.add_argument("--no_compensation", action="store_true",
                         help="Disable bias compensation after pruning")
+    parser.add_argument("--similarity_discount", action="store_true",
+                        help="Discount VBP importance by channel cosine similarity")
     parser.add_argument("--bn_recalibration", action="store_true",
                         help="Recalibrate BN running stats after each pruning step")
     parser.add_argument("--bn_recalib_batches", type=int, default=100,
@@ -495,7 +504,7 @@ def parse_args():
 
     # Sparse pre-training
     parser.add_argument("--sparse_mode", default="none",
-                        choices=["l1_group", "gmp", "reparam", "none"],
+                        choices=["l1_group", "gmp", "reparam", "vnr", "none"],
                         help="Sparse pre-training mode (none = skip)")
     parser.add_argument("--epochs_sparse", type=int, default=0,
                         help="Sparse pre-training epochs (shifts pruning start)")
@@ -509,6 +518,8 @@ def parse_args():
                         help="Re-estimate μ_x every N epochs (0 = never)")
     parser.add_argument("--reparam_normalize", action="store_true",
                         help="Normalize L_{2,1} by initial column norms (scale-invariant)")
+    parser.add_argument("--reparam_entropy_lambda", type=float, default=0.0,
+                        help="Entropy regularization strength for VNR mode")
 
     # KD
     parser.add_argument("--use_kd", action="store_true")

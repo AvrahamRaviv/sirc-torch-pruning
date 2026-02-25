@@ -210,6 +210,8 @@ class ChannelPruning:
         self._reparam_lambda = self.channel_sparsity_args.get("reparam_lambda", 0.01)
         self._reparam_normalize = self.channel_sparsity_args.get("reparam_normalize", False)
         self._reparam_layers = self.channel_sparsity_args.get("reparam_layers", self.layers_to_prune)
+        self._reparam_entropy_lambda = self.channel_sparsity_args.get("reparam_entropy_lambda", 0.0)
+        self._similarity_discount = self.channel_sparsity_args.get("similarity_discount", False)
         self._post_stats_hook = post_stats_hook  # callable(cp, model) — called after stats collection (e.g., DDP sync)
 
         # Build ignored_layers (needed before MAC estimation)
@@ -321,7 +323,8 @@ class ChannelPruning:
                 imp = self.vbp_importance
             else:
                 imp = tp.importance.VarianceImportance(
-                    norm_per_layer=self._vbp_norm_per_layer)
+                    norm_per_layer=self._vbp_norm_per_layer,
+                    similarity_discount=self._similarity_discount)
                 self.vbp_importance = imp
             pruner_entry = partial(tp.pruner.VBPPruner)
         elif self.pruning_method == PruningMethod.LAMP:
@@ -450,15 +453,24 @@ class ChannelPruning:
         is_vbp = self.pruning_method == PruningMethod.VBP
         loader = train_loader or self.train_loader
 
-        # Reparam sparse pre-training lifecycle
-        if self._sparse_mode == "reparam" and epoch < self.start_epoch:
+        # Reparam sparse pre-training lifecycle (reparam = mean-only, vnr = variance-normalized)
+        if self._sparse_mode in ("reparam", "vnr") and epoch < self.start_epoch:
             if self._reparam_manager is None:
-                from torch_pruning.utils.reparam import MeanResidualManager
-                self._reparam_manager = MeanResidualManager(
-                    model, self._reparam_layers, self.device,
-                    lambda_reg=self._reparam_lambda,
-                    max_batches=self._vbp_max_batches,
-                    normalize=self._reparam_normalize)
+                if self._sparse_mode == "vnr":
+                    from torch_pruning.utils.reparam import NormalizedResidualManager
+                    self._reparam_manager = NormalizedResidualManager(
+                        model, self._reparam_layers, self.device,
+                        lambda_reg=self._reparam_lambda,
+                        max_batches=self._vbp_max_batches,
+                        scale_invariant=self._reparam_normalize,
+                        entropy_lambda=self._reparam_entropy_lambda)
+                else:
+                    from torch_pruning.utils.reparam import MeanResidualManager
+                    self._reparam_manager = MeanResidualManager(
+                        model, self._reparam_layers, self.device,
+                        lambda_reg=self._reparam_lambda,
+                        max_batches=self._vbp_max_batches,
+                        normalize=self._reparam_normalize)
                 self._reparam_manager.reparameterize(loader)
                 self._model_changed = True
             return
