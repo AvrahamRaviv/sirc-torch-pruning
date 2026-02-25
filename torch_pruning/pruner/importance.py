@@ -1033,10 +1033,12 @@ class VarianceImportance(Importance):
         pruner = MagnitudePruner(..., importance=importance)
     """
 
-    def __init__(self, norm_per_layer: bool = False, eps: float = 1e-8):
+    def __init__(self, norm_per_layer: bool = False, eps: float = 1e-8,
+                 similarity_discount: bool = False):
         super().__init__()
         self.norm_per_layer = norm_per_layer
         self.eps = eps
+        self.similarity_discount = similarity_discount
 
         # Exact accumulators: module -> tensors
         self.sum = {}
@@ -1046,6 +1048,10 @@ class VarianceImportance(Importance):
         # final per-module statistics after collection
         self.variance = {}   # module -> var[C]
         self.means = {}      # module -> mean[C]
+
+        # Similarity discount accumulators
+        self.gram = {}           # module -> A^T A [C, C] accumulated
+        self._similarity = {}   # module -> R[C] max similarity per channel
 
     # ---------------------------------------------------------
     # 1. Collect statistics OFFLINE (NO EMA)
@@ -1072,6 +1078,8 @@ class VarianceImportance(Importance):
         self.count.clear()
         self.variance.clear()
         self.means.clear()
+        self.gram.clear()
+        self._similarity.clear()
 
         handles = []
         if target_layers is not None:
@@ -1142,6 +1150,14 @@ class VarianceImportance(Importance):
                 self.sum_sq[mod] += (x * x).sum(dim=0).cpu()
                 self.count[mod] += n
 
+            # Gram matrix for similarity discount
+            if self.similarity_discount:
+                gram_batch = (x.T @ x).cpu()  # [C, C]
+                if mod not in self.gram:
+                    self.gram[mod] = gram_batch
+                else:
+                    self.gram[mod] += gram_batch
+
         return hook
 
     # ---------------------------------------------------------
@@ -1171,6 +1187,16 @@ class VarianceImportance(Importance):
 
             self.means[module] = mean.clone()   # <-- for VBP compensation
             self.variance[module] = var         # <-- for importance
+
+        # Compute similarity discount from Gram matrices
+        if self.similarity_discount:
+            self._similarity.clear()
+            for module in self.gram:
+                G = self.gram[module].float()
+                norms = G.diag().clamp(min=1e-12).sqrt()
+                S = G / (norms[:, None] * norms[None, :])  # cosine similarity
+                S.fill_diagonal_(0.0)  # exclude self-similarity
+                self._similarity[module] = S.max(dim=1).values.clamp(0, 1)
 
     # ---------------------------------------------------------
     # 2. Torch-Pruning interface: importance(group)
@@ -1202,6 +1228,11 @@ class VarianceImportance(Importance):
         var = self.variance[module]
         idxs = torch.as_tensor(idxs, dtype=torch.long)
         scores = var[idxs].clone()
+
+        # Apply similarity discount: high similarity → lower importance
+        if self.similarity_discount and module in self._similarity:
+            R = self._similarity[module]
+            scores = scores * (1.0 - R[idxs])
 
         return scores
 
