@@ -525,3 +525,487 @@ class TestBuildReparamLayersCNN:
             assert parent.groups == 1
             assert parent.in_channels > parent.out_channels, \
                 f"{name}: in={parent.in_channels} should be > out={parent.out_channels}"
+
+
+# ---------------------------------------------------------------------------
+# Test: NormalizedResidualLinear
+# ---------------------------------------------------------------------------
+
+class TestNormalizedResidualLinear:
+    """Test NormalizedResidualLinear: function-preserving init and merge."""
+
+    def test_function_preserving_init(self):
+        """Output of NormalizedResidualLinear matches original Linear."""
+        from torch_pruning.utils.reparam import NormalizedResidualLinear
+
+        torch.manual_seed(42)
+        linear = nn.Linear(16, 32)
+        x = torch.randn(4, 16)
+
+        with torch.no_grad():
+            y_orig = linear(x)
+
+        # Simulate calibration
+        mu_x = x.mean(dim=0)
+        sigma_x = x.std(dim=0).clamp(min=1e-6)
+
+        W = linear.weight.data.clone()
+        b = linear.bias.data.clone()
+        v_tilde = W * sigma_x[None, :]
+        m = b + W @ mu_x
+
+        reparam = NormalizedResidualLinear(16, 32, v_tilde, m, mu_x, sigma_x)
+        with torch.no_grad():
+            y_reparam = reparam(x)
+
+        assert torch.allclose(y_orig, y_reparam, atol=1e-5), \
+            f"Max diff: {(y_orig - y_reparam).abs().max()}"
+
+    def test_merge_params_recovers_original(self):
+        """merge_params recovers original W, b."""
+        from torch_pruning.utils.reparam import NormalizedResidualLinear
+
+        torch.manual_seed(42)
+        linear = nn.Linear(16, 32)
+        x = torch.randn(8, 16)
+
+        mu_x = x.mean(dim=0)
+        sigma_x = x.std(dim=0).clamp(min=1e-6)
+
+        W = linear.weight.data.clone()
+        b = linear.bias.data.clone()
+        v_tilde = W * sigma_x[None, :]
+        m = b + W @ mu_x
+
+        reparam = NormalizedResidualLinear(16, 32, v_tilde, m, mu_x, sigma_x)
+        w_merged, b_merged = reparam.merge_params()
+
+        # Effective weight should match original
+        assert torch.allclose(W, w_merged, atol=1e-5), \
+            f"Weight max diff: {(W - w_merged).abs().max()}"
+
+        # Effective bias should match original
+        b_eff_orig = b.clone()
+        b_eff_merged = b_merged
+        # The merged bias = m - w @ mu_x = (b + W @ mu_x) - W @ mu_x = b
+        assert torch.allclose(b_eff_orig, b_eff_merged, atol=1e-5), \
+            f"Bias max diff: {(b_eff_orig - b_eff_merged).abs().max()}"
+
+
+# ---------------------------------------------------------------------------
+# Test: NormalizedResidualConv2d
+# ---------------------------------------------------------------------------
+
+class TestNormalizedResidualConv2d:
+    """Test NormalizedResidualConv2d: function-preserving init and merge."""
+
+    def test_function_preserving_init(self):
+        """Output of NormalizedResidualConv2d matches original Conv2d."""
+        from torch_pruning.utils.reparam import NormalizedResidualConv2d
+
+        torch.manual_seed(42)
+        conv = nn.Conv2d(8, 16, 3, padding=1)
+        x = torch.randn(2, 8, 8, 8)
+
+        with torch.no_grad():
+            y_orig = conv(x)
+
+        # Simulate calibration: spatial-averaged per-channel stats
+        mu_x = x.mean(dim=(0, 2, 3))
+        sigma_x = ((x * x).mean(dim=(0, 2, 3)) - mu_x * mu_x).clamp(min=1e-12).sqrt().clamp(min=1e-6)
+
+        W = conv.weight.data.clone()
+        b = conv.bias.data.clone()
+        sigma_bc = sigma_x[None, :, None, None]
+        v_tilde = W * sigma_bc
+        m = b + W.sum(dim=(2, 3)) @ mu_x
+
+        reparam = NormalizedResidualConv2d(
+            8, 16, kernel_size=conv.kernel_size, stride=conv.stride,
+            padding=conv.padding, dilation=conv.dilation, groups=conv.groups,
+            v_tilde=v_tilde, m=m, mu_x=mu_x, sigma_x=sigma_x)
+
+        with torch.no_grad():
+            y_reparam = reparam(x)
+
+        assert torch.allclose(y_orig, y_reparam, atol=1e-4), \
+            f"Max diff: {(y_orig - y_reparam).abs().max()}"
+
+    def test_merge_params_recovers_original(self):
+        """merge_params recovers original W, b."""
+        from torch_pruning.utils.reparam import NormalizedResidualConv2d
+
+        torch.manual_seed(42)
+        conv = nn.Conv2d(8, 16, 3, padding=1)
+        x = torch.randn(4, 8, 8, 8)
+
+        mu_x = x.mean(dim=(0, 2, 3))
+        sigma_x = ((x * x).mean(dim=(0, 2, 3)) - mu_x * mu_x).clamp(min=1e-12).sqrt().clamp(min=1e-6)
+
+        W = conv.weight.data.clone()
+        b = conv.bias.data.clone()
+        sigma_bc = sigma_x[None, :, None, None]
+        v_tilde = W * sigma_bc
+        m = b + W.sum(dim=(2, 3)) @ mu_x
+
+        reparam = NormalizedResidualConv2d(
+            8, 16, kernel_size=conv.kernel_size, stride=conv.stride,
+            padding=conv.padding, dilation=conv.dilation, groups=conv.groups,
+            v_tilde=v_tilde, m=m, mu_x=mu_x, sigma_x=sigma_x)
+
+        w_merged, b_merged = reparam.merge_params()
+
+        assert torch.allclose(W, w_merged, atol=1e-5), \
+            f"Weight max diff: {(W - w_merged).abs().max()}"
+        assert torch.allclose(b, b_merged, atol=1e-5), \
+            f"Bias max diff: {(b - b_merged).abs().max()}"
+
+
+# ---------------------------------------------------------------------------
+# Test: NormalizedResidualManager lifecycle
+# ---------------------------------------------------------------------------
+
+class TestNormalizedResidualManager:
+    """Test full lifecycle: reparameterize → forward → merge_back → output matches."""
+
+    def test_lifecycle_linear(self):
+        """NormalizedResidualManager on TinyMLP: reparam → merge → numerically exact."""
+        from torch_pruning.utils.reparam import NormalizedResidualManager
+
+        model = TinyMLP()
+        loader = _make_dataloader()
+        x = torch.randn(4, 16)
+
+        model.eval()
+        with torch.no_grad():
+            y_before = model(x).clone()
+
+        mgr = NormalizedResidualManager(model, ["fc1"], torch.device("cpu"),
+                                         lambda_reg=0.01)
+        mgr.reparameterize(loader)
+
+        model.eval()
+        with torch.no_grad():
+            y_during = model(x)
+        assert torch.allclose(y_before, y_during, atol=1e-5), \
+            f"Max diff during reparam: {(y_before - y_during).abs().max()}"
+
+        mgr.merge_back()
+
+        model.eval()
+        with torch.no_grad():
+            y_after = model(x)
+        assert torch.allclose(y_before, y_after, atol=1e-5), \
+            f"Max diff after merge: {(y_before - y_after).abs().max()}"
+
+    def test_lifecycle_conv2d(self):
+        """NormalizedResidualManager on TinyCNN: reparam → merge → numerically exact."""
+        from torch_pruning.utils.reparam import NormalizedResidualManager
+
+        model = TinyCNN()
+        loader = _make_image_dataloader()
+        x = torch.randn(4, 3, 8, 8)
+
+        model.eval()
+        with torch.no_grad():
+            y_before = model(x).clone()
+
+        mgr = NormalizedResidualManager(model, ["project"], torch.device("cpu"),
+                                         lambda_reg=0.01)
+        mgr.reparameterize(loader)
+
+        model.eval()
+        with torch.no_grad():
+            y_during = model(x)
+        assert torch.allclose(y_before, y_during, atol=1e-4), \
+            f"Max diff during reparam: {(y_before - y_during).abs().max()}"
+
+        mgr.merge_back()
+
+        model.eval()
+        with torch.no_grad():
+            y_after = model(x)
+        assert torch.allclose(y_before, y_after, atol=1e-4), \
+            f"Max diff after merge: {(y_before - y_after).abs().max()}"
+
+    def test_regularization_loss(self):
+        """Regularization loss is scalar, positive, and differentiable."""
+        from torch_pruning.utils.reparam import NormalizedResidualManager
+
+        model = TinyMLP()
+        loader = _make_dataloader()
+
+        mgr = NormalizedResidualManager(model, ["fc1"], torch.device("cpu"),
+                                         lambda_reg=0.01)
+        mgr.reparameterize(loader)
+
+        loss = mgr.regularization_loss()
+        assert loss.dim() == 0
+        assert loss.item() > 0
+        assert loss.requires_grad
+        loss.backward()
+
+
+# ---------------------------------------------------------------------------
+# Test: refresh_stats (function-preserving)
+# ---------------------------------------------------------------------------
+
+class TestRefreshStats:
+    """Output before refresh == output after refresh (function-preserving)."""
+
+    def test_refresh_stats_preserves_output(self):
+        from torch_pruning.utils.reparam import NormalizedResidualManager
+
+        model = TinyMLP()
+        loader = _make_dataloader()
+        x = torch.randn(4, 16)
+
+        mgr = NormalizedResidualManager(model, ["fc1"], torch.device("cpu"),
+                                         lambda_reg=0.01)
+        mgr.reparameterize(loader)
+
+        model.eval()
+        with torch.no_grad():
+            y_before = model(x).clone()
+
+        mgr.refresh_stats(loader)
+
+        model.eval()
+        with torch.no_grad():
+            y_after = model(x)
+
+        assert torch.allclose(y_before, y_after, atol=1e-5), \
+            f"Max diff after refresh: {(y_before - y_after).abs().max()}"
+
+    def test_mean_residual_refresh_mu_alias(self):
+        """MeanResidualManager.refresh_mu still works (backward compat)."""
+        from torch_pruning.utils.reparam import MeanResidualManager
+
+        model = TinyMLP()
+        loader = _make_dataloader()
+        x = torch.randn(4, 16)
+
+        mgr = MeanResidualManager(model, ["fc1"], torch.device("cpu"),
+                                   lambda_reg=0.01)
+        mgr.reparameterize(loader)
+
+        model.eval()
+        with torch.no_grad():
+            y_before = model(x).clone()
+
+        mgr.refresh_mu(loader)
+
+        model.eval()
+        with torch.no_grad():
+            y_after = model(x)
+
+        assert torch.allclose(y_before, y_after, atol=1e-5), \
+            f"Max diff after refresh_mu: {(y_before - y_after).abs().max()}"
+
+
+# ---------------------------------------------------------------------------
+# Test: entropy loss
+# ---------------------------------------------------------------------------
+
+class TestEntropyLoss:
+    """Entropy loss behavior: uniform → max, single channel → zero."""
+
+    def test_uniform_v_max_entropy(self):
+        """Uniform V column norms should give maximum entropy."""
+        from torch_pruning.utils.reparam import NormalizedResidualManager
+
+        model = TinyMLP()
+        # Set fc1 weights to have uniform column norms
+        with torch.no_grad():
+            w = torch.randn(32, 16)
+            # Normalize each column to have same norm
+            w = w / w.norm(p=2, dim=0, keepdim=True)
+            model.fc1.weight.copy_(w)
+
+        loader = _make_dataloader()
+        mgr = NormalizedResidualManager(model, ["fc1"], torch.device("cpu"),
+                                         lambda_reg=0.01, entropy_lambda=1.0)
+        mgr.reparameterize(loader)
+
+        H_uniform = mgr.entropy_loss()
+        assert H_uniform.item() > 0, "Entropy loss should be positive (negative entropy)"
+
+    def test_zero_lambda_returns_zero(self):
+        """entropy_lambda=0 should return zero loss."""
+        from torch_pruning.utils.reparam import NormalizedResidualManager
+
+        model = TinyMLP()
+        loader = _make_dataloader()
+        mgr = NormalizedResidualManager(model, ["fc1"], torch.device("cpu"),
+                                         lambda_reg=0.01, entropy_lambda=0.0)
+        mgr.reparameterize(loader)
+
+        H = mgr.entropy_loss()
+        assert H.item() == 0.0
+
+    def test_concentrated_v_lower_entropy(self):
+        """A single dominant column should give lower entropy (closer to zero) than uniform."""
+        from torch_pruning.utils.reparam import NormalizedResidualManager
+
+        # Model with concentrated columns
+        model_conc = TinyMLP()
+        with torch.no_grad():
+            w = torch.zeros(32, 16)
+            w[:, 0] = 10.0  # one dominant column
+            w[:, 1:] = 0.001  # rest near zero
+            model_conc.fc1.weight.copy_(w)
+
+        loader = _make_dataloader()
+        mgr_conc = NormalizedResidualManager(model_conc, ["fc1"], torch.device("cpu"),
+                                              lambda_reg=0.01, entropy_lambda=1.0)
+        mgr_conc.reparameterize(loader)
+        H_conc = mgr_conc.entropy_loss().item()
+
+        # Model with uniform columns
+        model_uni = TinyMLP()
+        with torch.no_grad():
+            w = torch.randn(32, 16)
+            w = w / w.norm(p=2, dim=0, keepdim=True)
+            model_uni.fc1.weight.copy_(w)
+
+        mgr_uni = NormalizedResidualManager(model_uni, ["fc1"], torch.device("cpu"),
+                                             lambda_reg=0.01, entropy_lambda=1.0)
+        mgr_uni.reparameterize(loader)
+        H_uni = mgr_uni.entropy_loss().item()
+
+        # Uniform should have higher entropy → higher negative entropy loss
+        assert H_uni > H_conc, \
+            f"Uniform entropy ({H_uni}) should be > concentrated ({H_conc})"
+
+
+# ---------------------------------------------------------------------------
+# Test: similarity discount in VarianceImportance
+# ---------------------------------------------------------------------------
+
+class TestSimilarityDiscount:
+    """Similarity discount: identical channels → high discount, orthogonal → none."""
+
+    def test_identical_channels_high_discount(self):
+        """Identical output rows → identical activation channels → high similarity."""
+        from torch_pruning.pruner.importance import VarianceImportance
+
+        imp = VarianceImportance(similarity_discount=True)
+
+        # Create a model where fc1 output channels 0 and 1 are identical
+        # (same row in weight matrix → same output activation)
+        model = TinyMLP()
+        with torch.no_grad():
+            model.fc1.weight[0] = model.fc1.weight[1].clone()
+            model.fc1.bias[0] = model.fc1.bias[1].clone()
+
+        loader = _make_dataloader()
+        imp.collect_statistics(model, loader, torch.device("cpu"), max_batches=4)
+
+        fc1 = model.fc1
+        assert fc1 in imp._similarity, "fc1 should have similarity scores"
+        R = imp._similarity[fc1]
+        # Output channels 0 and 1 produce identical activations → cosine sim ≈ 1.0
+        assert R[0].item() > 0.9, f"Channel 0 max sim should be high, got {R[0].item()}"
+        assert R[1].item() > 0.9, f"Channel 1 max sim should be high, got {R[1].item()}"
+
+    def test_no_discount_when_disabled(self):
+        """Without similarity_discount, scores should equal raw variance."""
+        from torch_pruning.pruner.importance import VarianceImportance
+        import torch_pruning as tp
+
+        model = TinyMLP()
+        loader = _make_dataloader()
+
+        imp_no = VarianceImportance(similarity_discount=False)
+        imp_no.collect_statistics(model, loader, torch.device("cpu"), max_batches=4)
+
+        imp_yes = VarianceImportance(similarity_discount=True)
+        imp_yes.collect_statistics(model, loader, torch.device("cpu"), max_batches=4)
+
+        # Raw variances should be the same
+        fc1 = model.fc1
+        assert torch.allclose(imp_no.variance[fc1], imp_yes.variance[fc1])
+
+    def test_orthogonal_lower_similarity_than_identical(self):
+        """Orthogonal weight rows should yield lower activation similarity than identical rows."""
+        from torch_pruning.pruner.importance import VarianceImportance
+
+        torch.manual_seed(42)
+        loader = _make_dataloader()
+
+        # Model with identical rows → high activation similarity
+        model_ident = TinyMLP()
+        with torch.no_grad():
+            for i in range(32):
+                model_ident.fc1.weight[i] = model_ident.fc1.weight[0].clone()
+                model_ident.fc1.bias[i] = model_ident.fc1.bias[0].clone()
+
+        imp_ident = VarianceImportance(similarity_discount=True)
+        imp_ident.collect_statistics(model_ident, loader, torch.device("cpu"), max_batches=4)
+        R_ident = imp_ident._similarity[model_ident.fc1]
+
+        # Model with orthogonal rows → lower activation similarity
+        model_orth = TinyMLP()
+        with torch.no_grad():
+            nn.init.orthogonal_(model_orth.fc1.weight)
+
+        imp_orth = VarianceImportance(similarity_discount=True)
+        imp_orth.collect_statistics(model_orth, loader, torch.device("cpu"), max_batches=4)
+        R_orth = imp_orth._similarity[model_orth.fc1]
+
+        assert R_orth.mean().item() < R_ident.mean().item(), \
+            f"Orthogonal mean sim ({R_orth.mean():.3f}) should be < identical ({R_ident.mean():.3f})"
+
+
+# ---------------------------------------------------------------------------
+# Test: VNR lifecycle through prune()
+# ---------------------------------------------------------------------------
+
+class TestVNRLifecycle:
+    """Test NormalizedResidualManager init/merge through prune() with sparse_mode=vnr."""
+
+    def test_vnr_init_on_first_sparse_epoch(self, tmp_path):
+        """prune() at epoch < start_epoch with sparse_mode=vnr inits VNR reparam."""
+        config_dir = _create_config(tmp_path, start_epoch=3, end_epoch=7,
+                                    epoch_rate=1, epochs_ft=0,
+                                    sparse_mode="vnr")
+        model = TinyMLP()
+        loader = _make_dataloader()
+        p = Pruning(model, config_dir, device=torch.device("cpu"),
+                    train_loader=loader)
+        cp = p.channel_pruner
+
+        assert cp._reparam_manager is None
+
+        p.prune(model, epoch=0, mask_only=False)
+        assert cp._reparam_manager is not None
+        assert cp._reparam_manager.is_active
+        assert cp.model_changed is True
+
+        # Verify it's a NormalizedResidualManager
+        from torch_pruning.utils.reparam import NormalizedResidualManager
+        assert isinstance(cp._reparam_manager, NormalizedResidualManager)
+
+    def test_vnr_numerically_exact(self, tmp_path):
+        """Forward output is identical before and after VNR reparameterize+merge."""
+        config_dir = _create_config(tmp_path, start_epoch=2, end_epoch=4,
+                                    epoch_rate=1, epochs_ft=0,
+                                    sparse_mode="vnr")
+        model = TinyMLP()
+        loader = _make_dataloader()
+
+        model.eval()
+        x = torch.randn(4, 16)
+        with torch.no_grad():
+            out_before = model(x).clone()
+
+        p = Pruning(model, config_dir, device=torch.device("cpu"),
+                    train_loader=loader)
+
+        p.prune(model, epoch=0, mask_only=False)
+
+        model.eval()
+        with torch.no_grad():
+            out_reparam = model(x)
+        assert torch.allclose(out_before, out_reparam, atol=1e-5), \
+            f"Max diff after reparam: {(out_before - out_reparam).abs().max()}"
