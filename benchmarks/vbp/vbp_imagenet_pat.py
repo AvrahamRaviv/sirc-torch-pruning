@@ -376,10 +376,12 @@ def main(argv):
         if phase == "Sparse" and cp._reparam_manager and cp._reparam_manager.is_active:
             mgr = cp._reparam_manager
             def aux_fn(m=mgr):
-                loss = m.regularization_loss()
+                parts = {"reg": m.regularization_loss()}
                 if hasattr(m, 'entropy_loss'):
-                    loss = loss + m.entropy_loss()
-                return loss
+                    ent = m.entropy_loss()
+                    if ent.item() != 0.0:
+                        parts["ent"] = ent
+                return parts
 
         train_loss = train_one_epoch(
             train_model, train_loader, train_sampler,

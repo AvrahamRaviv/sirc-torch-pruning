@@ -448,7 +448,7 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
     total_loss = 0.0
     total_reg = 0.0
     total_var = 0.0
-    total_aux = 0.0
+    total_aux = {}  # key → running sum (supports dict-returning aux_loss_fn)
     num_batches = 0
 
     total = len(train_loader)
@@ -486,10 +486,16 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
             total_var += var_loss.item()
 
         # Auxiliary loss (e.g. mean-residual regularization)
+        # aux_loss_fn may return a scalar OR a dict {name: tensor} for per-component logging
         if aux_loss_fn is not None:
             aux = aux_loss_fn()
-            loss = loss + aux
-            total_aux += aux.item()
+            if isinstance(aux, dict):
+                for k, v in aux.items():
+                    loss = loss + v
+                    total_aux[k] = total_aux.get(k, 0.0) + v.item()
+            else:
+                loss = loss + aux
+                total_aux["aux"] = total_aux.get("aux", 0.0) + aux.item()
 
         optimizer.zero_grad()
         loss.backward()
@@ -510,8 +516,9 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
                 parts.append(f"L21={total_reg / num_batches:.2f}")
             if use_var_loss:
                 parts.append(f"var={total_var / num_batches:.4f}")
-            if aux_loss_fn is not None:
-                parts.append(f"aux={total_aux / num_batches:.4f}")
+            if total_aux:
+                for k, v in total_aux.items():
+                    parts.append(f"{k}={v / num_batches:.4f}")
             log_info(f"{phase} {epoch+1} [{batch_idx+1}/{total}] {' '.join(parts)}")
 
     if not step_per_batch:
