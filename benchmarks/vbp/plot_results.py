@@ -93,6 +93,33 @@ def parse_log(log_path):
         if result["final_acc"] < 1.0:
             result["final_acc"] *= 100
 
+    # FT-phase best: parse per-epoch FT validation lines
+    ft_accs = [float(m.group(1)) for m in re.finditer(r"FT ep \d+/\d+:.*val_acc=([\d.]+)", text)]
+    if ft_accs:
+        ft_best = max(ft_accs) * 100 if max(ft_accs) < 1.0 else max(ft_accs)
+        result["ft_best_acc"] = ft_best
+
+    # V-norm stats: find all header positions, collect layer lines after each
+    vnorm_headers = list(re.finditer(r"V-norm stats \(column-wise, per input channel\):", text))
+    if vnorm_headers:
+        # Take lines after last header until a non-layer line
+        start = vnorm_headers[-1].end()
+        block_lines = text[start:].split("\n")
+        fracs = []
+        for line in block_lines:
+            m_frac = re.search(r"<0\.1=([\d.]+)%", line)
+            if m_frac:
+                fracs.append(float(m_frac.group(1)))
+            elif fracs:  # stop at first non-matching line after we started collecting
+                break
+        if fracs:
+            result["vnorm_frac_below_0.1"] = sum(fracs) / len(fracs)
+
+    # Final L21 loss from last batch log line
+    l21_matches = list(re.finditer(r"L21=([\d.]+)", text))
+    if l21_matches:
+        result["l21_loss"] = float(l21_matches[-1].group(1))
+
     # Early pruned stats: "Pruned: 1.04G MACs, 5.54M params" (appears right after retention)
     m = re.search(r"Pruned:\s*([\d.]+)G MACs,\s*([\d.]+)M params", text)
     if m:
@@ -136,6 +163,11 @@ def parse_log(log_path):
     # Determine status
     if "best_acc" in result or "final_acc" in result:
         result["status"] = "done"
+        # Prefer FT-phase best from per-epoch logs; fall back to summary Best Acc
+        if "ft_best_acc" in result:
+            result["best_acc"] = result["ft_best_acc"]
+        elif "best_acc" not in result:
+            result["best_acc"] = result.get("final_acc")
     elif "retention_acc" in result:
         result["status"] = "retention_only"
     else:
@@ -154,6 +186,8 @@ def scan_root(root_dir):
     for setup_name in sorted(os.listdir(root_dir)):
         setup_dir = os.path.join(root_dir, setup_name)
         if not os.path.isdir(setup_dir):
+            continue
+        if 'old' in setup_dir:
             continue
 
         for kr_folder in sorted(os.listdir(setup_dir)):
@@ -183,6 +217,10 @@ def scan_root(root_dir):
 
 def print_table(setups):
     """Print a comparison table for all setups."""
+    # Check if any result has V-norm or L21 data (show columns conditionally)
+    has_vnorm = any("vnorm_frac_below_0.1" in r for results in setups.values() for r in results)
+    has_l21 = any("l21_loss" in r for results in setups.values() for r in results)
+
     print("\n" + "=" * 110)
     print("VBP DeiT-T Results Summary")
     print("=" * 110)
@@ -195,7 +233,12 @@ def print_table(setups):
         print(f"\n--- {setup_name} ({n_total} runs: {status_str}) ---")
         header = (f"{'Prune%':>7} | {'Keep':>5} | {'Ret%':>7} | {'Best%':>7} | "
                   f"{'Paper Ret%':>10} | {'Paper FT%':>9} | {'Δ Ret':>6} | "
-                  f"{'Params(M)':>9} | {'Status':>8}")
+                  f"{'Params(M)':>9}")
+        if has_vnorm:
+            header += f" | {'avg<0.1%':>8}"
+        if has_l21:
+            header += f" | {'L21':>7}"
+        header += f" | {'Status':>8}"
         print(header)
         print("-" * len(header))
 
@@ -221,9 +264,17 @@ def print_table(setups):
                 params_str += "*"
             status_icon = {"done": "OK", "retention_only": "FT...", "pruned_only": "PRUNE"}.get(status, "?")
 
-            print(f"  {pp:>5}% | {kr:>.2f} | {ret_str:>6}% | {best_str:>6}% | "
-                  f"{paper_ret_str:>9}% | {paper_ft_str:>8}% | {delta:>6} | "
-                  f"{params_str:>8}M | {status_icon:>8}")
+            line = (f"  {pp:>5}% | {kr:>.2f} | {ret_str:>6}% | {best_str:>6}% | "
+                    f"{paper_ret_str:>9}% | {paper_ft_str:>8}% | {delta:>6} | "
+                    f"{params_str:>8}M")
+            if has_vnorm:
+                vnorm = r.get("vnorm_frac_below_0.1")
+                line += f" | {vnorm:>7.1f}%" if vnorm is not None else " |       —"
+            if has_l21:
+                l21 = r.get("l21_loss")
+                line += f" | {l21:>7.2f}" if l21 is not None else " |      —"
+            line += f" | {status_icon:>8}"
+            print(line)
 
     print("=" * 110)
     print("  * = params estimated from paper table (log incomplete)")
