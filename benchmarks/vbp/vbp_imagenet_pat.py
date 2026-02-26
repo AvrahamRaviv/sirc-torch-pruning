@@ -225,6 +225,14 @@ def _make_stats_sync_hook(device):
                     for m, v in cp._compensation_means.items()
                     if m in module_to_name
                 }
+            # Similarity discount (from Gram matrix)
+            if (cp.vbp_importance is not None
+                    and cp.vbp_importance._similarity):
+                stats["similarity"] = {
+                    module_to_name[m]: v.cpu()
+                    for m, v in cp.vbp_importance._similarity.items()
+                    if m in module_to_name
+                }
         else:
             stats = None
 
@@ -246,6 +254,10 @@ def _make_stats_sync_hook(device):
                     for n, v in stats["comp_means"].items()
                     if n in name_to_module
                 }
+            if "similarity" in stats and cp.vbp_importance is not None:
+                for name, sim in stats["similarity"].items():
+                    if name in name_to_module:
+                        cp.vbp_importance._similarity[name_to_module[name]] = sim.to(device)
 
         dist.barrier()
 
