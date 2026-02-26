@@ -21,9 +21,11 @@ Owners: Avraham Raviv, Ishay Goldin.
 
 
 def _log(log, msg: str) -> None:
-    """Dispatch a message to a logger, or silently no-op if log is None."""
+    """Dispatch a message to a logger or stdout."""
     if log is not None:
         log.info(msg)
+    else:
+        print(msg)
 
 
 _IMAGE_KEYS = ("image", "images", "img", "img1", "input", "inputs",
