@@ -21,11 +21,9 @@ Owners: Avraham Raviv, Ishay Goldin.
 
 
 def _log(log, msg: str) -> None:
-    """Dispatch a message to a logger or stdout."""
+    """Dispatch a message to a logger, or silently no-op if log is None."""
     if log is not None:
         log.info(msg)
-    else:
-        print(msg)
 
 
 _IMAGE_KEYS = ("image", "images", "img", "img1", "input", "inputs",
@@ -89,7 +87,7 @@ class Pruning:
     def __init__(self, model: nn.Module, config_folder: str, forward_fn: Optional[Any] = None,
                  log: Optional[Any] = None, device: Optional[torch.device] = None,
                  train_loader=None, post_stats_hook=None) -> None:
-        self.version = "1.1.5"
+        self.version = "2.0.1"
         try:
             config_path = os.path.join(config_folder, "pruning_config.json")
             with open(config_path, "r") as f:
