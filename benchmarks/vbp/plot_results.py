@@ -32,8 +32,8 @@ import matplotlib.pyplot as plt
 
 
 # Paper Table 10, DeiT-T (arxiv 2507.12988)
+# prune_pct: (retention_acc, finetuned_acc, macs_G, params_M)
 PAPER_DEIT_T = {
-    # prune_pct: (retention_acc, finetuned_acc, macs_G, params_M)
     0:  (72.02, 72.02, 1.26, 5.72),
     5:  (71.67, 72.05, 1.22, 5.54),
     10: (70.95, 71.92, 1.19, 5.36),
@@ -251,8 +251,8 @@ def print_table(setups):
             status = r.get("status", "?")
 
             paper = PAPER_DEIT_T.get(pp)
-            paper_ret = paper[0] if paper else None
-            paper_ft = paper[1] if paper else None
+            paper_ret = paper[0] if paper and paper[0] is not None else None
+            paper_ft = paper[1] if paper and paper[1] is not None else None
 
             ret_str = f"{ret:.2f}" if ret is not None else "  —"
             best_str = f"{best:.2f}" if best is not None else "  —"
@@ -294,8 +294,9 @@ def plot_results(setups, save_path):
     if n_plots == 1:
         axes = [axes]
 
-    # --- Paper data ---
-    paper_pcts = sorted(k for k in PAPER_DEIT_T.keys() if k > 0)
+    # --- Paper data (only entries with actual accuracy values) ---
+    paper_pcts = sorted(k for k in PAPER_DEIT_T.keys()
+                        if k > 0 and PAPER_DEIT_T[k][0] is not None)
     paper_params = [PAPER_DEIT_T[p][3] for p in paper_pcts]
     paper_ret = [PAPER_DEIT_T[p][0] for p in paper_pcts]
     paper_ft = [PAPER_DEIT_T[p][1] for p in paper_pcts]
