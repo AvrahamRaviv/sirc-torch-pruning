@@ -331,6 +331,8 @@ def main(argv):
     pruner = Pruning(model, config_dir, device=device, train_loader=train_loader,
                      log=prune_log, post_stats_hook=stats_hook)
     cp = pruner.channel_pruner
+    if use_ddp and not is_main():
+        cp.verbose = 0
     total = cp.total_epochs
 
     # Variance concentration hooks (optional, VBP only)
