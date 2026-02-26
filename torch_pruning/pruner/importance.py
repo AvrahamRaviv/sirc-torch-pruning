@@ -1231,7 +1231,7 @@ class VarianceImportance(Importance):
 
         # Apply similarity discount: high similarity → lower importance
         if self.similarity_discount and module in self._similarity:
-            R = self._similarity[module]
+            R = self._similarity[module].to(scores.device)
             scores = scores * (1.0 - R[idxs])
 
         return scores
