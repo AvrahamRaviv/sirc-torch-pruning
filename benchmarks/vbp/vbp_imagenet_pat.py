@@ -129,6 +129,7 @@ def build_pruning_config(args, model, config_dir):
             "reparam_lambda": args.reparam_lambda,
             "reparam_normalize": getattr(args, 'reparam_normalize', False),
             "reparam_entropy_lambda": getattr(args, 'reparam_entropy_lambda', 0.0),
+            "reparam_during_pat": getattr(args, 'reparam_during_pat', False),
         },
         "slice_sparsity_args": None,
     }
@@ -387,7 +388,7 @@ def main(argv):
         phase = cp.phase
         fc1 = cp._sparse_modules if phase == "Sparse" and args.sparse_mode == "l1_group" else None
         aux_fn = None
-        if phase == "Sparse" and cp._reparam_manager and cp._reparam_manager.is_active:
+        if phase in ("Sparse", "PAT") and cp._reparam_manager and cp._reparam_manager.is_active:
             mgr = cp._reparam_manager
             def aux_fn(m=mgr):
                 parts = {"reg": m.regularization_loss()}
