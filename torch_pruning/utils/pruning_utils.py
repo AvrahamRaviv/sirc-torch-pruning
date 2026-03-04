@@ -214,6 +214,7 @@ class ChannelPruning:
         self._reparam_during_pat = self.channel_sparsity_args.get("reparam_during_pat", False)
         self._reparam_target = self.channel_sparsity_args.get("reparam_target", "fc2")
         self._similarity_discount = self.channel_sparsity_args.get("similarity_discount", False)
+        self._importance_mode = self.channel_sparsity_args.get("importance_mode", "variance")
         self._post_stats_hook = post_stats_hook  # callable(cp, model) — called after stats collection (e.g., DDP sync)
 
         # Build ignored_layers (needed before MAC estimation)
@@ -326,7 +327,8 @@ class ChannelPruning:
             else:
                 imp = tp.importance.VarianceImportance(
                     norm_per_layer=self._vbp_norm_per_layer,
-                    similarity_discount=self._similarity_discount)
+                    similarity_discount=self._similarity_discount,
+                    importance_mode=self._importance_mode)
                 self.vbp_importance = imp
             pruner_entry = partial(tp.pruner.VBPPruner)
         elif self.pruning_method == PruningMethod.LAMP:
@@ -386,6 +388,13 @@ class ChannelPruning:
         # Sync stats across ranks (e.g., DDP broadcast from rank 0)
         if self._post_stats_hook is not None and self._stats_fresh:
             self._post_stats_hook(self, model)
+
+        # Set consumer weight norms for weight×variance importance mode
+        if self._importance_mode == "weight_variance" and self.pruning_method == PruningMethod.VBP:
+            weight_map = self._build_consumer_weight_map(model)
+            if weight_map:
+                imp.set_weight_norms(weight_map)
+                _log(log, f"Weight×variance mode: set weight norms for {len(weight_map)} layers")
 
         # Set mean_dict on pruner for bias compensation
         if not self._no_compensation and self._compensation_means:
@@ -681,6 +690,51 @@ class ChannelPruning:
             return 0.0
         self.update_max_imp()
         return self.pruner.regularize(model, alpha=2 ** self.channels_pruner_args["alpha_shrinkage_reg"])
+
+    def _build_consumer_weight_map(self, model):
+        """Map fc1 modules → ||W_fc2[:,k]||₂ using DG graph-walking.
+
+        For weight×variance importance: I_k = ||W_fc2[:,k]||₂ · σ_k.
+        Walks the DG from each target (fc1) module to find its consumer (fc2).
+        """
+        from torch_pruning.pruner.importance import build_target_layers
+        target_layers = build_target_layers(model, self.pruner.DG)
+        if not target_layers:
+            return {}
+
+        weight_map = {}
+        for fc1, _ in target_layers:
+            node = self.pruner.DG.module2node.get(fc1)
+            if node is None:
+                continue
+            # BFS to find next Linear/Conv2d consumer
+            visited = set()
+            queue = list(node.outputs)
+            fc2 = None
+            for _ in range(8):
+                next_queue = []
+                for out_node in queue:
+                    nid = id(out_node)
+                    if nid in visited:
+                        continue
+                    visited.add(nid)
+                    m = out_node.module
+                    if isinstance(m, (torch.nn.Linear, torch.nn.Conv2d)) and m is not fc1:
+                        fc2 = m
+                        break
+                    next_queue.extend(out_node.outputs)
+                if fc2 is not None:
+                    break
+                queue = next_queue
+                if not queue:
+                    break
+            if fc2 is not None:
+                W = fc2.weight.detach()
+                if W.dim() == 4:  # Conv2d: [out, in, kH, kW]
+                    W = W.squeeze(-1).squeeze(-1)
+                weight_map[fc1] = W.norm(p=2, dim=0)  # per-input-channel norm
+
+        return weight_map
 
     def set_layers_to_prune(self, model):
         """Build ignored_layers and per-layer pruning ratio dict.

@@ -132,6 +132,7 @@ def build_pruning_config(args, model, config_dir):
             "reparam_entropy_lambda": getattr(args, 'reparam_entropy_lambda', 0.0),
             "reparam_during_pat": getattr(args, 'reparam_during_pat', False),
             "reparam_target": getattr(args, 'reparam_target', 'fc2'),
+            "importance_mode": getattr(args, 'importance_mode', 'variance'),
         },
         "slice_sparsity_args": None,
     }
@@ -400,7 +401,7 @@ def main(argv):
                         parts["ent"] = ent
                 return parts
 
-        train_loss = train_one_epoch(
+        train_loss, aux_losses = train_one_epoch(
             train_model, train_loader, train_sampler,
             optimizer, scheduler, device, epoch, args,
             teacher=teacher, fc1_modules=fc1,
@@ -423,8 +424,10 @@ def main(argv):
             eval_model = train_model.module if isinstance(train_model, DDP) else train_model
             acc, val_loss = validate(eval_model, val_loader, device, args.model_type)
             pruned_macs, pruned_params = tp.utils.count_ops_and_params(eval_model, example_inputs)
+            aux_str = " ".join(f"{k}={v:.4f}" for k, v in aux_losses.items()) if aux_losses else ""
             log_info(f"[{phase}] Epoch {epoch+1}/{total}: train_loss={train_loss:.4f}, "
-                     f"val_acc={acc:.4f}, MACs={pruned_macs / 1e9:.2f}G")
+                     f"val_acc={acc:.4f}, MACs={pruned_macs / 1e9:.2f}G"
+                     f"{' | ' + aux_str if aux_str else ''}")
 
             if acc > best_acc:
                 best_acc = acc
@@ -541,6 +544,9 @@ def parse_args():
                         help="Which layer to reparameterize: fc1 (upstream, row norms) or fc2 (downstream, col norms)")
     parser.add_argument("--reparam_entropy_lambda", type=float, default=0.0,
                         help="Entropy regularization strength for VNR mode")
+    parser.add_argument("--importance_mode", default="variance",
+                        choices=["variance", "weight_variance"],
+                        help="Importance scoring: variance (σ²) or weight_variance (||W_fc2[:,k]||·σ_k)")
 
     # KD
     parser.add_argument("--use_kd", action="store_true")

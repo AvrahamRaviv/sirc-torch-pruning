@@ -391,6 +391,48 @@ def build_reparam_layers(model, model_type, architecture=None, reparam_target="f
     return layers
 
 
+def build_consumer_weight_map(model, model_type, architecture=None):
+    """Map fc1 modules to per-channel L2 norms of corresponding fc2 weight columns.
+
+    Returns:
+        Dict[nn.Module, torch.Tensor]: fc1_module → ||W_fc2[:,k]||₂ shape [d_intermediate].
+    """
+    weight_map = {}
+    if model_type == "vit":
+        for block in model.vit.encoder.layer:
+            fc1 = block.intermediate.dense
+            fc2 = block.output.dense
+            # fc2.weight: [d_model, d_intermediate], column k = fc2.weight[:, k]
+            weight_map[fc1] = fc2.weight.detach().norm(p=2, dim=0)
+    elif model_type == "cnn":
+        if architecture and "mobilenet" in architecture.lower():
+            # MNV2 inverted residual: expand(fc1) → DW → project(fc2)
+            for name, m in model.named_modules():
+                if not hasattr(m, 'conv'):
+                    continue
+                expand, project = None, None
+                for sub in m.conv.modules():
+                    if isinstance(sub, nn.Conv2d) and sub.groups == 1 and sub.kernel_size == (1, 1):
+                        if sub.out_channels > sub.in_channels:
+                            expand = sub
+                        elif sub.in_channels > sub.out_channels:
+                            project = sub
+                if expand is not None and project is not None:
+                    # project.weight: [C_bottleneck, C_expand, 1, 1]
+                    weight_map[expand] = project.weight.detach().squeeze(-1).squeeze(-1).norm(p=2, dim=0)
+        else:
+            # ResNet Bottleneck: conv1(fc1) → conv2 → conv3(fc2)
+            for name, m in model.named_modules():
+                if hasattr(m, 'conv1') and hasattr(m, 'conv3'):
+                    fc1 = m.conv1
+                    fc2 = m.conv3
+                    # conv3.weight: [C_residual, C_mid, 1, 1]
+                    weight_map[fc1] = fc2.weight.detach().squeeze(-1).squeeze(-1).norm(p=2, dim=0)
+    if weight_map:
+        log_info(f"Consumer weight map: {len(weight_map)} fc1→fc2 pairs ({model_type})")
+    return weight_map
+
+
 def build_layers_to_prune(model, model_type, architecture=None, interior_only=True):
     """Return list of module names to prune (fc1 / pwconv1 / interior convs)."""
     layers = []
@@ -532,7 +574,9 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
 
     if not step_per_batch:
         scheduler.step()
-    return total_loss / max(num_batches, 1)
+    avg_loss = total_loss / max(num_batches, 1)
+    avg_aux = {k: v / max(num_batches, 1) for k, v in total_aux.items()} if total_aux else {}
+    return avg_loss, avg_aux
 
 
 def validate(model, val_loader, device, model_type: str):

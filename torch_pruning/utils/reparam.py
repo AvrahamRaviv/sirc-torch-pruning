@@ -246,6 +246,8 @@ class BaseReparamManager(ABC):
         logger.info(f"{cls_name}: reparameterized {len(targets)} {self.reparam_target} modules"
                      f"{' (scale-invariant)' if self.scale_invariant else ''}"
                      f" [norm_dim={self.norm_dim}]")
+        # Log initial V-norms as baseline for tracking regularization progress
+        self.log_channel_stats(verbose=False)
 
     def merge_back(self):
         """Restore standard nn.Linear/nn.Conv2d from reparam modules."""
@@ -283,18 +285,43 @@ class BaseReparamManager(ABC):
         torch.save(vnorms, path)
         logger.info(f"Saved V-norm snapshot to {path} ({len(vnorms)} layers)")
 
-    def log_channel_stats(self):
-        """Log per-layer residual-weight norm summary (one line per layer)."""
+    def log_channel_stats(self, verbose=True):
+        """Log per-layer and aggregate residual-weight norm summary.
+
+        Args:
+            verbose: If True, log per-layer detail. Always logs aggregate summary.
+        """
         stats = self.channel_stats()
-        axis_desc = "row-wise, per output channel" if self.norm_dim == 1 else "column-wise, per input channel"
-        logger.info(f"V-norm stats ({axis_desc}):")
-        for name, s in stats.items():
-            short = name.split('.')[-2] + '.' + name.split('.')[-1] if '.' in name else name
+        axis_desc = "row" if self.norm_dim == 1 else "col"
+        target_desc = f"fc1 ({axis_desc}-norms)" if self.reparam_target == "fc1" else f"fc2 ({axis_desc}-norms)"
+
+        if verbose:
+            logger.info(f"V-norm per-layer ({target_desc}):")
+            for name, s in stats.items():
+                short = name.split('.')[-2] + '.' + name.split('.')[-1] if '.' in name else name
+                logger.info(
+                    f"  {short}: mean={s['v_col_norm_mean']:.4f} std={s['v_col_norm_std']:.4f} "
+                    f"min={s['v_col_norm_min']:.4f} max={s['v_col_norm_max']:.4f} "
+                    f"<0.01={s['frac_below_0.01']:.1%} <0.1={s['frac_below_0.1']:.1%} "
+                    f"m={s['m_mean']:.4f}±{s['m_std']:.4f}"
+                )
+
+        # Aggregate summary across all layers
+        if stats:
+            all_norms = []
+            for name, reparam in self._reparam_modules.items():
+                v = _residual_weight(reparam).detach()
+                norms = v.flatten(1).norm(p=2, dim=self.norm_dim)
+                all_norms.append(norms)
+            all_norms = torch.cat(all_norms)
+            n_total = len(all_norms)
             logger.info(
-                f"  {short}: mean={s['v_col_norm_mean']:.4f} std={s['v_col_norm_std']:.4f} "
-                f"min={s['v_col_norm_min']:.4f} max={s['v_col_norm_max']:.4f} "
-                f"<0.01={s['frac_below_0.01']:.1%} <0.1={s['frac_below_0.1']:.1%} "
-                f"m={s['m_mean']:.4f}±{s['m_std']:.4f}"
+                f"V-norm aggregate ({target_desc}, {len(stats)} layers, {n_total} channels): "
+                f"mean={all_norms.mean():.4f} median={all_norms.median():.4f} "
+                f"std={all_norms.std():.4f} "
+                f"<0.01={((all_norms < 0.01).sum().item() / n_total):.1%} "
+                f"<0.1={((all_norms < 0.1).sum().item() / n_total):.1%} "
+                f"<1.0={((all_norms < 1.0).sum().item() / n_total):.1%}"
             )
 
     # ------------------------------------------------------------------

@@ -1034,11 +1034,12 @@ class VarianceImportance(Importance):
     """
 
     def __init__(self, norm_per_layer: bool = False, eps: float = 1e-8,
-                 similarity_discount: bool = False):
+                 similarity_discount: bool = False, importance_mode: str = "variance"):
         super().__init__()
         self.norm_per_layer = norm_per_layer
         self.eps = eps
         self.similarity_discount = similarity_discount
+        self.importance_mode = importance_mode  # "variance" or "weight_variance"
 
         # Exact accumulators: module -> tensors
         self.sum = {}
@@ -1048,6 +1049,9 @@ class VarianceImportance(Importance):
         # final per-module statistics after collection
         self.variance = {}   # module -> var[C]
         self.means = {}      # module -> mean[C]
+
+        # Consumer weight norms for weight×variance mode: module -> ||W_fc2[:,k]||₂ [C]
+        self.weight_norms = {}
 
         # Similarity discount accumulators
         self.gram = {}           # module -> A^T A [C, C] accumulated
@@ -1198,6 +1202,15 @@ class VarianceImportance(Importance):
                 S.fill_diagonal_(0.0)  # exclude self-similarity
                 self._similarity[module] = S.max(dim=1).values.clamp(0, 1)
 
+    def set_weight_norms(self, weight_norms: dict):
+        """Set consumer weight norms for weight×variance mode.
+
+        Args:
+            weight_norms: dict mapping fc1 module → tensor of shape [C]
+                containing per-channel L2 norms of the corresponding fc2 weight columns.
+        """
+        self.weight_norms = weight_norms
+
     # ---------------------------------------------------------
     # 2. Torch-Pruning interface: importance(group)
     # ---------------------------------------------------------
@@ -1228,6 +1241,12 @@ class VarianceImportance(Importance):
         var = self.variance[module]
         idxs = torch.as_tensor(idxs, dtype=torch.long)
         scores = var[idxs].clone()
+
+        # Weight×variance: I_k = ||W_fc2[:,k]||₂ · σ_k
+        if self.importance_mode == "weight_variance" and module in self.weight_norms:
+            w_norms = self.weight_norms[module].to(scores.device)
+            scores = w_norms[idxs] * scores.clamp(min=0.0).sqrt()
+        # else: plain variance (σ_k²), the default
 
         # Apply similarity discount: high similarity → lower importance
         if self.similarity_discount and module in self._similarity:
