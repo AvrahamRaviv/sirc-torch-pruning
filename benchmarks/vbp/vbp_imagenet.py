@@ -65,6 +65,7 @@ try:
         build_dataloaders, load_model, forward_logits,
         validate, train_one_epoch, build_ft_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
+        build_consumer_weight_map,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -74,6 +75,7 @@ except ImportError:
         build_dataloaders, load_model, forward_logits,
         validate, train_one_epoch, build_ft_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
+        build_consumer_weight_map,
     )
 
 # ---------------------------------------------------------------------------
@@ -187,7 +189,7 @@ def run_sparse_pretraining(model, teacher, train_loader, train_sampler,
             log_info(f"GMP epoch {epoch+1}: target={target_s:.4f}, "
                      f"actual={ws['global']:.4f}")
 
-        train_loss = train_one_epoch(
+        train_loss, aux_losses = train_one_epoch(
             train_model, train_loader, train_sampler, optimizer, scheduler,
             device, epoch, args, teacher=teacher, fc1_modules=fc1_modules,
             step_per_batch=step_per_batch, phase="Sparse")
@@ -195,8 +197,10 @@ def run_sparse_pretraining(model, teacher, train_loader, train_sampler,
         # Validate on unwrapped model
         if is_main():
             acc, val_loss = validate(model, val_loader, device, args.model_type)
+            aux_str = " ".join(f"{k}={v:.4f}" for k, v in aux_losses.items()) if aux_losses else ""
             log_info(f"Sparse {epoch+1}/{args.epochs_sparse}: "
-                     f"train_loss={train_loss:.4f}, val_acc={acc:.4f}")
+                     f"train_loss={train_loss:.4f}, val_acc={acc:.4f}"
+                     f"{' | ' + aux_str if aux_str else ''}")
             if acc < 0.01:
                 log_info("WARNING: Model accuracy collapsed below 1%!")
 
@@ -266,12 +270,15 @@ def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
     scheduler, step_per_batch = build_ft_scheduler(
         optimizer, args.epochs_sparse, len(train_loader))
 
+    def _reparam_aux():
+        return {"reg": mgr.regularization_loss()}
+
     for epoch in range(args.epochs_sparse):
-        train_loss = train_one_epoch(
+        train_loss, aux_losses = train_one_epoch(
             train_model, train_loader, train_sampler, optimizer, scheduler,
             device, epoch, args, teacher=teacher,
             step_per_batch=step_per_batch, phase="Reparam",
-            aux_loss_fn=mgr.regularization_loss)
+            aux_loss_fn=_reparam_aux)
 
         # Periodic μ_x refresh (function-preserving)
         refresh = getattr(args, 'reparam_refresh_interval', 0)
@@ -280,8 +287,10 @@ def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
 
         if is_main():
             acc, _ = validate(model, val_loader, device, args.model_type)
+            aux_str = " ".join(f"{k}={v:.4f}" for k, v in aux_losses.items()) if aux_losses else ""
             log_info(f"Reparam {epoch+1}/{args.epochs_sparse}: "
-                     f"train_loss={train_loss:.4f}, val_acc={acc:.4f}")
+                     f"train_loss={train_loss:.4f}, val_acc={acc:.4f}"
+                     f"{' | ' + aux_str if aux_str else ''}")
             mgr.log_channel_stats()
 
         if use_ddp:
@@ -309,10 +318,11 @@ def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
 # ---------------------------------------------------------------------------
 # Pruner setup
 # ---------------------------------------------------------------------------
-def build_importance(criterion, norm_per_layer=False):
+def build_importance(criterion, norm_per_layer=False, importance_mode="variance"):
     """Map criterion string to importance object."""
     if criterion == "variance":
-        return tp.importance.VarianceImportance(norm_per_layer=norm_per_layer)
+        return tp.importance.VarianceImportance(norm_per_layer=norm_per_layer,
+                                                 importance_mode=importance_mode)
     elif criterion == "magnitude":
         return tp.importance.MagnitudeImportance(p=2)
     elif criterion == "lamp":
@@ -581,7 +591,7 @@ def finetune(model, teacher, train_loader, train_sampler, val_loader,
     best_acc = 0.0
     for ep in range(epochs):
         global_epoch = epoch_offset + ep
-        train_loss = train_one_epoch(
+        train_loss, aux_losses = train_one_epoch(
             train_model, train_loader, train_sampler,
             optimizer, scheduler, device, global_epoch, args,
             teacher=teacher, step_per_batch=step_per_batch,
@@ -596,8 +606,10 @@ def finetune(model, teacher, train_loader, train_sampler, val_loader,
         if is_main():
             eval_model = train_model.module if isinstance(train_model, DDP) else train_model
             acc_ft, loss_ft = validate(eval_model, val_loader, device, args.model_type)
+            aux_str = " ".join(f"{k}={v:.4f}" for k, v in aux_losses.items()) if aux_losses else ""
             log_info(f"{phase} ep {ep+1}/{epochs}: "
-                     f"train_loss={train_loss:.4f}, val_acc={acc_ft:.4f}")
+                     f"train_loss={train_loss:.4f}, val_acc={acc_ft:.4f}"
+                     f"{' | ' + aux_str if aux_str else ''}")
 
             if acc_ft > best_acc:
                 best_acc = acc_ft
@@ -644,9 +656,17 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
         log_info(f"{'='*60}")
 
         # 1. Create importance and collect stats (VBP only)
-        imp = build_importance(args.criterion, norm_per_layer=args.norm_per_layer)
+        imp = build_importance(args.criterion, norm_per_layer=args.norm_per_layer,
+                               importance_mode=getattr(args, 'importance_mode', 'variance'))
         if is_vbp:
             collect_and_sync_stats(model, train_loader, device, imp, args)
+            # Set consumer weight norms for weight×variance mode
+            if getattr(args, 'importance_mode', 'variance') == 'weight_variance':
+                w_map = build_consumer_weight_map(model, args.model_type,
+                                                   architecture=getattr(args, 'cnn_arch', None))
+                if w_map:
+                    imp.set_weight_norms(w_map)
+                    log_info(f"Weight×variance mode: set weight norms for {len(w_map)} layers")
 
             if is_main():
                 var_metrics = compute_variance_entropy(imp)
@@ -894,6 +914,9 @@ def parse_args():
     prune_group.add_argument("--criterion", default="variance",
                              choices=["variance", "magnitude", "lamp", "random"],
                              help="Importance criterion (variance=VBP, others use BasePruner)")
+    prune_group.add_argument("--importance_mode", default="variance",
+                             choices=["variance", "weight_variance"],
+                             help="Importance scoring: variance (σ²) or weight_variance (||W_fc2[:,k]||·σ_k)")
 
     # Fine-tuning
     ft_group = parser.add_argument_group("Fine-tuning")
