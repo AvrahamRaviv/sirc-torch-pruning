@@ -196,13 +196,15 @@ class BaseReparamManager(ABC):
     """
 
     def __init__(self, model, target_names, device, lambda_reg=0.01,
-                 max_batches=200, scale_invariant=False):
+                 max_batches=200, scale_invariant=False, reparam_target="fc2"):
         if not target_names:
             raise ValueError("target_names cannot be empty")
         if max_batches <= 0:
             raise ValueError(f"max_batches must be positive, got {max_batches}")
         if lambda_reg < 0:
             raise ValueError(f"lambda_reg must be non-negative, got {lambda_reg}")
+        if reparam_target not in ("fc1", "fc2"):
+            raise ValueError(f"reparam_target must be 'fc1' or 'fc2', got {reparam_target}")
 
         self.model = model
         self.target_names = target_names
@@ -210,6 +212,10 @@ class BaseReparamManager(ABC):
         self.lambda_reg = lambda_reg
         self.max_batches = max_batches
         self.scale_invariant = scale_invariant
+        self.reparam_target = reparam_target
+        # fc2: column norms (dim=0) → per input channel (= intermediate dim)
+        # fc1: row norms (dim=1) → per output channel (= intermediate dim)
+        self.norm_dim = 1 if reparam_target == "fc1" else 0
         self._active = False
         self._reparam_modules = OrderedDict()  # name → reparam module
 
@@ -227,18 +233,19 @@ class BaseReparamManager(ABC):
 
         for name, module in targets.items():
             reparam = self._make_reparam(module, cal_dict[name])
-            # Store initial column norms for scale-invariant L_{2,1}
+            # Store initial norms for scale-invariant L_{2,1}
             if self.scale_invariant:
                 w = _residual_weight(reparam)
-                init_col_norms = w.detach().flatten(1).norm(p=2, dim=0).clamp(min=EPSILON)
-                reparam.register_buffer('v_init_col_norms', init_col_norms)
+                init_norms = w.detach().flatten(1).norm(p=2, dim=self.norm_dim).clamp(min=EPSILON)
+                reparam.register_buffer('v_init_norms', init_norms)
             self._replace_module(name, reparam)
             self._reparam_modules[name] = reparam
 
         self._active = True
         cls_name = type(self).__name__
-        logger.info(f"{cls_name}: reparameterized {len(targets)} modules"
-                     f"{' (scale-invariant)' if self.scale_invariant else ''}")
+        logger.info(f"{cls_name}: reparameterized {len(targets)} {self.reparam_target} modules"
+                     f"{' (scale-invariant)' if self.scale_invariant else ''}"
+                     f" [norm_dim={self.norm_dim}]")
 
     def merge_back(self):
         """Restore standard nn.Linear/nn.Conv2d from reparam modules."""
@@ -264,11 +271,11 @@ class BaseReparamManager(ABC):
         return ids
 
     def save_vnorm_snapshot(self, save_dir):
-        """Save per-input-channel residual-weight norms as .pt file."""
+        """Save per-channel residual-weight norms as .pt file."""
         vnorms = OrderedDict()
         for name, reparam in self._reparam_modules.items():
             w = _residual_weight(reparam).detach()
-            vnorms[name] = w.flatten(1).norm(p=2, dim=0).cpu()
+            vnorms[name] = w.flatten(1).norm(p=2, dim=self.norm_dim).cpu()
         self._last_vnorms = vnorms
 
         os.makedirs(save_dir, exist_ok=True)
@@ -279,7 +286,8 @@ class BaseReparamManager(ABC):
     def log_channel_stats(self):
         """Log per-layer residual-weight norm summary (one line per layer)."""
         stats = self.channel_stats()
-        logger.info("V-norm stats (column-wise, per input channel):")
+        axis_desc = "row-wise, per output channel" if self.norm_dim == 1 else "column-wise, per input channel"
+        logger.info(f"V-norm stats ({axis_desc}):")
         for name, s in stats.items():
             short = name.split('.')[-2] + '.' + name.split('.')[-1] if '.' in name else name
             logger.info(
@@ -448,10 +456,11 @@ class MeanResidualManager(BaseReparamManager):
     """
 
     def __init__(self, model, target_names, device, lambda_reg=0.01, max_batches=200,
-                 normalize=False, scale_invariant=False):
+                 normalize=False, scale_invariant=False, reparam_target="fc2"):
         super().__init__(model, target_names, device, lambda_reg=lambda_reg,
                          max_batches=max_batches,
-                         scale_invariant=(normalize or scale_invariant))
+                         scale_invariant=(normalize or scale_invariant),
+                         reparam_target=reparam_target)
 
     # Backward-compat alias
     def refresh_mu(self, loader):
@@ -516,26 +525,28 @@ class MeanResidualManager(BaseReparamManager):
         logger.info("MeanResidualManager: refreshed μ_x (function-preserving)")
 
     def regularization_loss(self):
-        """Column-wise L_{2,1} regularization on V: λ · Σ_l Σ_k ||V[:,k]^(l)||_2.
+        """L_{2,1} regularization on V along self.norm_dim.
 
-        If scale_invariant=True, each column norm is divided by its initial value.
+        fc2 (dim=0): column norms → per input channel (intermediate dim).
+        fc1 (dim=1): row norms → per output channel (intermediate dim).
+        If scale_invariant=True, each norm is divided by its initial value.
         """
         loss = torch.tensor(0.0, device=self.device)
         for reparam in self._reparam_modules.values():
             v = reparam.v
-            col_norms = v.flatten(1).norm(p=2, dim=0)
-            if self.scale_invariant and hasattr(reparam, 'v_init_col_norms'):
-                loss = loss + (col_norms / reparam.v_init_col_norms).sum()
+            norms = v.flatten(1).norm(p=2, dim=self.norm_dim)
+            if self.scale_invariant and hasattr(reparam, 'v_init_norms'):
+                loss = loss + (norms / reparam.v_init_norms).sum()
             else:
-                loss = loss + col_norms.sum()
+                loss = loss + norms.sum()
         return self.lambda_reg * loss
 
     def channel_stats(self):
-        """Per-layer V-norm statistics (column-wise, per input channel)."""
+        """Per-layer V-norm statistics along self.norm_dim."""
         stats = OrderedDict()
         for name, reparam in self._reparam_modules.items():
             v = reparam.v.detach()
-            col_norms = v.flatten(1).norm(p=2, dim=0)
+            col_norms = v.flatten(1).norm(p=2, dim=self.norm_dim)
             m = reparam.m.detach()
             stats[name] = {
                 'v_col_norm_mean': col_norms.mean().item(),
@@ -569,9 +580,10 @@ class NormalizedResidualManager(BaseReparamManager):
     """
 
     def __init__(self, model, target_names, device, lambda_reg=0.01, max_batches=200,
-                 scale_invariant=False, entropy_lambda=0.0):
+                 scale_invariant=False, entropy_lambda=0.0, reparam_target="fc2"):
         super().__init__(model, target_names, device, lambda_reg=lambda_reg,
-                         max_batches=max_batches, scale_invariant=scale_invariant)
+                         max_batches=max_batches, scale_invariant=scale_invariant,
+                         reparam_target=reparam_target)
         self._entropy_lambda = entropy_lambda
 
     def _calibrate(self, targets, loader):
@@ -733,15 +745,15 @@ class NormalizedResidualManager(BaseReparamManager):
         logger.info("NormalizedResidualManager: refreshed μ_x, σ_x (function-preserving)")
 
     def regularization_loss(self):
-        """Column-wise L_{2,1} on Ṽ: λ · Σ_l Σ_k ||Ṽ[:,k]^(l)||_2."""
+        """L_{2,1} on Ṽ along self.norm_dim."""
         loss = torch.tensor(0.0, device=self.device)
         for reparam in self._reparam_modules.values():
             v = reparam.v_tilde
-            col_norms = v.flatten(1).norm(p=2, dim=0)
-            if self.scale_invariant and hasattr(reparam, 'v_init_col_norms'):
-                loss = loss + (col_norms / reparam.v_init_col_norms).sum()
+            norms = v.flatten(1).norm(p=2, dim=self.norm_dim)
+            if self.scale_invariant and hasattr(reparam, 'v_init_norms'):
+                loss = loss + (norms / reparam.v_init_norms).sum()
             else:
-                loss = loss + col_norms.sum()
+                loss = loss + norms.sum()
         return self.lambda_reg * loss
 
     def entropy_loss(self):
@@ -757,27 +769,24 @@ class NormalizedResidualManager(BaseReparamManager):
         loss = torch.tensor(0.0, device=self.device)
         for reparam in self._reparam_modules.values():
             v = reparam.v_tilde
-            if v.dim() == 2:  # Linear [out, in]
-                norms_sq = v.norm(p=2, dim=0) ** 2
-            else:  # Conv2d [C_out, C_in, kH, kW]
-                norms_sq = v.reshape(v.shape[0], v.shape[1], -1).norm(p=2, dim=(0, 2)) ** 2
+            norms_sq = v.flatten(1).norm(p=2, dim=self.norm_dim) ** 2
             p = norms_sq / (norms_sq.sum() + EPSILON)
             loss = loss - (p * (p + EPSILON).log()).sum()
         return self._entropy_lambda * loss
 
     def channel_stats(self):
-        """Per-layer dual reporting: Ṽ column norms AND w_eff column norms."""
+        """Per-layer dual reporting: Ṽ norms AND w_eff norms along self.norm_dim."""
         stats = OrderedDict()
         for name, reparam in self._reparam_modules.items():
             vt = reparam.v_tilde.detach()
-            vt_col_norms = vt.flatten(1).norm(p=2, dim=0)
+            vt_col_norms = vt.flatten(1).norm(p=2, dim=self.norm_dim)
 
             # w_eff = v_tilde / sigma_x
             if hasattr(reparam, 'in_features'):
                 w_eff = vt / reparam.sigma_x[None, :]
             else:
                 w_eff = vt / reparam.sigma_x[None, :, None, None]
-            weff_col_norms = w_eff.flatten(1).norm(p=2, dim=0)
+            weff_col_norms = w_eff.flatten(1).norm(p=2, dim=self.norm_dim)
 
             m = reparam.m.detach()
             stats[name] = {

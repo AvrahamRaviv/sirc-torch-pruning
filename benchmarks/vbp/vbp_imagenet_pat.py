@@ -88,7 +88,8 @@ def build_pruning_config(args, model, config_dir):
     end_epoch = start_epoch + (args.pat_steps - 1) * epoch_rate
 
     reparam_layers = build_reparam_layers(model, args.model_type,
-                                           getattr(args, 'cnn_arch', None))
+                                           getattr(args, 'cnn_arch', None),
+                                           reparam_target=getattr(args, 'reparam_target', 'fc2'))
 
     config = {
         "channel_sparsity_args": {
@@ -130,6 +131,7 @@ def build_pruning_config(args, model, config_dir):
             "reparam_normalize": getattr(args, 'reparam_normalize', False),
             "reparam_entropy_lambda": getattr(args, 'reparam_entropy_lambda', 0.0),
             "reparam_during_pat": getattr(args, 'reparam_during_pat', False),
+            "reparam_target": getattr(args, 'reparam_target', 'fc2'),
         },
         "slice_sparsity_args": None,
     }
@@ -534,7 +536,9 @@ def parse_args():
     parser.add_argument("--reparam_refresh_interval", type=int, default=1,
                         help="Re-estimate μ_x every N epochs (0 = never)")
     parser.add_argument("--reparam_normalize", action="store_true",
-                        help="Normalize L_{2,1} by initial column norms (scale-invariant)")
+                        help="Normalize L_{2,1} by initial norms (scale-invariant)")
+    parser.add_argument("--reparam_target", default="fc2", choices=["fc1", "fc2"],
+                        help="Which layer to reparameterize: fc1 (upstream, row norms) or fc2 (downstream, col norms)")
     parser.add_argument("--reparam_entropy_lambda", type=float, default=0.0,
                         help="Entropy regularization strength for VNR mode")
 
