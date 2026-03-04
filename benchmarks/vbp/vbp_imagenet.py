@@ -231,17 +231,20 @@ def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
     """
     from torch_pruning.utils.reparam import MeanResidualManager
 
+    reparam_target = getattr(args, 'reparam_target', 'fc2')
     target_names = build_reparam_layers(
         model, args.model_type,
-        architecture=getattr(args, 'cnn_arch', None))
-    log_info(f"Reparam pre-training: {len(target_names)} layers, "
+        architecture=getattr(args, 'cnn_arch', None),
+        reparam_target=reparam_target)
+    log_info(f"Reparam pre-training: {len(target_names)} {reparam_target} layers, "
              f"epochs={args.epochs_sparse}, λ={args.reparam_lambda}")
 
     mgr = MeanResidualManager(
         model, target_names, device,
         lambda_reg=args.reparam_lambda,
         max_batches=args.max_batches,
-        normalize=getattr(args, 'reparam_normalize', False))
+        normalize=getattr(args, 'reparam_normalize', False),
+        reparam_target=reparam_target)
     mgr.reparameterize(train_loader)
 
     # Wrap in DDP for training
@@ -691,14 +694,17 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
                            and epochs_per_step > 0)
         if use_reparam_pat:
             from torch_pruning.utils.reparam import MeanResidualManager
+            pat_reparam_target = getattr(args, 'reparam_target', 'fc2')
             target_names = build_reparam_layers(
                 model, args.model_type,
-                architecture=getattr(args, 'cnn_arch', None))
+                architecture=getattr(args, 'cnn_arch', None),
+                reparam_target=pat_reparam_target)
             pat_reparam_mgr = MeanResidualManager(
                 model, target_names, device,
                 lambda_reg=args.reparam_lambda,
                 max_batches=args.max_batches,
-                normalize=getattr(args, 'reparam_normalize', False))
+                normalize=getattr(args, 'reparam_normalize', False),
+                reparam_target=pat_reparam_target)
             pat_reparam_mgr.reparameterize(train_loader)
             pat_aux_fn = pat_reparam_mgr.regularization_loss
             log_info(f"PAT-{step_i+1}: reparam active with λ={args.reparam_lambda}")
@@ -943,7 +949,9 @@ def parse_args():
     sparse_group.add_argument("--reparam_refresh_interval", type=int, default=1,
                               help="Re-estimate μ_x every N epochs (0 = never)")
     sparse_group.add_argument("--reparam_normalize", action="store_true",
-                              help="Normalize L_{2,1} by initial column norms (scale-invariant)")
+                              help="Normalize L_{2,1} by initial norms (scale-invariant)")
+    sparse_group.add_argument("--reparam_target", default="fc2", choices=["fc1", "fc2"],
+                              help="Which layer to reparameterize: fc1 (upstream, row norms) or fc2 (downstream, col norms)")
 
     # DDP
     ddp_group = parser.add_argument_group("Distributed")

@@ -212,6 +212,7 @@ class ChannelPruning:
         self._reparam_layers = self.channel_sparsity_args.get("reparam_layers", self.layers_to_prune)
         self._reparam_entropy_lambda = self.channel_sparsity_args.get("reparam_entropy_lambda", 0.0)
         self._reparam_during_pat = self.channel_sparsity_args.get("reparam_during_pat", False)
+        self._reparam_target = self.channel_sparsity_args.get("reparam_target", "fc2")
         self._similarity_discount = self.channel_sparsity_args.get("similarity_discount", False)
         self._post_stats_hook = post_stats_hook  # callable(cp, model) — called after stats collection (e.g., DDP sync)
 
@@ -464,14 +465,16 @@ class ChannelPruning:
                         lambda_reg=self._reparam_lambda,
                         max_batches=self._vbp_max_batches,
                         scale_invariant=self._reparam_normalize,
-                        entropy_lambda=self._reparam_entropy_lambda)
+                        entropy_lambda=self._reparam_entropy_lambda,
+                        reparam_target=self._reparam_target)
                 else:
                     from torch_pruning.utils.reparam import MeanResidualManager
                     self._reparam_manager = MeanResidualManager(
                         model, self._reparam_layers, self.device,
                         lambda_reg=self._reparam_lambda,
                         max_batches=self._vbp_max_batches,
-                        normalize=self._reparam_normalize)
+                        normalize=self._reparam_normalize,
+                        reparam_target=self._reparam_target)
                 self._reparam_manager.reparameterize(loader)
                 self._model_changed = True
             return
@@ -624,14 +627,16 @@ class ChannelPruning:
                     lambda_reg=self._reparam_lambda,
                     max_batches=self._vbp_max_batches,
                     scale_invariant=self._reparam_normalize,
-                    entropy_lambda=self._reparam_entropy_lambda)
+                    entropy_lambda=self._reparam_entropy_lambda,
+                    reparam_target=self._reparam_target)
             else:
                 from torch_pruning.utils.reparam import MeanResidualManager
                 self._reparam_manager = MeanResidualManager(
                     model, self._reparam_layers, self.device,
                     lambda_reg=self._reparam_lambda,
                     max_batches=self._vbp_max_batches,
-                    normalize=self._reparam_normalize)
+                    normalize=self._reparam_normalize,
+                    reparam_target=self._reparam_target)
             self._reparam_manager.reparameterize(loader)
             self._model_changed = True
             _log(log, f" Reparam active between PAT steps (λ={self._reparam_lambda})")

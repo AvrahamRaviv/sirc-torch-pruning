@@ -355,28 +355,37 @@ class VarianceConcentrationHooks:
 # ---------------------------------------------------------------------------
 # Layer name helpers
 # ---------------------------------------------------------------------------
-def build_reparam_layers(model, model_type, architecture=None):
-    """Return downstream layer names for reparam (fc2 / pwconv2)."""
+def build_reparam_layers(model, model_type, architecture=None, reparam_target="fc2"):
+    """Return layer names for reparam.
+
+    Args:
+        reparam_target: "fc2" (downstream/output layer) or "fc1" (upstream/intermediate layer).
+    """
     layers = []
     if model_type == "vit":
+        suffix = ".output.dense" if reparam_target == "fc2" else ".intermediate.dense"
         for name, m in model.named_modules():
-            if name.endswith(".output.dense") and ".attention." not in name:
+            if name.endswith(suffix) and ".attention." not in name:
                 layers.append(name)
     elif model_type == "convnext":
+        attr = "pwconv2" if reparam_target == "fc2" else "pwconv1"
         for name, m in model.named_modules():
-            if hasattr(m, "pwconv2"):
-                layers.append(name + ".pwconv2")
+            if hasattr(m, attr):
+                layers.append(name + "." + attr)
     elif model_type == "cnn":
         if architecture and "mobilenet" in architecture.lower():
-            # MNV2 projection convs: 1×1 pointwise that narrows expanded → residual
             for name, m in model.named_modules():
-                if isinstance(m, nn.Conv2d) and m.groups == 1 \
-                   and m.kernel_size == (1, 1) and m.in_channels > m.out_channels:
-                    layers.append(name)
+                if not isinstance(m, nn.Conv2d) or m.groups != 1 or m.kernel_size != (1, 1):
+                    continue
+                if reparam_target == "fc2" and m.in_channels > m.out_channels:
+                    layers.append(name)  # project conv (narrows)
+                elif reparam_target == "fc1" and m.out_channels > m.in_channels:
+                    layers.append(name)  # expand conv (widens)
         else:
-            # ResNet Bottleneck: conv3 = 1×1 that expands mid → residual
+            # ResNet Bottleneck: fc2=conv3 (expand), fc1=conv1 (reduce)
+            suffix = "conv3" if reparam_target == "fc2" else "conv1"
             for name, m in model.named_modules():
-                if isinstance(m, nn.Conv2d) and name.endswith("conv3") \
+                if isinstance(m, nn.Conv2d) and name.endswith(suffix) \
                    and m.kernel_size == (1, 1) and m.groups == 1:
                     layers.append(name)
     return layers
