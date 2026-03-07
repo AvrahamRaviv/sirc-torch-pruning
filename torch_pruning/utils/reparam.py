@@ -6,18 +6,18 @@ Two variants, both sharing the BaseReparamManager ABC:
    Decomposes z = W^T x + b into z = m + V^T(x - μ_x), regularizes V → 0.
    Drives activation variance → 0 while preserving learned means m.
 
-2. **NormalizedResidualManager** (VNR, σ-inverted):
-   Stores Ṽ = W/σ_x as trainable parameter, forward computes w_eff = Ṽ·σ_x = W.
-   Regularizing Ṽ → 0 penalizes channels INVERSELY proportional to σ_x:
-   ‖Ṽ[:,k]‖ = ‖W[:,k]‖/σ_k → high-σ channels have SMALL Ṽ norms → protected.
-   Task gradient ∝ σ_k → high-σ channels amplified in learning signal.
+2. **NormalizedResidualManager** (VNR, BN-equivalent):
+   Stores Ṽ = W·σ_x as trainable parameter, forward computes w_eff = Ṽ/σ_x = W.
+   Equivalent to inserting BN(affine=False) before the layer:
+   ‖Ṽ[:,k]‖ = σ_k·‖W[:,k]‖ measures variance contribution directly.
+   Compensation blocked: inflating σ upstream increases ‖Ṽ‖ → more penalty.
 
 Training-time only — merge_back() restores standard nn.Linear/nn.Conv2d before
 pruning so the TP dependency graph, pruner, and compensation code stay untouched.
 
 Efficiency: uses the effective-bias trick to avoid materializing centered/normalized inputs:
     MeanResidual:     z = F.linear(x, V, m - V @ μ_x)
-    NormalizedResidual: z = F.linear(x, Ṽ·σ_x, m - (Ṽ·σ_x) @ μ_x)
+    NormalizedResidual: z = F.linear(x, Ṽ/σ_x, m - (Ṽ/σ_x) @ μ_x)
 Overhead is O(out × in) per layer per batch for the bias, negligible vs matmul.
 """
 
@@ -108,9 +108,9 @@ class MeanResidualConv2d(nn.Module):
 
 
 class NormalizedResidualLinear(nn.Module):
-    """Linear layer with σ-inverted reparameterization: Ṽ = W/σ_x.
+    """BN-equivalent reparameterization: Ṽ = W·σ_x (normalized-input weight).
 
-    Forward: w_eff = Ṽ · σ_x = W, b_eff = m - w_eff @ μ_x, z = F.linear(x, w_eff, b_eff)
+    Forward: w_eff = Ṽ / σ_x = W, b_eff = m - w_eff @ μ_x, z = F.linear(x, w_eff, b_eff)
     """
 
     def __init__(self, in_features, out_features, v_tilde, m, mu_x, sigma_x):
@@ -123,13 +123,13 @@ class NormalizedResidualLinear(nn.Module):
         self.register_buffer('sigma_x', sigma_x)  # [in] — input std
 
     def forward(self, x):
-        w_eff = self.v_tilde * self.sigma_x[None, :]  # [out, in]
+        w_eff = self.v_tilde / self.sigma_x[None, :]  # [out, in]
         eff_bias = self.m - w_eff @ self.mu_x          # [out]
         return F.linear(x, w_eff, eff_bias)
 
     def merge_params(self):
         """Return (weight, bias) in standard nn.Linear convention."""
-        w = self.v_tilde.data * self.sigma_x[None, :]
+        w = self.v_tilde.data / self.sigma_x[None, :]
         bias = (self.m - w @ self.mu_x).data.clone()
         return w.clone(), bias
 
@@ -138,7 +138,7 @@ class NormalizedResidualLinear(nn.Module):
 
 
 class NormalizedResidualConv2d(nn.Module):
-    """Conv2d (groups=1) with σ-inverted reparameterization: Ṽ = W/σ_x.
+    """Conv2d (groups=1) BN-equivalent reparameterization: Ṽ = W·σ_x.
 
     σ_x broadcast: [None, :, None, None] for [C_out, C_in, kH, kW].
     """
@@ -160,7 +160,7 @@ class NormalizedResidualConv2d(nn.Module):
 
     def forward(self, x):
         sigma_bc = self.sigma_x[None, :, None, None]           # [1, C_in, 1, 1]
-        w_eff = self.v_tilde * sigma_bc                         # [C_out, C_in, kH, kW]
+        w_eff = self.v_tilde / sigma_bc                         # [C_out, C_in, kH, kW]
         eff_bias = self.m - w_eff.sum(dim=(2, 3)) @ self.mu_x  # [C_out]
         return F.conv2d(x, w_eff, eff_bias, self.stride, self.padding,
                         self.dilation, self.groups)
@@ -168,7 +168,7 @@ class NormalizedResidualConv2d(nn.Module):
     def merge_params(self):
         """Return (weight, bias) in standard nn.Conv2d convention."""
         sigma_bc = self.sigma_x[None, :, None, None]
-        w = (self.v_tilde.data * sigma_bc).clone()
+        w = (self.v_tilde.data / sigma_bc).clone()
         bias = (self.m - w.sum(dim=(2, 3)) @ self.mu_x).data.clone()
         return w, bias
 
@@ -594,10 +594,11 @@ class MeanResidualManager(BaseReparamManager):
 # =====================================================================
 
 class NormalizedResidualManager(BaseReparamManager):
-    """σ-inverted reparameterization: Ṽ = W/σ_x, w_eff = Ṽ·σ_x = W.
+    """BN-equivalent reparameterization: Ṽ = W·σ_x, w_eff = Ṽ/σ_x = W.
 
-    L_{2,1} on Ṽ penalizes inversely to σ_x: high-σ channels have small Ṽ norms → protected.
-    Task gradient ∝ σ_k → high-σ channels amplified.
+    Equivalent to inserting BN(affine=False) before the layer. After normalization,
+    ‖Ṽ[:,k]‖ = σ_k·‖W[:,k]‖ measures variance contribution directly.
+    Compensation blocked: inflating σ upstream increases ‖Ṽ‖ → more penalty.
     Optional entropy_loss encourages uniform Ṽ column norms → balanced pruning.
 
     Usage:
@@ -703,8 +704,8 @@ class NormalizedResidualManager(BaseReparamManager):
             W = module.weight.data.clone()  # [out, in]
             b = module.bias.data.clone() if module.bias is not None else torch.zeros(
                 module.out_features, device=self.device)
-            # v_tilde = W / sigma_x so that w_eff = v_tilde * sigma_x = W
-            v_tilde = W / sigma_x[None, :]
+            # v_tilde = W * sigma_x so that w_eff = v_tilde / sigma_x = W
+            v_tilde = W * sigma_x[None, :]
             m = b + W @ mu_x
             reparam = NormalizedResidualLinear(
                 module.in_features, module.out_features,
@@ -716,7 +717,7 @@ class NormalizedResidualManager(BaseReparamManager):
             b = module.bias.data.clone() if module.bias is not None else torch.zeros(
                 module.out_channels, device=self.device)
             sigma_bc = sigma_x[None, :, None, None]
-            v_tilde = W / sigma_bc
+            v_tilde = W * sigma_bc
             m = b + W.sum(dim=(2, 3)) @ mu_x
             reparam = NormalizedResidualConv2d(
                 module.in_channels, module.out_channels,
@@ -732,9 +733,9 @@ class NormalizedResidualManager(BaseReparamManager):
         """Re-estimate μ_x, σ_x (function-preserving).
 
         Steps:
-        1. Compute w_eff_old = v_tilde * sigma_old
+        1. Compute w_eff_old = v_tilde / sigma_old
         2. Calibrate new mu, sigma
-        3. v_tilde *= sigma_old / sigma_new  (preserve w_eff = v_tilde * sigma)
+        3. v_tilde *= sigma_new / sigma_old  (preserve w_eff = v_tilde / sigma)
         4. m += w_eff_old @ (mu_old - mu_new)
         5. Update buffers
         """
@@ -755,16 +756,16 @@ class NormalizedResidualManager(BaseReparamManager):
             with torch.no_grad():
                 # Step 1: effective weight before change
                 if hasattr(reparam, 'in_features'):  # Linear
-                    w_eff_old = reparam.v_tilde * sigma_old[None, :]
-                    # Step 3: rescale v_tilde (preserve w_eff = v_tilde * sigma)
-                    reparam.v_tilde.mul_(sigma_old[None, :] / sigma_new[None, :])
+                    w_eff_old = reparam.v_tilde / sigma_old[None, :]
+                    # Step 3: rescale v_tilde (preserve w_eff = v_tilde / sigma)
+                    reparam.v_tilde.mul_(sigma_new[None, :] / sigma_old[None, :])
                     # Step 4: adjust m
                     reparam.m.add_(w_eff_old @ (mu_old - mu_new))
                 elif hasattr(reparam, 'in_channels'):  # Conv2d
                     sigma_old_bc = sigma_old[None, :, None, None]
                     sigma_new_bc = sigma_new[None, :, None, None]
-                    w_eff_old = reparam.v_tilde * sigma_old_bc
-                    reparam.v_tilde.mul_(sigma_old_bc / sigma_new_bc)
+                    w_eff_old = reparam.v_tilde / sigma_old_bc
+                    reparam.v_tilde.mul_(sigma_new_bc / sigma_old_bc)
                     reparam.m.add_(w_eff_old.sum(dim=(2, 3)) @ (mu_old - mu_new))
 
                 # Step 5: update buffers
@@ -810,11 +811,11 @@ class NormalizedResidualManager(BaseReparamManager):
             vt = reparam.v_tilde.detach()
             vt_col_norms = vt.flatten(1).norm(p=2, dim=self.norm_dim)
 
-            # w_eff = v_tilde * sigma_x
+            # w_eff = v_tilde / sigma_x
             if hasattr(reparam, 'in_features'):
-                w_eff = vt * reparam.sigma_x[None, :]
+                w_eff = vt / reparam.sigma_x[None, :]
             else:
-                w_eff = vt * reparam.sigma_x[None, :, None, None]
+                w_eff = vt / reparam.sigma_x[None, :, None, None]
             weff_col_norms = w_eff.flatten(1).norm(p=2, dim=self.norm_dim)
 
             m = reparam.m.detach()
