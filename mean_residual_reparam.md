@@ -15,13 +15,13 @@ header-includes:
 
 VBP measures activation variance but has no training-time lever to push it down. Plain weight decay (WD) destroys both mean and variance. Mean-residual reparameterization ($V = W$, regularize $V$) separates mean from variance, but is **scale-blind**: all channels get equal penalty regardless of input scale $\sigma_{x,k}$. The network can **compensate** by inflating $\sigma$ upstream (e.g.\ via $\gamma$ in a preceding BN) while shrinking $V$, preserving variance without penalty.
 
-# VNR: Input Normalization via Reparameterization
+# VNR: Input Normalization via BN(affine=False)
 
-Normalize input channels to unit variance, equivalent to inserting $\text{BN}(\texttt{affine=False})$. Absorb $\sigma_x$ into the trainable weight:
+Inserts $\text{BN}(\texttt{affine=False})$ before the target layer. The trainable weight $\tilde{V} = W \cdot \sigma_\text{cal}$ operates on normalized input:
 
-$$\boxed{\tilde{V} = W \cdot \sigma_x, \qquad W_\text{eff} = \tilde{V} / \sigma_x = W} \qquad \text{(function-preserving)}$$
+$$\boxed{\mathbf{x}_\text{bn} = \text{BN}(\mathbf{x}), \qquad z_k = \tilde{V}_k^\top \mathbf{x}_\text{bn} + m_k} \qquad \text{(function-preserving at init)}$$
 
-With $m_k = b_k + \mathbf{w}_k^\top \boldsymbol{\mu}_x$, the forward pass computes $z_k = m_k + (\tilde{V}_k / \sigma_x)^\top (\mathbf{x} - \boldsymbol{\mu}_x)$. Weight magnitude **directly indicates importance**: $\|\tilde{V}_{:,k}\| = \sigma_k \cdot \|W_{:,k}\|$ measures the variance contribution of channel $k$.
+Initialization: $\tilde{V} = W \cdot \sigma_\text{cal}$, $m_k = b_k + \mathbf{w}_k^\top \boldsymbol{\mu}_\text{cal}$, BN running stats $= (\boldsymbol{\mu}_\text{cal}, \sigma_\text{cal}^2)$. Weight magnitude **directly indicates importance**: $\|\tilde{V}_{:,k}\| = \sigma_k \cdot \|W_{:,k}\|$ measures the variance contribution of channel $k$. BN auto-updates running stats during training — no frozen $\sigma$, no drift risk.
 
 \vspace{0.3cm}
 
@@ -58,10 +58,10 @@ With $m_k = b_k + \mathbf{w}_k^\top \boldsymbol{\mu}_x$, the forward pass comput
 \node[neuron] (rx2) at (0, -3.5) {$x_2$};
 \node[neuron] (rx3) at (0, -4.3) {$x_3$};
 
-% Normalization nodes
-\node[block, fill=green!8] (n1) at (1.4, -2.7) {$\frac{-\mu_1}{\sigma_1}$};
-\node[block, fill=green!8] (n2) at (1.4, -3.5) {$\frac{-\mu_2}{\sigma_2}$};
-\node[block, fill=green!8] (n3) at (1.4, -4.3) {$\frac{-\mu_3}{\sigma_3}$};
+% BN normalization nodes
+\node[block, fill=green!8] (n1) at (1.4, -2.7) {BN};
+\node[block, fill=green!8] (n2) at (1.4, -3.5) {BN};
+\node[block, fill=green!8] (n3) at (1.4, -4.3) {BN};
 
 % Residual weights -> sum
 \node[neuron, minimum size=0.7cm, fill=red!8] (rsum) at (3.8, -3.8) {$\Sigma$};
@@ -96,7 +96,7 @@ With $m_k = b_k + \mathbf{w}_k^\top \boldsymbol{\mu}_x$, the forward pass comput
     (2.8, -4.7) -- node[below=3pt, font=\scriptsize, text=red!60!black] {$\|\tilde{V}_k\| = \sigma_k \|W_k\| \to 0$} (5.0, -4.7);
 
 % Compensation-blocked annotation — below brace
-\node[annot, text=green!50!black, font=\scriptsize\itshape] at (1.4, -5.5) {normalization blocks $\sigma$ compensation};
+\node[annot, text=green!50!black, font=\scriptsize\itshape] at (1.4, -5.5) {BN(affine=False) blocks $\sigma$ compensation};
 
 \end{tikzpicture}
 \end{center}
@@ -123,11 +123,7 @@ $$\mathcal{L} = \mathcal{L}_\text{task}(\theta) \;+\; \lambda \sum_{l} \sum_{k} 
 
 Standard WD is **disabled** for $m_k$ and $\tilde{V}$; other parameters keep normal WD.
 
-**$\boldsymbol{\mu}_x, \boldsymbol{\sigma}_x$ refresh** (function-preserving, every $N$ epochs). When statistics drift during PAT:
-
-$$\tilde{V} \leftarrow \tilde{V} \cdot \frac{\sigma_x'}{\sigma_x}, \qquad m_k \leftarrow m_k + W_{\text{eff},k}^\top (\boldsymbol{\mu}_x - \boldsymbol{\mu}_x')$$
-
-This preserves $W_\text{eff} = \tilde{V}/\sigma_x$. With real BN the compensation block is exact (recomputed every batch); with frozen $\sigma_x$ it is approximate, mitigated by refresh.
+**Statistics update**: BN(affine=False) auto-updates running mean and variance during training (exponential moving average, momentum=0.1). No manual `refresh_stats` needed — the normalization is exact per-batch, eliminating σ drift.
 
 # Pruning
 
