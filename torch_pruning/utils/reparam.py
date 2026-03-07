@@ -6,19 +6,19 @@ Two variants, both sharing the BaseReparamManager ABC:
    Decomposes z = W^T x + b into z = m + V^T(x - μ_x), regularizes V → 0.
    Drives activation variance → 0 while preserving learned means m.
 
-2. **NormalizedResidualManager** (VNR, BN-equivalent):
-   Stores Ṽ = W·σ_x as trainable parameter, forward computes w_eff = Ṽ/σ_x = W.
-   Equivalent to inserting BN(affine=False) before the layer:
-   ‖Ṽ[:,k]‖ = σ_k·‖W[:,k]‖ measures variance contribution directly.
-   Compensation blocked: inflating σ upstream increases ‖Ṽ‖ → more penalty.
+2. **NormalizedResidualManager** (VNR, BN-based):
+   Inserts BN(affine=False) before the target layer. The trainable weight
+   v_tilde = W·σ_cal operates on normalized input → ‖v_tilde[:,k]‖ directly
+   measures importance. BN auto-updates stats during training (no frozen σ,
+   no refresh needed). Compensation blocked: inflating σ upstream increases
+   ‖Ṽ‖ → more penalty.
 
 Training-time only — merge_back() restores standard nn.Linear/nn.Conv2d before
 pruning so the TP dependency graph, pruner, and compensation code stay untouched.
 
-Efficiency: uses the effective-bias trick to avoid materializing centered/normalized inputs:
-    MeanResidual:     z = F.linear(x, V, m - V @ μ_x)
-    NormalizedResidual: z = F.linear(x, Ṽ/σ_x, m - (Ṽ/σ_x) @ μ_x)
-Overhead is O(out × in) per layer per batch for the bias, negligible vs matmul.
+Efficiency:
+    MeanResidual:     z = F.linear(x, V, m - V @ μ_x)  (effective-bias trick)
+    BNResidual:       z = F.linear(BN(x), v_tilde, m)   (actual BN normalization)
 """
 
 import logging
@@ -107,44 +107,54 @@ class MeanResidualConv2d(nn.Module):
                 f'padding={self.padding} [MeanResidual]')
 
 
-class NormalizedResidualLinear(nn.Module):
-    """BN-equivalent reparameterization: Ṽ = W·σ_x (normalized-input weight).
+class BNResidualLinear(nn.Module):
+    """BN(affine=False) + Linear with mean-residual decomposition.
 
-    Forward: w_eff = Ṽ / σ_x = W, b_eff = m - w_eff @ μ_x, z = F.linear(x, w_eff, b_eff)
+    Forward: x_bn = BN(x), z = F.linear(x_bn, v_tilde, m)
+    BN normalizes input to ~unit variance → ‖v_tilde[:,k]‖ directly measures importance.
     """
 
-    def __init__(self, in_features, out_features, v_tilde, m, mu_x, sigma_x):
+    def __init__(self, in_features, out_features, v_tilde, m, bn_running_mean, bn_running_var):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.v_tilde = nn.Parameter(v_tilde)  # [out, in] — normalized residual weights
+        self.bn = nn.BatchNorm1d(in_features, affine=False)
+        self.bn.running_mean.copy_(bn_running_mean)
+        self.bn.running_var.copy_(bn_running_var)
+        self.v_tilde = nn.Parameter(v_tilde)  # [out, in] — operates on normalized input
         self.m = nn.Parameter(m)              # [out] — channel means
-        self.register_buffer('mu_x', mu_x)    # [in] — input mean
-        self.register_buffer('sigma_x', sigma_x)  # [in] — input std
 
     def forward(self, x):
-        w_eff = self.v_tilde / self.sigma_x[None, :]  # [out, in]
-        eff_bias = self.m - w_eff @ self.mu_x          # [out]
-        return F.linear(x, w_eff, eff_bias)
+        # Handle 3D [B, T, D] for ViT
+        if x.dim() == 3:
+            B, T, D = x.shape
+            x_bn = self.bn(x.reshape(B * T, D)).reshape(B, T, D)
+        else:
+            x_bn = self.bn(x)
+        return F.linear(x_bn, self.v_tilde, self.m)
 
     def merge_params(self):
-        """Return (weight, bias) in standard nn.Linear convention."""
-        w = self.v_tilde.data / self.sigma_x[None, :]
-        bias = (self.m - w @ self.mu_x).data.clone()
-        return w.clone(), bias
+        """Recover standard (weight, bias) using BN running stats."""
+        sigma = torch.sqrt(self.bn.running_var + self.bn.eps)
+        mu = self.bn.running_mean
+        w_eff = self.v_tilde.data / sigma[None, :]
+        b_eff = self.m.data - w_eff @ mu
+        return w_eff.clone(), b_eff.clone()
 
     def extra_repr(self):
-        return f'in_features={self.in_features}, out_features={self.out_features} [NormalizedResidual]'
+        return f'in_features={self.in_features}, out_features={self.out_features} [BNResidual]'
 
 
-class NormalizedResidualConv2d(nn.Module):
-    """Conv2d (groups=1) BN-equivalent reparameterization: Ṽ = W·σ_x.
+class BNResidualConv2d(nn.Module):
+    """BN2d(affine=False) stats tracker + Conv2d with effective-bias trick.
 
-    σ_x broadcast: [None, :, None, None] for [C_out, C_in, kH, kW].
+    BN auto-updates running stats during training (no frozen σ).
+    Forward uses the effective-bias trick (not actual BN normalization)
+    to avoid padding artifacts at borders.
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
-                 dilation, groups, v_tilde, m, mu_x, sigma_x):
+                 dilation, groups, v_tilde, m, bn_running_mean, bn_running_var):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -153,29 +163,39 @@ class NormalizedResidualConv2d(nn.Module):
         self.padding = padding
         self.dilation = dilation
         self.groups = groups
+        self.bn = nn.BatchNorm2d(in_channels, affine=False)
+        self.bn.running_mean.copy_(bn_running_mean)
+        self.bn.running_var.copy_(bn_running_var)
         self.v_tilde = nn.Parameter(v_tilde)  # [C_out, C_in, kH, kW]
         self.m = nn.Parameter(m)              # [C_out]
-        self.register_buffer('mu_x', mu_x)    # [C_in]
-        self.register_buffer('sigma_x', sigma_x)  # [C_in]
 
     def forward(self, x):
-        sigma_bc = self.sigma_x[None, :, None, None]           # [1, C_in, 1, 1]
-        w_eff = self.v_tilde / sigma_bc                         # [C_out, C_in, kH, kW]
-        eff_bias = self.m - w_eff.sum(dim=(2, 3)) @ self.mu_x  # [C_out]
+        # Update BN running stats in training mode (no gradient, discard output)
+        if self.training:
+            with torch.no_grad():
+                self.bn(x)
+        # Use effective-bias trick (avoids padding border artifacts)
+        sigma = torch.sqrt(self.bn.running_var + self.bn.eps)
+        mu = self.bn.running_mean
+        sigma_bc = sigma[None, :, None, None]
+        w_eff = self.v_tilde / sigma_bc
+        eff_bias = self.m - w_eff.sum(dim=(2, 3)) @ mu
         return F.conv2d(x, w_eff, eff_bias, self.stride, self.padding,
                         self.dilation, self.groups)
 
     def merge_params(self):
-        """Return (weight, bias) in standard nn.Conv2d convention."""
-        sigma_bc = self.sigma_x[None, :, None, None]
-        w = (self.v_tilde.data / sigma_bc).clone()
-        bias = (self.m - w.sum(dim=(2, 3)) @ self.mu_x).data.clone()
-        return w, bias
+        """Recover standard (weight, bias) using BN running stats."""
+        sigma = torch.sqrt(self.bn.running_var + self.bn.eps)
+        mu = self.bn.running_mean
+        sigma_bc = sigma[None, :, None, None]
+        w_eff = (self.v_tilde.data / sigma_bc).clone()
+        b_eff = (self.m.data - w_eff.sum(dim=(2, 3)) @ mu).clone()
+        return w_eff, b_eff
 
     def extra_repr(self):
         return (f'{self.in_channels}, {self.out_channels}, '
                 f'kernel_size={self.kernel_size}, stride={self.stride}, '
-                f'padding={self.padding} [NormalizedResidual]')
+                f'padding={self.padding} [BNResidual]')
 
 
 # =====================================================================
@@ -444,12 +464,12 @@ class BaseReparamManager(ABC):
 
     def _make_standard(self, reparam, weight, bias):
         """Create standard nn.Linear/Conv2d from merged params."""
-        if isinstance(reparam, (MeanResidualLinear, NormalizedResidualLinear)):
+        if isinstance(reparam, (MeanResidualLinear, BNResidualLinear)):
             linear = nn.Linear(reparam.in_features, reparam.out_features, bias=True)
             linear.weight.data.copy_(weight)
             linear.bias.data.copy_(bias)
             return linear.to(self.device)
-        elif isinstance(reparam, (MeanResidualConv2d, NormalizedResidualConv2d)):
+        elif isinstance(reparam, (MeanResidualConv2d, BNResidualConv2d)):
             conv = nn.Conv2d(
                 reparam.in_channels, reparam.out_channels,
                 kernel_size=reparam.kernel_size, stride=reparam.stride,
@@ -594,10 +614,11 @@ class MeanResidualManager(BaseReparamManager):
 # =====================================================================
 
 class NormalizedResidualManager(BaseReparamManager):
-    """BN-equivalent reparameterization: Ṽ = W·σ_x, w_eff = Ṽ/σ_x = W.
+    """BN-based reparameterization: inserts BN(affine=False) before the target layer.
 
-    Equivalent to inserting BN(affine=False) before the layer. After normalization,
-    ‖Ṽ[:,k]‖ = σ_k·‖W[:,k]‖ measures variance contribution directly.
+    The trainable weight v_tilde = W·σ_cal operates on BN-normalized input.
+    ‖v_tilde[:,k]‖ = σ_k·‖W[:,k]‖ measures variance contribution directly.
+    BN auto-updates running stats during training — no frozen σ, no refresh needed.
     Compensation blocked: inflating σ upstream increases ‖Ṽ‖ → more penalty.
     Optional entropy_loss encourages uniform Ṽ column norms → balanced pruning.
 
@@ -697,82 +718,49 @@ class NormalizedResidualManager(BaseReparamManager):
         return cal_dict
 
     def _make_reparam(self, module, calibration_data):
-        """Create NormalizedResidual* module from standard nn.Linear/Conv2d."""
+        """Create BNResidual* module from standard nn.Linear/Conv2d."""
         mu_x, sigma_x = calibration_data
+        BN_EPS = 1e-5  # default nn.BatchNorm eps
 
         if isinstance(module, nn.Linear):
             W = module.weight.data.clone()  # [out, in]
             b = module.bias.data.clone() if module.bias is not None else torch.zeros(
                 module.out_features, device=self.device)
-            # v_tilde = W * sigma_x so that w_eff = v_tilde / sigma_x = W
-            v_tilde = W * sigma_x[None, :]
+            bn_running_var = sigma_x ** 2  # BN stores variance, not std
+            # BN eval: x_bn = (x - μ) / sqrt(var + eps)
+            # For v_tilde / sqrt(var + eps) = W: v_tilde = W * sqrt(var + eps)
+            sigma_eff = torch.sqrt(bn_running_var + BN_EPS)
+            v_tilde = W * sigma_eff[None, :]
             m = b + W @ mu_x
-            reparam = NormalizedResidualLinear(
+            reparam = BNResidualLinear(
                 module.in_features, module.out_features,
-                v_tilde=v_tilde, m=m, mu_x=mu_x, sigma_x=sigma_x)
+                v_tilde=v_tilde, m=m,
+                bn_running_mean=mu_x, bn_running_var=bn_running_var)
             return reparam.to(self.device)
 
         elif isinstance(module, nn.Conv2d):
             W = module.weight.data.clone()  # [C_out, C_in, kH, kW]
             b = module.bias.data.clone() if module.bias is not None else torch.zeros(
                 module.out_channels, device=self.device)
-            sigma_bc = sigma_x[None, :, None, None]
-            v_tilde = W * sigma_bc
+            bn_running_var = sigma_x ** 2  # BN stores variance, not std
+            sigma_eff = torch.sqrt(bn_running_var + BN_EPS)
+            v_tilde = W * sigma_eff[None, :, None, None]
             m = b + W.sum(dim=(2, 3)) @ mu_x
-            reparam = NormalizedResidualConv2d(
+            reparam = BNResidualConv2d(
                 module.in_channels, module.out_channels,
                 kernel_size=module.kernel_size, stride=module.stride,
                 padding=module.padding, dilation=module.dilation,
                 groups=module.groups, v_tilde=v_tilde, m=m,
-                mu_x=mu_x, sigma_x=sigma_x)
+                bn_running_mean=mu_x, bn_running_var=bn_running_var)
             return reparam.to(self.device)
 
         raise TypeError(f"Unsupported module type: {type(module)}")
 
     def refresh_stats(self, loader):
-        """Re-estimate μ_x, σ_x (function-preserving).
-
-        Steps:
-        1. Compute w_eff_old = v_tilde / sigma_old
-        2. Calibrate new mu, sigma
-        3. v_tilde *= sigma_new / sigma_old  (preserve w_eff = v_tilde / sigma)
-        4. m += w_eff_old @ (mu_old - mu_new)
-        5. Update buffers
-        """
+        """No-op: BN(affine=False) auto-updates running stats during training."""
         if not self._active:
             return
-
-        targets = OrderedDict()
-        for name, reparam in self._reparam_modules.items():
-            targets[name] = reparam
-
-        cal_new = self._calibrate(targets, loader)
-
-        for name, reparam in self._reparam_modules.items():
-            mu_old = reparam.mu_x.clone()
-            sigma_old = reparam.sigma_x.clone()
-            mu_new, sigma_new = cal_new[name]
-
-            with torch.no_grad():
-                # Step 1: effective weight before change
-                if hasattr(reparam, 'in_features'):  # Linear
-                    w_eff_old = reparam.v_tilde / sigma_old[None, :]
-                    # Step 3: rescale v_tilde (preserve w_eff = v_tilde / sigma)
-                    reparam.v_tilde.mul_(sigma_new[None, :] / sigma_old[None, :])
-                    # Step 4: adjust m
-                    reparam.m.add_(w_eff_old @ (mu_old - mu_new))
-                elif hasattr(reparam, 'in_channels'):  # Conv2d
-                    sigma_old_bc = sigma_old[None, :, None, None]
-                    sigma_new_bc = sigma_new[None, :, None, None]
-                    w_eff_old = reparam.v_tilde / sigma_old_bc
-                    reparam.v_tilde.mul_(sigma_new_bc / sigma_old_bc)
-                    reparam.m.add_(w_eff_old.sum(dim=(2, 3)) @ (mu_old - mu_new))
-
-                # Step 5: update buffers
-                reparam.mu_x.copy_(mu_new)
-                reparam.sigma_x.copy_(sigma_new)
-
-        logger.info("NormalizedResidualManager: refreshed μ_x, σ_x (function-preserving)")
+        logger.info("NormalizedResidualManager: BN running stats auto-updated (no manual refresh needed)")
 
     def regularization_loss(self):
         """L_{2,1} on Ṽ along self.norm_dim."""
@@ -811,11 +799,12 @@ class NormalizedResidualManager(BaseReparamManager):
             vt = reparam.v_tilde.detach()
             vt_col_norms = vt.flatten(1).norm(p=2, dim=self.norm_dim)
 
-            # w_eff = v_tilde / sigma_x
-            if hasattr(reparam, 'in_features'):
-                w_eff = vt / reparam.sigma_x[None, :]
-            else:
-                w_eff = vt / reparam.sigma_x[None, :, None, None]
+            # w_eff from BN running stats
+            sigma = torch.sqrt(reparam.bn.running_var + reparam.bn.eps)
+            if hasattr(reparam, 'in_features'):  # Linear
+                w_eff = vt / sigma[None, :]
+            else:  # Conv2d
+                w_eff = vt / sigma[None, :, None, None]
             weff_col_norms = w_eff.flatten(1).norm(p=2, dim=self.norm_dim)
 
             m = reparam.m.detach()

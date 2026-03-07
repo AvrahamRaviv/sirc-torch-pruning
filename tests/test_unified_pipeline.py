@@ -528,19 +528,20 @@ class TestBuildReparamLayersCNN:
 
 
 # ---------------------------------------------------------------------------
-# Test: NormalizedResidualLinear
+# Test: BNResidualLinear
 # ---------------------------------------------------------------------------
 
-class TestNormalizedResidualLinear:
-    """Test NormalizedResidualLinear: function-preserving init and merge."""
+class TestBNResidualLinear:
+    """Test BNResidualLinear: function-preserving init and merge."""
 
     def test_function_preserving_init(self):
-        """Output of NormalizedResidualLinear matches original Linear."""
-        from torch_pruning.utils.reparam import NormalizedResidualLinear
+        """Output of BNResidualLinear matches original Linear (eval mode, BN uses running stats)."""
+        from torch_pruning.utils.reparam import BNResidualLinear
 
         torch.manual_seed(42)
         linear = nn.Linear(16, 32)
         x = torch.randn(4, 16)
+        BN_EPS = 1e-5
 
         with torch.no_grad():
             y_orig = linear(x)
@@ -551,10 +552,15 @@ class TestNormalizedResidualLinear:
 
         W = linear.weight.data.clone()
         b = linear.bias.data.clone()
-        v_tilde = W * sigma_x[None, :]  # BN-equivalent: Ṽ = W·σ
+        bn_running_var = sigma_x ** 2
+        # v_tilde = W * sqrt(var + eps) so BN eval gives v_tilde / sqrt(var + eps) = W
+        sigma_eff = torch.sqrt(bn_running_var + BN_EPS)
+        v_tilde = W * sigma_eff[None, :]
         m = b + W @ mu_x
 
-        reparam = NormalizedResidualLinear(16, 32, v_tilde, m, mu_x, sigma_x)
+        reparam = BNResidualLinear(16, 32, v_tilde, m,
+                                   bn_running_mean=mu_x, bn_running_var=bn_running_var)
+        reparam.eval()
         with torch.no_grad():
             y_reparam = reparam(x)
 
@@ -563,49 +569,119 @@ class TestNormalizedResidualLinear:
 
     def test_merge_params_recovers_original(self):
         """merge_params recovers original W, b."""
-        from torch_pruning.utils.reparam import NormalizedResidualLinear
+        from torch_pruning.utils.reparam import BNResidualLinear
 
         torch.manual_seed(42)
         linear = nn.Linear(16, 32)
         x = torch.randn(8, 16)
+        BN_EPS = 1e-5
 
         mu_x = x.mean(dim=0)
         sigma_x = x.std(dim=0).clamp(min=1e-6)
 
         W = linear.weight.data.clone()
         b = linear.bias.data.clone()
-        v_tilde = W * sigma_x[None, :]  # BN-equivalent: Ṽ = W·σ
+        bn_running_var = sigma_x ** 2
+        sigma_eff = torch.sqrt(bn_running_var + BN_EPS)
+        v_tilde = W * sigma_eff[None, :]
         m = b + W @ mu_x
 
-        reparam = NormalizedResidualLinear(16, 32, v_tilde, m, mu_x, sigma_x)
+        reparam = BNResidualLinear(16, 32, v_tilde, m,
+                                   bn_running_mean=mu_x, bn_running_var=bn_running_var)
         w_merged, b_merged = reparam.merge_params()
 
-        # Effective weight: v_tilde / sigma_x = (W·σ)/σ = W
+        # merge_params: w = v_tilde / sqrt(var + eps) = W
         assert torch.allclose(W, w_merged, atol=1e-5), \
             f"Weight max diff: {(W - w_merged).abs().max()}"
+        assert torch.allclose(b, b_merged, atol=1e-5), \
+            f"Bias max diff: {(b - b_merged).abs().max()}"
 
-        # Effective bias should match original
-        b_eff_orig = b.clone()
-        b_eff_merged = b_merged
-        # The merged bias = m - w @ mu_x = (b + W @ mu_x) - W @ mu_x = b
-        assert torch.allclose(b_eff_orig, b_eff_merged, atol=1e-5), \
-            f"Bias max diff: {(b_eff_orig - b_eff_merged).abs().max()}"
+    def test_bn_running_stats_initialized(self):
+        """BN running stats should match calibration values."""
+        from torch_pruning.utils.reparam import BNResidualLinear
+
+        torch.manual_seed(42)
+        mu_x = torch.randn(16)
+        sigma_x = torch.rand(16) + 0.1
+        bn_running_var = sigma_x ** 2
+        v_tilde = torch.randn(32, 16)
+        m = torch.randn(32)
+
+        reparam = BNResidualLinear(16, 32, v_tilde, m,
+                                   bn_running_mean=mu_x, bn_running_var=bn_running_var)
+        assert torch.allclose(reparam.bn.running_mean, mu_x)
+        assert torch.allclose(reparam.bn.running_var, bn_running_var)
+
+    def test_bn_updates_during_training(self):
+        """Forward in train mode should update BN running stats."""
+        from torch_pruning.utils.reparam import BNResidualLinear
+
+        torch.manual_seed(42)
+        mu_x = torch.zeros(16)
+        sigma_x = torch.ones(16)
+        v_tilde = torch.randn(32, 16)
+        m = torch.randn(32)
+
+        reparam = BNResidualLinear(16, 32, v_tilde, m,
+                                   bn_running_mean=mu_x, bn_running_var=sigma_x ** 2)
+        reparam.train()
+
+        # Forward with non-zero-mean data
+        x = torch.randn(8, 16) + 5.0
+        reparam(x)
+
+        # BN running mean should have moved toward ~5.0
+        assert not torch.allclose(reparam.bn.running_mean, mu_x, atol=0.1), \
+            "BN running_mean should update during training"
+
+    def test_3d_input_bn_linear(self):
+        """Verify [B, T, D] reshaping works correctly for ViT-style input."""
+        from torch_pruning.utils.reparam import BNResidualLinear
+
+        torch.manual_seed(42)
+        linear = nn.Linear(16, 32)
+        BN_EPS = 1e-5
+        # 3D input: [batch, tokens, dim]
+        x_3d = torch.randn(2, 5, 16)
+
+        with torch.no_grad():
+            y_orig = linear(x_3d)
+
+        mu_x = x_3d.reshape(-1, 16).mean(dim=0)
+        sigma_x = x_3d.reshape(-1, 16).std(dim=0).clamp(min=1e-6)
+        W = linear.weight.data.clone()
+        b = linear.bias.data.clone()
+        bn_running_var = sigma_x ** 2
+        sigma_eff = torch.sqrt(bn_running_var + BN_EPS)
+        v_tilde = W * sigma_eff[None, :]
+        m = b + W @ mu_x
+
+        reparam = BNResidualLinear(16, 32, v_tilde, m,
+                                   bn_running_mean=mu_x, bn_running_var=bn_running_var)
+        reparam.eval()
+        with torch.no_grad():
+            y_reparam = reparam(x_3d)
+
+        assert y_reparam.shape == (2, 5, 32)
+        assert torch.allclose(y_orig, y_reparam, atol=1e-4), \
+            f"Max diff: {(y_orig - y_reparam).abs().max()}"
 
 
 # ---------------------------------------------------------------------------
-# Test: NormalizedResidualConv2d
+# Test: BNResidualConv2d
 # ---------------------------------------------------------------------------
 
-class TestNormalizedResidualConv2d:
-    """Test NormalizedResidualConv2d: function-preserving init and merge."""
+class TestBNResidualConv2d:
+    """Test BNResidualConv2d: function-preserving init and merge."""
 
     def test_function_preserving_init(self):
-        """Output of NormalizedResidualConv2d matches original Conv2d."""
-        from torch_pruning.utils.reparam import NormalizedResidualConv2d
+        """Output of BNResidualConv2d matches original Conv2d (eval mode)."""
+        from torch_pruning.utils.reparam import BNResidualConv2d
 
         torch.manual_seed(42)
         conv = nn.Conv2d(8, 16, 3, padding=1)
         x = torch.randn(2, 8, 8, 8)
+        BN_EPS = 1e-5
 
         with torch.no_grad():
             y_orig = conv(x)
@@ -616,14 +692,17 @@ class TestNormalizedResidualConv2d:
 
         W = conv.weight.data.clone()
         b = conv.bias.data.clone()
-        sigma_bc = sigma_x[None, :, None, None]
-        v_tilde = W * sigma_bc  # BN-equivalent: Ṽ = W·σ
+        bn_running_var = sigma_x ** 2
+        sigma_eff = torch.sqrt(bn_running_var + BN_EPS)
+        v_tilde = W * sigma_eff[None, :, None, None]
         m = b + W.sum(dim=(2, 3)) @ mu_x
 
-        reparam = NormalizedResidualConv2d(
+        reparam = BNResidualConv2d(
             8, 16, kernel_size=conv.kernel_size, stride=conv.stride,
             padding=conv.padding, dilation=conv.dilation, groups=conv.groups,
-            v_tilde=v_tilde, m=m, mu_x=mu_x, sigma_x=sigma_x)
+            v_tilde=v_tilde, m=m,
+            bn_running_mean=mu_x, bn_running_var=bn_running_var)
+        reparam.eval()
 
         with torch.no_grad():
             y_reparam = reparam(x)
@@ -633,29 +712,32 @@ class TestNormalizedResidualConv2d:
 
     def test_merge_params_recovers_original(self):
         """merge_params recovers original W, b."""
-        from torch_pruning.utils.reparam import NormalizedResidualConv2d
+        from torch_pruning.utils.reparam import BNResidualConv2d
 
         torch.manual_seed(42)
         conv = nn.Conv2d(8, 16, 3, padding=1)
         x = torch.randn(4, 8, 8, 8)
+        BN_EPS = 1e-5
 
         mu_x = x.mean(dim=(0, 2, 3))
         sigma_x = ((x * x).mean(dim=(0, 2, 3)) - mu_x * mu_x).clamp(min=1e-12).sqrt().clamp(min=1e-6)
 
         W = conv.weight.data.clone()
         b = conv.bias.data.clone()
-        sigma_bc = sigma_x[None, :, None, None]
-        v_tilde = W * sigma_bc  # BN-equivalent: Ṽ = W·σ
+        bn_running_var = sigma_x ** 2
+        sigma_eff = torch.sqrt(bn_running_var + BN_EPS)
+        v_tilde = W * sigma_eff[None, :, None, None]
         m = b + W.sum(dim=(2, 3)) @ mu_x
 
-        reparam = NormalizedResidualConv2d(
+        reparam = BNResidualConv2d(
             8, 16, kernel_size=conv.kernel_size, stride=conv.stride,
             padding=conv.padding, dilation=conv.dilation, groups=conv.groups,
-            v_tilde=v_tilde, m=m, mu_x=mu_x, sigma_x=sigma_x)
+            v_tilde=v_tilde, m=m,
+            bn_running_mean=mu_x, bn_running_var=bn_running_var)
 
         w_merged, b_merged = reparam.merge_params()
 
-        # Effective weight: v_tilde / sigma = (W·σ)/σ = W
+        # merge_params: w = v_tilde / sqrt(var + eps) = W
         assert torch.allclose(W, w_merged, atol=1e-5), \
             f"Weight max diff: {(W - w_merged).abs().max()}"
         assert torch.allclose(b, b_merged, atol=1e-5), \
@@ -752,9 +834,10 @@ class TestNormalizedResidualManager:
 # ---------------------------------------------------------------------------
 
 class TestRefreshStats:
-    """Output before refresh == output after refresh (function-preserving)."""
+    """refresh_stats is a no-op for VNR (BN auto-updates); output unchanged."""
 
     def test_refresh_stats_preserves_output(self):
+        """refresh_stats is no-op for VNR — output should be identical before/after."""
         from torch_pruning.utils.reparam import NormalizedResidualManager
 
         model = TinyMLP()
@@ -983,9 +1066,12 @@ class TestVNRLifecycle:
         assert cp._reparam_manager.is_active
         assert cp.model_changed is True
 
-        # Verify it's a NormalizedResidualManager
-        from torch_pruning.utils.reparam import NormalizedResidualManager
+        # Verify it's a NormalizedResidualManager with BN-based modules
+        from torch_pruning.utils.reparam import NormalizedResidualManager, BNResidualLinear
         assert isinstance(cp._reparam_manager, NormalizedResidualManager)
+        # Verify reparam modules are BNResidualLinear (not old NormalizedResidualLinear)
+        for reparam in cp._reparam_manager._reparam_modules.values():
+            assert isinstance(reparam, BNResidualLinear)
 
     def test_vnr_numerically_exact(self, tmp_path):
         """Forward output is identical before and after VNR reparameterize+merge."""
