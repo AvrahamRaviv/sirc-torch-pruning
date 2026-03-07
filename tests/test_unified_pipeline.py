@@ -551,7 +551,7 @@ class TestNormalizedResidualLinear:
 
         W = linear.weight.data.clone()
         b = linear.bias.data.clone()
-        v_tilde = W / sigma_x[None, :]  # σ-inverted: Ṽ = W/σ
+        v_tilde = W * sigma_x[None, :]  # BN-equivalent: Ṽ = W·σ
         m = b + W @ mu_x
 
         reparam = NormalizedResidualLinear(16, 32, v_tilde, m, mu_x, sigma_x)
@@ -574,13 +574,13 @@ class TestNormalizedResidualLinear:
 
         W = linear.weight.data.clone()
         b = linear.bias.data.clone()
-        v_tilde = W / sigma_x[None, :]  # σ-inverted: Ṽ = W/σ
+        v_tilde = W * sigma_x[None, :]  # BN-equivalent: Ṽ = W·σ
         m = b + W @ mu_x
 
         reparam = NormalizedResidualLinear(16, 32, v_tilde, m, mu_x, sigma_x)
         w_merged, b_merged = reparam.merge_params()
 
-        # Effective weight: v_tilde * sigma_x = (W/σ)*σ = W
+        # Effective weight: v_tilde / sigma_x = (W·σ)/σ = W
         assert torch.allclose(W, w_merged, atol=1e-5), \
             f"Weight max diff: {(W - w_merged).abs().max()}"
 
@@ -617,7 +617,7 @@ class TestNormalizedResidualConv2d:
         W = conv.weight.data.clone()
         b = conv.bias.data.clone()
         sigma_bc = sigma_x[None, :, None, None]
-        v_tilde = W / sigma_bc  # σ-inverted: Ṽ = W/σ
+        v_tilde = W * sigma_bc  # BN-equivalent: Ṽ = W·σ
         m = b + W.sum(dim=(2, 3)) @ mu_x
 
         reparam = NormalizedResidualConv2d(
@@ -645,7 +645,7 @@ class TestNormalizedResidualConv2d:
         W = conv.weight.data.clone()
         b = conv.bias.data.clone()
         sigma_bc = sigma_x[None, :, None, None]
-        v_tilde = W / sigma_bc  # σ-inverted: Ṽ = W/σ
+        v_tilde = W * sigma_bc  # BN-equivalent: Ṽ = W·σ
         m = b + W.sum(dim=(2, 3)) @ mu_x
 
         reparam = NormalizedResidualConv2d(
@@ -655,7 +655,7 @@ class TestNormalizedResidualConv2d:
 
         w_merged, b_merged = reparam.merge_params()
 
-        # Effective weight: v_tilde * sigma = (W/σ)*σ = W
+        # Effective weight: v_tilde / sigma = (W·σ)/σ = W
         assert torch.allclose(W, w_merged, atol=1e-5), \
             f"Weight max diff: {(W - w_merged).abs().max()}"
         assert torch.allclose(b, b_merged, atol=1e-5), \
