@@ -270,10 +270,27 @@ class BaseReparamManager(ABC):
         # Log initial V-norms as baseline for tracking regularization progress
         self.log_channel_stats(verbose=False)
 
+    def _sync_bn_stats(self):
+        """All-reduce BN running stats across DDP ranks (no-op if not distributed)."""
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return
+        world_size = torch.distributed.get_world_size()
+        if world_size <= 1:
+            return
+        for reparam in self._reparam_modules.values():
+            if hasattr(reparam, 'bn'):
+                torch.distributed.all_reduce(reparam.bn.running_mean)
+                reparam.bn.running_mean.div_(world_size)
+                torch.distributed.all_reduce(reparam.bn.running_var)
+                reparam.bn.running_var.div_(world_size)
+        logger.info(f"{type(self).__name__}: synced BN running stats across {world_size} ranks")
+
     def merge_back(self):
         """Restore standard nn.Linear/nn.Conv2d from reparam modules."""
         if not self._active:
             return
+
+        self._sync_bn_stats()
 
         for name, reparam in self._reparam_modules.items():
             weight, bias = reparam.merge_params()
