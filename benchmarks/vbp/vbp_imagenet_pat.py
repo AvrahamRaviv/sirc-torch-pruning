@@ -142,7 +142,9 @@ def build_pruning_config(args, model, config_dir):
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
 
-    total = end_epoch + 1 + args.epochs_ft
+    # end_epoch is the last prune epoch. After pruning, that epoch trains as FT,
+    # so it counts as the first FT epoch. Avoid double-counting.
+    total = end_epoch + max(1, args.epochs_ft)
     log_info(f"Pruning config: {len(layers)} layers, start={start_epoch}, "
              f"end={end_epoch}, epoch_rate={epoch_rate}, total={total}, "
              f"keep_ratio={args.keep_ratio:.3f}, "
@@ -506,7 +508,7 @@ def parse_args():
                         help="Number of batches for BN recalibration (CNN only)")
 
     # PAT schedule
-    parser.add_argument("--pat_steps", type=int, default=5,
+    parser.add_argument("--pat_steps", type=int, default=1,
                         help="Number of prune steps")
     parser.add_argument("--pat_epochs_per_step", type=int, default=0,
                         help="FT epochs between prune steps (0 = prune every epoch)")
