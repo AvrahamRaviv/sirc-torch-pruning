@@ -385,7 +385,7 @@ def main(argv):
         if changed:
             optimizer = build_optimizer(model, args, cp._reparam_manager)
             scheduler, step_per_batch = build_ft_scheduler(
-                optimizer, max(1, total - epoch - 1), len(train_loader))
+                optimizer, max(1, total - epoch), len(train_loader))
             if use_ddp:
                 del train_model
                 train_model = DDP(model, device_ids=[args.local_rank],
