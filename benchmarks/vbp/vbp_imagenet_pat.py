@@ -383,7 +383,7 @@ def main(argv):
         if changed:
             optimizer = build_optimizer(model, args, cp._reparam_manager)
             scheduler, step_per_batch = build_ft_scheduler(
-                optimizer, total - epoch - 1, len(train_loader))
+                optimizer, max(1, total - epoch - 1), len(train_loader))
             if use_ddp:
                 del train_model
                 train_model = DDP(model, device_ids=[args.local_rank],
@@ -478,7 +478,7 @@ def parse_args():
     # Model
     parser.add_argument("--model_type", default="vit", choices=["vit", "convnext", "cnn"])
     parser.add_argument("--model_name", default="/algo/NetOptimization/outputs/VBP/DeiT_tiny")
-    parser.add_argument("--cnn_arch", default="resnet50",
+    parser.add_argument("--cnn_arch", default=None,
                         choices=["resnet18", "resnet34", "resnet50", "resnet101", "mobilenet_v2"])
     parser.add_argument("--pretrained", action="store_true", default=True)
     parser.add_argument("--interior_only", action="store_true", default=True)
