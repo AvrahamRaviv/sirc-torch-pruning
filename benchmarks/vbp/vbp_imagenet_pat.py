@@ -354,7 +354,9 @@ def main(argv):
 
     # --- Unified training loop ---
     optimizer = build_optimizer(model, args, cp._reparam_manager)
-    scheduler, step_per_batch = build_ft_scheduler(optimizer, total, len(train_loader))
+    # Build scheduler per phase: sparse gets its own cosine, FT rebuilds after pruning
+    initial_sched_epochs = args.epochs_sparse if args.sparse_mode != "none" and args.epochs_sparse > 0 else total
+    scheduler, step_per_batch = build_ft_scheduler(optimizer, initial_sched_epochs, len(train_loader))
 
     train_model = model
     if use_ddp:
