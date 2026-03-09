@@ -54,7 +54,7 @@ try:
         logger, is_main, log_info, setup_logging,
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate,
-        train_one_epoch, build_ft_scheduler,
+        train_one_epoch, build_cosine_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
     )
 except ImportError:
@@ -63,7 +63,7 @@ except ImportError:
         logger, is_main, log_info, setup_logging,
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate,
-        train_one_epoch, build_ft_scheduler,
+        train_one_epoch, build_cosine_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
     )
 
@@ -356,7 +356,7 @@ def main(argv):
     optimizer = build_optimizer(model, args, cp._reparam_manager)
     # Build scheduler per phase: sparse gets its own cosine, FT rebuilds after pruning
     initial_sched_epochs = args.epochs_sparse if args.sparse_mode != "none" and args.epochs_sparse > 0 else total
-    scheduler, step_per_batch = build_ft_scheduler(optimizer, initial_sched_epochs, len(train_loader))
+    scheduler, step_per_batch = build_cosine_scheduler(optimizer, initial_sched_epochs, len(train_loader))
 
     train_model = model
     if use_ddp:
@@ -384,7 +384,7 @@ def main(argv):
             _broadcast_model_state(model)
         if changed:
             optimizer = build_optimizer(model, args, cp._reparam_manager)
-            scheduler, step_per_batch = build_ft_scheduler(
+            scheduler, step_per_batch = build_cosine_scheduler(
                 optimizer, max(1, total - epoch), len(train_loader))
             if use_ddp:
                 del train_model
