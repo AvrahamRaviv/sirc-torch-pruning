@@ -63,7 +63,7 @@ try:
         logger, is_main, log_info, setup_logging,
         setup_distributed, cleanup,
         build_dataloaders, load_model, forward_logits,
-        validate, train_one_epoch, build_ft_scheduler,
+        validate, train_one_epoch, build_cosine_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
         build_consumer_weight_map,
     )
@@ -73,7 +73,7 @@ except ImportError:
         logger, is_main, log_info, setup_logging,
         setup_distributed, cleanup,
         build_dataloaders, load_model, forward_logits,
-        validate, train_one_epoch, build_ft_scheduler,
+        validate, train_one_epoch, build_cosine_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
         build_consumer_weight_map,
     )
@@ -175,7 +175,7 @@ def run_sparse_pretraining(model, teacher, train_loader, train_sampler,
 
     optimizer = torch.optim.AdamW(train_model.parameters(), lr=args.lr_sparse,
                                   weight_decay=0.01)
-    scheduler, step_per_batch = build_ft_scheduler(
+    scheduler, step_per_batch = build_cosine_scheduler(
         optimizer, args.epochs_sparse, len(train_loader))
 
     for epoch in range(args.epochs_sparse):
@@ -267,7 +267,7 @@ def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
         {"params": base_params, "weight_decay": 0.01},
         {"params": reparam_params, "weight_decay": 0.0},
     ], lr=args.lr_sparse)
-    scheduler, step_per_batch = build_ft_scheduler(
+    scheduler, step_per_batch = build_cosine_scheduler(
         optimizer, args.epochs_sparse, len(train_loader))
 
     def _reparam_aux():
@@ -574,7 +574,7 @@ def finetune(model, teacher, train_loader, train_sampler, val_loader,
         optimizer = torch.optim.SGD(groups, lr=args.lr_ft, momentum=args.momentum_ft)
     else:
         optimizer = torch.optim.AdamW(groups, lr=args.lr_ft)
-    scheduler, step_per_batch = build_ft_scheduler(
+    scheduler, step_per_batch = build_cosine_scheduler(
         optimizer, epochs, len(train_loader))
 
     var_hooks = None

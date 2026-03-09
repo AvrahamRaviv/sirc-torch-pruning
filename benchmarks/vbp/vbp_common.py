@@ -456,7 +456,7 @@ def build_layers_to_prune(model, model_type, architecture=None, interior_only=Tr
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
-def build_ft_scheduler(optimizer, epochs, steps_per_epoch):
+def build_cosine_scheduler(optimizer, epochs, steps_per_epoch):
     """Build cosine LR scheduler with per-batch stepping.
 
     Returns:
