@@ -354,8 +354,10 @@ def main(argv):
 
     # --- Unified training loop ---
     optimizer = build_optimizer(model, args, cp._reparam_manager)
-    # Build scheduler per phase: sparse gets its own cosine, FT rebuilds after pruning
-    initial_sched_epochs = args.epochs_sparse if args.sparse_mode != "none" and args.epochs_sparse > 0 else total
+    # Build scheduler per phase: sparse gets its own cosine, FT rebuilds after pruning.
+    # Use epochs_sparse+1 so cosine doesn't fully reach zero — keeps nonzero LR
+    # throughout the sparse phase (the +1 "runway" is never actually trained).
+    initial_sched_epochs = (args.epochs_sparse + 1) if args.sparse_mode != "none" and args.epochs_sparse > 0 else total
     scheduler, step_per_batch = build_cosine_scheduler(optimizer, initial_sched_epochs, len(train_loader))
 
     train_model = model
