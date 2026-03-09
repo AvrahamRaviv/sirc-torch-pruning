@@ -266,8 +266,12 @@ class ChannelPruning:
 
     @property
     def total_epochs(self):
-        """Total epochs across all phases: sparse + PAT + FT."""
-        return self.end_epoch + 1 + self._epochs_ft
+        """Total epochs across all phases: sparse + PAT + FT.
+
+        The last prune epoch counts as the first FT epoch, so we use
+        max(1, epochs_ft) instead of 1 + epochs_ft to avoid double-counting.
+        """
+        return self.end_epoch + max(1, self._epochs_ft)
 
     @property
     def model_changed(self):
