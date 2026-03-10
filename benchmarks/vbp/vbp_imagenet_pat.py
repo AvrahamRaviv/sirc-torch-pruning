@@ -62,6 +62,7 @@ try:
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate,
         train_one_epoch, build_cosine_scheduler,
+        build_sparse_scheduler, build_ft_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
     )
 except ImportError:
@@ -71,6 +72,7 @@ except ImportError:
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate,
         train_one_epoch, build_cosine_scheduler,
+        build_sparse_scheduler, build_ft_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
     )
 
@@ -363,8 +365,12 @@ def main(argv):
     optimizer = build_optimizer(model, args, cp._reparam_manager)
     # Build scheduler for sparse phase only. FT rebuilds its own after pruning.
     # Use epochs_sparse+1 so cosine doesn't fully reach zero during sparse.
-    initial_sched_epochs = (args.epochs_sparse + 1) if args.sparse_mode != "none" and args.epochs_sparse > 0 else total
-    scheduler, step_per_batch = build_cosine_scheduler(optimizer, initial_sched_epochs, len(train_loader))
+    if args.sparse_mode != "none" and args.epochs_sparse > 0:
+        initial_sched_epochs = args.epochs_sparse + 1
+        scheduler, step_per_batch = build_sparse_scheduler(optimizer, initial_sched_epochs, len(train_loader))
+    else:
+        initial_sched_epochs = total
+        scheduler, step_per_batch = build_ft_scheduler(optimizer, initial_sched_epochs, len(train_loader), eta_min=args.ft_eta_min)
 
     train_model = model
     if use_ddp:
@@ -394,9 +400,11 @@ def main(argv):
             optimizer = build_optimizer(model, args, cp._reparam_manager)
             # During sparse phase, keep the sparse scheduler config;
             # after pruning (FT phase), use remaining epochs.
-            sched_epochs = initial_sched_epochs if cp.phase == "Sparse" else max(1, total - epoch)
-            scheduler, step_per_batch = build_cosine_scheduler(
-                optimizer, sched_epochs, len(train_loader))
+            if cp.phase == "Sparse":
+                scheduler, step_per_batch = build_sparse_scheduler(optimizer, initial_sched_epochs, len(train_loader))
+            else:
+                sched_epochs = max(1, total - epoch)
+                scheduler, step_per_batch = build_ft_scheduler(optimizer, sched_epochs, len(train_loader), eta_min=args.ft_eta_min)
             if use_ddp:
                 del train_model
                 train_model = DDP(model, device_ids=[args.local_rank],
@@ -534,6 +542,8 @@ def parse_args():
                         help="FT epochs between prune steps (0 = prune every epoch)")
     parser.add_argument("--epochs_ft", type=int, default=10,
                         help="Post-prune fine-tuning epochs")
+    parser.add_argument("--ft_eta_min", type=float, default=1e-8,
+                        help="Minimum LR for FT cosine scheduler (raise for short FT runs)")
     parser.add_argument("--lr", type=float, default=1.5e-5)
     parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd"])
     parser.add_argument("--wd", type=float, default=0.01,
