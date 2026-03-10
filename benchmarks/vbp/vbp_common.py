@@ -524,6 +524,27 @@ def build_cosine_scheduler(optimizer, epochs, steps_per_epoch):
     return scheduler, True
 
 
+def build_sparse_scheduler(optimizer, epochs, steps_per_epoch):
+    """Cosine scheduler for sparse pre-training phase."""
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs * steps_per_epoch, eta_min=1e-8
+    )
+    return scheduler, True
+
+
+def build_ft_scheduler(optimizer, epochs, steps_per_epoch, eta_min=1e-8):
+    """Cosine scheduler for fine-tuning phase.
+
+    Args:
+        eta_min: Minimum LR floor. Raise for short FT runs (e.g. 1e-5)
+                 to keep the model learning through all epochs.
+    """
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs * steps_per_epoch, eta_min=eta_min
+    )
+    return scheduler, True
+
+
 def train_one_epoch(model, train_loader, train_sampler, optimizer,
                     scheduler, device, epoch, args,
                     teacher=None, fc1_modules=None,
