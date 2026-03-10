@@ -208,6 +208,46 @@ def build_dataloaders(args, use_ddp=True):
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
+def _merge_vnr_state_dict(state, eps=1e-5):
+    """Convert VNR checkpoint (v_tilde, m, bn.*) to standard (weight, bias).
+
+    If no VNR keys found, returns state unchanged.
+    """
+    # Find VNR layer prefixes: keys ending in .v_tilde
+    prefixes = [k.rsplit(".v_tilde", 1)[0] for k in state if k.endswith(".v_tilde")]
+    if not prefixes:
+        return state
+
+    new_state = {}
+    consumed = set()
+    for prefix in prefixes:
+        vt = state[prefix + ".v_tilde"]
+        m = state[prefix + ".m"]
+        var = state[prefix + ".bn.running_var"]
+        mu = state[prefix + ".bn.running_mean"]
+        sigma = torch.sqrt(var + eps)
+
+        # Linear: v_tilde [out, in], sigma [in]
+        w_eff = vt / sigma[None, :]
+        b_eff = m - w_eff @ mu
+
+        new_state[prefix + ".weight"] = w_eff
+        new_state[prefix + ".bias"] = b_eff
+        consumed.update([
+            prefix + ".v_tilde", prefix + ".m",
+            prefix + ".bn.running_mean", prefix + ".bn.running_var",
+            prefix + ".bn.num_batches_tracked",
+        ])
+
+    # Copy non-VNR keys as-is
+    for k, v in state.items():
+        if k not in consumed:
+            new_state[k] = v
+
+    log_info(f"Converted {len(prefixes)} VNR layers to standard weight/bias")
+    return new_state
+
+
 def load_model(args, device):
     """Load model architecture, optionally overriding weights from --checkpoint.
 
@@ -227,6 +267,7 @@ def load_model(args, device):
             args.model_name, local_files_only=os.path.isdir(args.model_name))
         if checkpoint:
             state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+            state = _merge_vnr_state_dict(state)
             model.load_state_dict(state, strict=True)
             log_info(f"Loaded ViT arch from {args.model_name}, weights from {checkpoint}")
         else:
