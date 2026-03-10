@@ -416,15 +416,19 @@ def main(argv):
                         parts["ent"] = ent
                 return parts
 
-        train_loss, aux_losses = train_one_epoch(
-            train_model, train_loader, train_sampler,
-            optimizer, scheduler, device, epoch, args,
-            teacher=teacher, fc1_modules=fc1,
-            step_per_batch=step_per_batch, phase=phase,
-            var_hooks=var_hooks if phase == "PAT" else None,
-            regularize_fn=pruner.channel_regularize,
-            aux_loss_fn=aux_fn,
-        )
+        # Skip training in prune-only mode (epochs_ft=0, no sparse phase)
+        if args.epochs_ft == 0 and phase == "FT":
+            train_loss, aux_losses = 0.0, {}
+        else:
+            train_loss, aux_losses = train_one_epoch(
+                train_model, train_loader, train_sampler,
+                optimizer, scheduler, device, epoch, args,
+                teacher=teacher, fc1_modules=fc1,
+                step_per_batch=step_per_batch, phase=phase,
+                var_hooks=var_hooks if phase == "PAT" else None,
+                regularize_fn=pruner.channel_regularize,
+                aux_loss_fn=aux_fn,
+            )
 
         # 5. Periodic μ_x refresh + log reparam stats if active
         if cp._reparam_manager and cp._reparam_manager.is_active:
