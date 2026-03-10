@@ -209,23 +209,35 @@ def build_dataloaders(args, use_ddp=True):
 # Model loading
 # ---------------------------------------------------------------------------
 def load_model(args, device):
-    """Load ViT (HuggingFace) or ConvNeXt (FB implementation)."""
+    """Load model architecture, optionally overriding weights from --checkpoint.
+
+    Args:
+        args.model_name: Architecture source.
+            - vit: HuggingFace model ID or local dir (e.g. "google/vit-base-patch16-224")
+            - convnext: variant string or path containing variant name
+            - cnn: ignored (architecture from --cnn_arch)
+        args.checkpoint: Optional .pth file to load weights from (overrides default weights).
+    """
+    checkpoint = getattr(args, 'checkpoint', None)
+
     if args.model_type == "vit":
-        # HuggingFace ViT
-        model = ViTForImageClassification.from_pretrained(args.model_name, local_files_only=os.path.isdir(args.model_name))
+        model = ViTForImageClassification.from_pretrained(
+            args.model_name, local_files_only=os.path.isdir(args.model_name))
+        if checkpoint:
+            state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+            model.load_state_dict(state, strict=True)
+            log_info(f"Loaded ViT arch from {args.model_name}, weights from {checkpoint}")
+        else:
+            log_info(f"Loaded ViT from {args.model_name}")
         model = model.to(device)
-        log_info(f"Loaded ViT from {args.model_name}")
 
     elif args.model_type == "convnext":
-        # FB ConvNeXt implementation — model_name is the checkpoint path
         variant_map = {
             "convnext_tiny": convnext_tiny,
             "convnext_small": convnext_small,
             "convnext_base": convnext_base,
             "convnext_large": convnext_large,
         }
-
-        # Determine variant from model_name (path or variant string)
         variant = args.model_name.lower()
         for key in variant_map:
             if key in variant:
@@ -236,17 +248,15 @@ def load_model(args, device):
             log_info(f"Unknown ConvNeXt variant '{args.model_name}', defaulting to tiny")
 
         model = model_fn(pretrained=False)
-
-        # Load checkpoint (model_name is the .pth path)
-        if os.path.exists(args.model_name):
-            state = torch.load(args.model_name, map_location="cpu", weights_only=True)
+        ckpt = checkpoint or args.model_name
+        if os.path.exists(ckpt):
+            state = torch.load(ckpt, map_location="cpu", weights_only=True)
             if "model" in state:
                 state = state["model"]
             model.load_state_dict(state, strict=True)
-            log_info(f"Loaded ConvNeXt checkpoint from {args.model_name}")
+            log_info(f"Loaded ConvNeXt checkpoint from {ckpt}")
         else:
-            log_info(f"WARNING: Checkpoint not found at {args.model_name}, using random weights")
-
+            log_info(f"WARNING: Checkpoint not found at {ckpt}, using random weights")
         model = model.to(device)
 
     elif args.model_type == "cnn":
@@ -260,10 +270,11 @@ def load_model(args, device):
         }
         model_fn = model_map[args.cnn_arch]
         model = model_fn(pretrained=False)
-        state = torch.load(args.model_name, map_location='cpu', weights_only=True)
+        ckpt = checkpoint or args.model_name
+        state = torch.load(ckpt, map_location='cpu', weights_only=True)
         model.load_state_dict(state, strict=True)
         model = model.to(device)
-        log_info(f"Loaded {args.cnn_arch} (pretrained={args.pretrained})")
+        log_info(f"Loaded {args.cnn_arch} from {ckpt}")
 
     else:
         raise ValueError(f"Unsupported model_type: {args.model_type}")

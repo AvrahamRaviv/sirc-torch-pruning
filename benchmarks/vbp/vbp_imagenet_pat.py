@@ -26,6 +26,13 @@ Usage:
         --epochs_ft 10 \
         --disable_ddp
 
+    # Resume from a .pth checkpoint (sparse or pruned)
+    python benchmarks/vbp/vbp_imagenet_pat.py \
+        --model_type vit --model_name /path/to/deit_tiny \
+        --checkpoint /path/to/variance_pat_best.pth \
+        --data_path /path/to/imagenet \
+        --keep_ratio 0.65 --global_pruning --disable_ddp
+
     # Sparse (reparam) + PAT + FT
     python benchmarks/vbp/vbp_imagenet_pat.py \
         --sparse_mode reparam --epochs_sparse 3 \
@@ -483,7 +490,10 @@ def parse_args():
 
     # Model
     parser.add_argument("--model_type", default="vit", choices=["vit", "convnext", "cnn"])
-    parser.add_argument("--model_name", default="/algo/NetOptimization/outputs/VBP/DeiT_tiny")
+    parser.add_argument("--model_name", default="/algo/NetOptimization/outputs/VBP/DeiT_tiny",
+                        help="Architecture source (HF model ID/dir, ConvNeXt variant)")
+    parser.add_argument("--checkpoint", default=None,
+                        help="Optional .pth checkpoint to load weights from")
     parser.add_argument("--cnn_arch", default=None,
                         choices=["resnet18", "resnet34", "resnet50", "resnet101", "mobilenet_v2"])
     parser.add_argument("--pretrained", action="store_true", default=True)
