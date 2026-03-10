@@ -10,7 +10,7 @@ Epoch math:
     epoch_rate = max(1, pat_epochs_per_step + 1)
     start_epoch = epochs_sparse  (if sparse_mode != none)
     end_epoch   = start_epoch + (pat_steps - 1) * epoch_rate
-    total       = end_epoch + 1 + epochs_ft
+    total       = end_epoch + max(1, epochs_ft)
 
 Supports multiple pruning criteria (variance/VBP, magnitude, LAMP, random).
 
