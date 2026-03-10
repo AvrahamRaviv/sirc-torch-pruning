@@ -875,7 +875,9 @@ def parse_args():
     model_group.add_argument("--model_type", default="vit", choices=["vit", "convnext", "cnn"],
                              help="Model architecture type")
     model_group.add_argument("--model_name", default="/algo/NetOptimization/outputs/VBP/DeiT_tiny",
-                             help="Model name/path (HF model ID or ConvNeXt .pth path)")
+                             help="Architecture source (HF model ID/dir, ConvNeXt variant)")
+    model_group.add_argument("--checkpoint", default=None,
+                             help="Optional .pth checkpoint to load weights from")
     model_group.add_argument("--cnn_arch", default="resnet50",
                              choices=["resnet18", "resnet34", "resnet50", "resnet101", "mobilenet_v2"],
                              help="CNN architecture (only used when model_type=cnn)")
