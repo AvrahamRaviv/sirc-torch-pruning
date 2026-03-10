@@ -385,8 +385,11 @@ def main(argv):
             _broadcast_model_state(model)
         if changed:
             optimizer = build_optimizer(model, args, cp._reparam_manager)
+            # During sparse phase, keep the sparse scheduler config;
+            # after pruning (FT phase), use remaining epochs.
+            sched_epochs = initial_sched_epochs if cp.phase == "Sparse" else max(1, total - epoch)
             scheduler, step_per_batch = build_cosine_scheduler(
-                optimizer, max(1, total - epoch), len(train_loader))
+                optimizer, sched_epochs, len(train_loader))
             if use_ddp:
                 del train_model
                 train_model = DDP(model, device_ids=[args.local_rank],
