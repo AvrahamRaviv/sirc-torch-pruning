@@ -219,6 +219,8 @@ def load_model(args, device):
         args.checkpoint: Optional .pth file to load weights from (overrides default weights).
     """
     checkpoint = getattr(args, 'checkpoint', None)
+    if checkpoint and not os.path.isfile(checkpoint):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 
     if args.model_type == "vit":
         model = ViTForImageClassification.from_pretrained(
