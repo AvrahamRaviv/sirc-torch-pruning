@@ -562,7 +562,8 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
 
         if is_main() and (batch_idx % log_interval == 0 or batch_idx == total - 1):
             avg_loss = total_loss / num_batches
-            parts = [f"loss={avg_loss:.4f}"]
+            cur_lr = optimizer.param_groups[0]['lr']
+            parts = [f"loss={avg_loss:.4f}", f"lr={cur_lr:.2e}"]
             if use_l21:
                 parts.append(f"L21={total_reg / num_batches:.2f}")
             if use_var_loss:
