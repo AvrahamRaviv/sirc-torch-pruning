@@ -370,7 +370,7 @@ def main(argv):
         scheduler, step_per_batch = build_sparse_scheduler(optimizer, initial_sched_epochs, len(train_loader))
     else:
         initial_sched_epochs = total
-        scheduler, step_per_batch = build_ft_scheduler(optimizer, initial_sched_epochs, len(train_loader), eta_min=args.ft_eta_min)
+        scheduler, step_per_batch = build_ft_scheduler(optimizer, initial_sched_epochs, len(train_loader), eta_min=args.ft_eta_min, warmup_epochs=args.ft_warmup_epochs)
 
     train_model = model
     if use_ddp:
@@ -544,6 +544,8 @@ def parse_args():
                         help="Post-prune fine-tuning epochs")
     parser.add_argument("--ft_eta_min", type=float, default=1e-8,
                         help="Minimum LR for FT cosine scheduler (raise for short FT runs)")
+    parser.add_argument("--ft_warmup_epochs", type=float, default=0,
+                        help="Linear warmup epochs for FT scheduler (0 = no warmup)")
     parser.add_argument("--lr", type=float, default=1.5e-5)
     parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd"])
     parser.add_argument("--wd", type=float, default=0.01,

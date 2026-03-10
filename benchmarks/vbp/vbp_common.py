@@ -532,16 +532,34 @@ def build_sparse_scheduler(optimizer, epochs, steps_per_epoch):
     return scheduler, True
 
 
-def build_ft_scheduler(optimizer, epochs, steps_per_epoch, eta_min=1e-8):
-    """Cosine scheduler for fine-tuning phase.
+def build_ft_scheduler(optimizer, epochs, steps_per_epoch, eta_min=1e-8,
+                       warmup_epochs=0):
+    """Cosine scheduler for fine-tuning phase with optional linear warmup.
 
     Args:
         eta_min: Minimum LR floor. Raise for short FT runs (e.g. 1e-5)
                  to keep the model learning through all epochs.
+        warmup_epochs: Number of epochs for linear warmup from ~0 to base LR.
+                       0 = no warmup (backward-compatible default).
     """
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs * steps_per_epoch, eta_min=eta_min
-    )
+    total_steps = epochs * steps_per_epoch
+    warmup_steps = int(warmup_epochs * steps_per_epoch)
+
+    if warmup_steps > 0:
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-2, end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_steps - warmup_steps, eta_min=eta_min,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps],
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_steps, eta_min=eta_min,
+        )
     return scheduler, True
 
 
