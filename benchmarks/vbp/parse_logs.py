@@ -45,7 +45,7 @@ def parse_hyperparams(text):
             in_args = True
             continue
         if in_args:
-            m = re.match(r"\S.*\|\s*INFO\s*\|\s{2}(\w+):\s*(.*)", line)
+            m = re.search(r"INFO \|   (\w+): (.*)", line)
             if m:
                 key, val = m.group(1), m.group(2).strip()
                 # Convert types
