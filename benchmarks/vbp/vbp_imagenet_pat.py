@@ -314,6 +314,14 @@ def main(argv):
 
     # Load model
     model = load_model(args, device)
+
+    if getattr(args, 'fold_bn_init', False):
+        from torch_pruning.utils.reparam import fold_all_conv_bn
+        n = fold_all_conv_bn(model)
+        log_info(args, f"[fold_bn_init] Folded {n} post-layer BNs into Conv/Linear weights")
+        # BN recalibration is no longer needed after folding
+        args.bn_recalibration = False
+
     example_inputs = torch.randn(1, 3, 224, 224).to(device)
 
     # Baseline
@@ -534,6 +542,9 @@ def parse_args():
                         help="Recalibrate BN running stats after each pruning step")
     parser.add_argument("--bn_recalib_batches", type=int, default=100,
                         help="Number of batches for BN recalibration (CNN only)")
+    parser.add_argument('--fold_bn_init', action='store_true',
+                        help='Fold post-Conv/Linear BN into preceding layer weights at init '
+                             '(permanent; removes need for bn_recalibration in CNN models)')
 
     # PAT schedule
     parser.add_argument("--pat_steps", type=int, default=1,
