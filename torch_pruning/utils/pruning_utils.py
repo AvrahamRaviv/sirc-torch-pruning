@@ -724,6 +724,10 @@ class ChannelPruning:
                     visited.add(nid)
                     m = out_node.module
                     if isinstance(m, (torch.nn.Linear, torch.nn.Conv2d)) and m is not fc1:
+                        # Skip depthwise/grouped convs (weight[:,k] has only 1 input → norm is size 1)
+                        if isinstance(m, torch.nn.Conv2d) and m.groups > 1:
+                            next_queue.extend(out_node.outputs)
+                            continue
                         fc2 = m
                         break
                     next_queue.extend(out_node.outputs)
