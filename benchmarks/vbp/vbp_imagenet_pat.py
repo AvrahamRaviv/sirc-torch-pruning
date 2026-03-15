@@ -64,6 +64,7 @@ try:
         train_one_epoch, build_cosine_scheduler,
         build_sparse_scheduler, build_ft_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
+        fold_all_conv_bn,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -74,6 +75,7 @@ except ImportError:
         train_one_epoch, build_cosine_scheduler,
         build_sparse_scheduler, build_ft_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
+        fold_all_conv_bn,
     )
 
 
@@ -316,7 +318,6 @@ def main(argv):
     model = load_model(args, device)
 
     if getattr(args, 'fold_bn_init', False):
-        from torch_pruning.utils.reparam import fold_all_conv_bn
         n = fold_all_conv_bn(model)
         log_info(args, f"[fold_bn_init] Folded {n} post-layer BNs into Conv/Linear weights")
         # BN recalibration is no longer needed after folding

@@ -407,6 +407,63 @@ class VarianceConcentrationHooks:
 
 
 # ---------------------------------------------------------------------------
+# BN folding
+# ---------------------------------------------------------------------------
+def fold_all_conv_bn(model: nn.Module) -> int:
+    """Fold each BatchNorm that immediately follows a Conv2d/Linear in a Sequential
+    into that layer's weights. Replaces the BN with nn.Identity permanently.
+    Returns the number of BNs folded.
+    """
+    folded = 0
+    for parent_module in model.modules():
+        if not isinstance(parent_module, nn.Sequential):
+            continue
+        children = list(parent_module.named_children())
+        for i in range(len(children) - 1):
+            key_a, mod_a = children[i]
+            key_b, mod_b = children[i + 1]
+            if not isinstance(mod_a, (nn.Conv2d, nn.Linear)):
+                continue
+            if not isinstance(mod_b, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                continue
+
+            bn = mod_b
+            eps = bn.eps
+            mean = bn.running_mean
+            var = bn.running_var
+            sigma = torch.sqrt(var + eps)
+
+            if bn.affine:
+                gamma, beta = bn.weight, bn.bias
+            else:
+                gamma = torch.ones_like(mean)
+                beta = torch.zeros_like(mean)
+
+            scale = gamma / sigma
+
+            if isinstance(mod_a, nn.Conv2d):
+                mod_a.weight.data.mul_(scale[:, None, None, None])
+            else:
+                mod_a.weight.data.mul_(scale[:, None])
+
+            b = mod_a.bias.data if mod_a.bias is not None else torch.zeros(
+                scale.shape[0], device=mod_a.weight.device)
+            b_eff = scale * (b - mean) + beta
+
+            if mod_a.bias is None:
+                mod_a.bias = nn.Parameter(b_eff.detach().clone())
+            else:
+                mod_a.bias.data.copy_(b_eff)
+
+            setattr(parent_module, key_b, nn.Identity())
+            logger.info(f"fold_all_conv_bn: folded {key_b}(BN) into {key_a}(Conv/Linear)")
+            folded += 1
+
+    logger.info(f"fold_all_conv_bn: total {folded} BNs folded into preceding layers")
+    return folded
+
+
+# ---------------------------------------------------------------------------
 # Layer name helpers
 # ---------------------------------------------------------------------------
 def build_reparam_layers(model, model_type, architecture=None, reparam_target="fc2"):
