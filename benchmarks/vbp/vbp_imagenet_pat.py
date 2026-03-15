@@ -318,7 +318,7 @@ def main(argv):
     if getattr(args, 'fold_bn_init', False):
         from torch_pruning.utils.reparam import fold_all_conv_bn
         n = fold_all_conv_bn(model)
-        log_info(args, f"[fold_bn_init] Folded {n} post-layer BNs into Conv/Linear weights")
+        log_info(f"[fold_bn_init] Folded {n} post-layer BNs into Conv/Linear weights")
         # BN recalibration is no longer needed after folding
         args.bn_recalibration = False
 
