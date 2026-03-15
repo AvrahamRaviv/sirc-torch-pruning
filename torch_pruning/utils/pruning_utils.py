@@ -251,7 +251,7 @@ class ChannelPruning:
         self._sparse_modules = []
         if self._sparse_mode != 'none':
             for name, m in model.named_modules():
-                if name.replace("module.", "") in self.layers_to_prune:
+                if (name[len("module."):] if name.startswith("module.") else name) in self.layers_to_prune:
                     self._sparse_modules.append(m)
 
         # Initial MAC measurement
@@ -751,7 +751,7 @@ class ChannelPruning:
         pruning_ratio_dict = {}
 
         for name, m in model.named_modules():
-            name = name.replace("module.", "")
+            name = name[len("module."):] if name.startswith("module.") else name
             # QAT modules
             try:
                 if isinstance(m, (torch.ao.nn.qat.modules.conv.Conv2d, torch.ao.nn.intrinsic.qat.modules.conv_fused.ConvReLU2d)):
@@ -826,7 +826,7 @@ class ChannelPruning:
 
     def update_channel_mask_dict(self, model):
         for name, param in model.named_modules():
-            name = name.replace("module.", "")
+            name = name[len("module."):] if name.startswith("module.") else name
             if isinstance(param, nn.Conv2d):
                 pruned_channel_indices = torch.where(torch.sum(param.weight, dim=(1, 2, 3)) == 0)[0]
                 r, _ = divmod(pruned_channel_indices.shape[0], self.slice_block_size)
@@ -844,7 +844,7 @@ class ChannelPruning:
         ltp = self.set_layers_to_prune(model)
 
         for name, module in model.named_modules():
-            name = name.replace("module.", "")
+            name = name[len("module."):] if name.startswith("module.") else name
             if module in macs_dict and isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)) and module in ltp:
                 macs_layer = macs_dict[module]
                 weight = module.weight
@@ -972,7 +972,7 @@ class SlicePruning:
         self.block_size = slice_sparsity_args['block_size']
         self.prune_rate = slice_sparsity_args['prune_rate']
         self.reg = slice_sparsity_args['reg']
-        self.slice_sparsity_args['layers'] = {name.replace("module.", "") + '.weight': self.prune_rate for name, m in model.named_modules() if isinstance(m, nn.Conv2d)}
+        self.slice_sparsity_args['layers'] = {(name[len("module."):] if name.startswith("module.") else name) + '.weight': self.prune_rate for name, m in model.named_modules() if isinstance(m, nn.Conv2d)}
         self.channel_mask_dict = {}
 
     def extract_slices(self, name: str, w: torch.nn.parameter.Parameter):
@@ -1028,7 +1028,7 @@ class SlicePruning:
         SP_loss = 0
         # run over the relevant layers, as defined in the config
         for name, param in model.named_parameters():
-            name = name.replace("module.", "")
+            name = name[len("module."):] if name.startswith("module.") else name
 
             if name in self.slice_sparsity_args['layers'].keys():
                 Slices, _, fc_indices, _, _ = self.extract_slices(name, param)
@@ -1069,7 +1069,7 @@ class SlicePruning:
             _log(log, f"Total target: {self.prune_rate}.")
             # loop over layers and pruned them
             for name, param in model.named_parameters():
-                name = name.replace("module.", "")
+                name = name[len("module."):] if name.startswith("module.") else name
 
                 # slice pruning
                 if name in self.slice_sparsity_args['layers'].keys():
@@ -1107,7 +1107,7 @@ class SlicePruning:
             num_slices = 0
             num_zero_slices = 0
             for name, param in model.named_parameters():
-                name = name.replace("module.", "")
+                name = name[len("module."):] if name.startswith("module.") else name
                 if name in self.slice_sparsity_args['layers'].keys():
                     # icm = torch.where(param.sum(dim=(0, 2, 3)) == 0)
                     # ocm = torch.where(param.sum(dim=(1, 2, 3)) == 0)
