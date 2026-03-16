@@ -282,6 +282,27 @@ def print_compact(results):
         print(f"\n=== {setup} ===")
         print(f"Config: {', '.join(parts)}")
 
+        # Sparse stats sub-table (only if any KR has sparse epochs)
+        max_sp_epochs = max(
+            (len([e for e in data["epochs"] if e["phase"] == "Sparse"])
+             for _, data in entries),
+            default=0
+        )
+        if max_sp_epochs > 0:
+            sp_ep_hdr = "".join(f" {'S'+str(i+1):>13}" for i in range(max_sp_epochs))
+            print(f"  Sparse (acc|reg):  {sp_ep_hdr}")
+            for kr_folder, data in sorted(entries, key=lambda x: -x[1]["hyperparams"].get("keep_ratio", 0)):
+                kr = data["hyperparams"].get("keep_ratio", "?")
+                sp_eps = [e for e in data["epochs"] if e["phase"] == "Sparse"]
+                cells = ""
+                for e in sp_eps:
+                    reg = e.get("reg")
+                    reg_str = f"{reg:.4f}" if reg is not None else "     -"
+                    cells += f" {e['val_acc']:.4f}|{reg_str}"
+                # Pad missing epochs
+                cells += "".join(f" {'':>13}" for _ in range(max_sp_epochs - len(sp_eps)))
+                print(f"  {kr:>5}{cells}")
+
         # Collect all FT epoch counts to build header
         max_ft_epochs = 0
         for _, data in entries:
