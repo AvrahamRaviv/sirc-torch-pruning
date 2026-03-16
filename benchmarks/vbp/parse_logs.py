@@ -121,9 +121,10 @@ def parse_summary(text):
     if m:
         summary["final_acc"] = float(m.group(1))
 
-    m = re.search(r"Best [Aa]cc(?:uracy)?:\s*([\d.]+)", text)
-    if m:
-        summary["best_acc"] = float(m.group(1))
+    # Use last match — first may be from sparse phase (before pruning)
+    best_matches = list(re.finditer(r"Best [Aa]cc(?:uracy)?:\s*([\d.]+)", text))
+    if best_matches:
+        summary["best_acc"] = float(best_matches[-1].group(1))
 
     m = re.search(r"Baseline:\s*([\d.]+)G MACs,\s*([\d.]+)M params", text)
     if m:
@@ -289,7 +290,7 @@ def print_compact(results):
 
         # Header
         ep_cols = "".join(f" {'E'+str(i+1):>6}" for i in range(max_ft_epochs))
-        print(f"  {'KR':>5} {'Ret':>7} {ep_cols} {'Best':>7} {'MACs':>6}")
+        print(f"  {'KR':>5} {'SpBest':>7} {'Ret':>7} {ep_cols} {'Best':>7} {'MACs':>6}")
 
         # One row per keep ratio
         for kr_folder, data in sorted(entries, key=lambda x: -x[1]["hyperparams"].get("keep_ratio", 0)):
@@ -297,6 +298,11 @@ def print_compact(results):
             retentions = data["step_retentions"]
             epochs = data["epochs"]
             summary = data["summary"]
+
+            # Best val_acc during sparse phase
+            sp_eps = [e for e in epochs if e["phase"] == "Sparse"]
+            sp_best = max((e["val_acc"] for e in sp_eps), default=None)
+            sp_str = f"{sp_best:.4f}" if sp_best is not None else "     -"
 
             # Retention (last step)
             ret_str = f"{retentions[-1]['acc']:.4f}" if retentions else "  -"
@@ -307,7 +313,7 @@ def print_compact(results):
             # Pad if fewer epochs than max
             ep_vals += "".join("      -" for _ in range(max_ft_epochs - len(ft_eps)))
 
-            # Best (from summary or epochs)
+            # Best FT (from summary or FT epochs)
             best = summary.get("best_acc")
             if best is None and ft_eps:
                 best = max(e["val_acc"] for e in ft_eps)
@@ -317,7 +323,7 @@ def print_compact(results):
             macs = retentions[-1]["macs_G"] if retentions else summary.get("pruned_macs_G")
             macs_str = f"{macs:.2f}G" if macs else "  -"
 
-            print(f"  {kr:>5} {ret_str:>7} {ep_vals} {best_str:>7} {macs_str:>6}")
+            print(f"  {kr:>5} {sp_str:>7} {ret_str:>7} {ep_vals} {best_str:>7} {macs_str:>6}")
 
         # Original accuracy (once per setup)
         orig = entries[0][1]["summary"].get("original_acc")
