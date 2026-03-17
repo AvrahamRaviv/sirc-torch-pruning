@@ -315,11 +315,13 @@ def main(argv):
     # Load model
     model = load_model(args, device)
 
-    if getattr(args, 'fold_bn_init', False):
+    # For CNN + checkpoint, fold_bn_init was already applied inside load_model
+    # (must happen before loading the checkpoint so key names match).
+    if getattr(args, 'fold_bn_init', False) and not (
+            args.model_type == "cnn" and getattr(args, 'checkpoint', None)):
         from torch_pruning.utils.reparam import fold_all_conv_bn
         n = fold_all_conv_bn(model)
         log_info(f"[fold_bn_init] Folded {n} post-layer BNs into Conv/Linear weights")
-        # BN recalibration is no longer needed after folding
         args.bn_recalibration = False
 
     example_inputs = torch.randn(1, 3, 224, 224).to(device)

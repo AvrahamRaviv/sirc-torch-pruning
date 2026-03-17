@@ -319,6 +319,13 @@ def load_model(args, device):
         model_fn = model_map[args.cnn_arch]
         model = model_fn(pretrained=False)
         ckpt = checkpoint or args.model_name
+        if checkpoint and getattr(args, 'fold_bn_init', False):
+            # Checkpoint was saved with BNs already folded (replaced by Identity).
+            # Must fold the base architecture first so key names match before loading.
+            from torch_pruning.utils.reparam import fold_all_conv_bn
+            n = fold_all_conv_bn(model)
+            log_info(f"[fold_bn_init] Folded {n} BNs before loading checkpoint")
+            args.bn_recalibration = False
         state = torch.load(ckpt, map_location='cpu', weights_only=True)
         state = _merge_vnr_state_dict(state)
         model.load_state_dict(state, strict=True)
