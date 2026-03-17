@@ -227,9 +227,14 @@ def _merge_vnr_state_dict(state, eps=1e-5):
         mu = state[prefix + ".bn.running_mean"]
         sigma = torch.sqrt(var + eps)
 
-        # Linear: v_tilde [out, in], sigma [in]
-        w_eff = vt / sigma[None, :]
-        b_eff = m - w_eff @ mu
+        if vt.dim() == 2:
+            # Linear: v_tilde [out, in], sigma [in]
+            w_eff = vt / sigma[None, :]
+            b_eff = m - w_eff @ mu
+        else:
+            # Conv2d: v_tilde [C_out, C_in, kH, kW], sigma [C_in]
+            w_eff = vt / sigma[None, :, None, None]
+            b_eff = m - (w_eff.view(vt.shape[0], -1) @ mu)
 
         new_state[prefix + ".weight"] = w_eff
         new_state[prefix + ".bias"] = b_eff
