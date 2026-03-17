@@ -129,7 +129,7 @@ def build_pruning_config(args, model, config_dir):
             "verbose": 1,
             # Schedule and features
             "pruning_schedule": args.pruning_schedule,
-            "bn_recalibration": args.bn_recalibration or (args.model_type == "cnn"),
+            "bn_recalibration": args.bn_recalibration,
             "bn_recalib_batches": args.bn_recalib_batches,
             "sparse_mode": args.sparse_mode,
             "sparse_l1_lambda": args.l1_lambda,
