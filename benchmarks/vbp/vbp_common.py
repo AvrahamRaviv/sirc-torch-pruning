@@ -315,6 +315,7 @@ def load_model(args, device):
         model = model_fn(pretrained=False)
         ckpt = checkpoint or args.model_name
         state = torch.load(ckpt, map_location='cpu', weights_only=True)
+        state = _merge_vnr_state_dict(state)
         model.load_state_dict(state, strict=True)
         model = model.to(device)
         log_info(f"Loaded {args.cnn_arch} from {ckpt}")
