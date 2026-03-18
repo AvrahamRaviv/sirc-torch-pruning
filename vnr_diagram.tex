@@ -17,7 +17,12 @@
 ]
 
 %% ═══ LINEAR ═══════════════════════════════════════════════════════════
-\node[font=\normalsize\bfseries] at (6.0, 4.8) {Linear Layer — VNR};
+\node[font=\normalsize\bfseries] at (6.0, 5.2) {Linear Layer — VNR};
+
+% BN statistics at the top
+\node[param, fill=green!20] (lsigma) at (3.0, 3.8) {$\sigma$};
+\node[param, fill=green!20] (lmu)    at (5.0, 3.8) {$\mu$};
+\node[annot] at (4.0, 4.7) {Collect: $\sigma_0, \mu_0$};
 
 % Main forward pass
 \node[param]             (lx)   at (0,   0.5) {$x$};
@@ -28,17 +33,13 @@
 \node[box]               (ladd) at (9.5, 0.5) {Add};
 \node[param]             (lz)   at (12.0, 0.5) {$z$};
 
-% Parameters for Matmul (red)
-\node[param, fill=red!8]  (lvt) at (6.5,  2.6) {$\tilde{V}$};
-\node[annot] at (6.5,  3.4) {$W\!\cdot\!\sigma_0$};
+% Parameters for Matmul (red) - initialized with σ
+\node[param, fill=red!8]  (lvt) at (6.5,  2.2) {$\tilde{V}$};
+\node[annot] at (6.5,  3.0) {$W\!\cdot\!\sigma_0$};
 
-% Parameters for Add (blue): effective bias using σ and μ
-\node[box, fill=blue!8]   (lbias) at (9.5, 2.6) {$m - \tilde{V}\mu$};
-\node[annot] at (9.5,  3.4) {bias correction};
-
-% BN statistics flowing out
-\node[param, fill=green!20] (lmu)   at (3.8, -1.5) {$\mu$};
-\node[param, fill=green!20] (lsigma) at (3.8, -2.4) {$\sigma$};
+% Parameters for Add (blue) - initialized with μ
+\node[box, fill=blue!8]   (lbias) at (9.5, 2.2) {$b + W\mu$};
+\node[annot] at (9.5,  3.0) {bias init};
 
 % Main forward arrows
 \draw[arr]  (lx)  -- (lbn);
@@ -48,9 +49,15 @@
 \draw[radd] (lvt) -- (lmul);
 \draw[badd] (lbias) -- (ladd);
 
-% Statistics flowing from BN to operations
+% σ flows from top to V̂
+\draw[darrw] (lsigma) -- (lvt);
+
+% μ flows from top to bias box
 \draw[darrw] (lmu) -- (lbias);
-\draw[darrw] (lsigma) -- (lmul);
+
+% Statistics update from BN
+\draw[darrw, in=90, out=180] (lsigma) to (lbn);
+\draw[darrw, in=90, out=0] (lmu) to (lbn);
 
 \end{tikzpicture}
 \end{document}
