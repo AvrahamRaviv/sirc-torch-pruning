@@ -1,4 +1,4 @@
-\documentclass[tikz,border=14pt]{standalone}
+\documentclass[tikz,border=10pt]{standalone}
 \usepackage{tikz}
 \usepackage{amsmath}
 \usetikzlibrary{arrows.meta,calc,positioning}
@@ -6,58 +6,41 @@
 \begin{document}
 \begin{tikzpicture}[
   >=Stealth,
-  box/.style={draw, rounded corners=3pt, minimum width=1.8cm, minimum height=0.7cm,
-              inner sep=5pt, font=\small, align=center},
-  param/.style={draw, circle, minimum size=0.9cm, inner sep=1pt, font=\small},
-  annot/.style={font=\footnotesize, text=black!55},
-  arr/.style={->, thick},
-  radd/.style={->, red!70!black, thick},
-  badd/.style={->, blue!55!black, thick},
-  darrw/.style={->, dashed, black!45, thick},
+  box/.style={draw, rounded corners=2pt, minimum width=1.3cm, minimum height=0.6cm,
+              inner sep=3pt, font=\footnotesize},
+  param/.style={draw, circle, minimum size=0.75cm, inner sep=1pt, font=\small},
+  annot/.style={font=\tiny, text=gray},
+  arr/.style={->, thick, black},
+  radd/.style={->, thick, red!70},
+  badd/.style={->, thick, blue!60},
 ]
 
-%% ═══ LINEAR ═══════════════════════════════════════════════════════════
-\node[font=\normalsize\bfseries] at (6.0, 5.2) {Linear Layer — VNR};
+% Title with collection info
+\node at (5.5, 5.8) {\footnotesize collect statistics $s_0, m_0$};
 
-% BN statistics at the top
-\node[param, fill=green!20] (lsigma) at (3.0, 3.8) {$\sigma$};
-\node[param, fill=green!20] (lmu)    at (5.0, 3.8) {$\mu$};
-\node[annot] at (4.0, 4.7) {Collect: $\sigma_0, \mu_0$};
+% Parameters at top
+\node[param, fill=red!8]  (V)   at (5.5, 4.8) {$V=Ws_0$};
+\node[param, fill=blue!8] (b)   at (9.5, 4.8) {$b+Wm_0$};
 
-% Main forward pass
-\node[param]             (lx)   at (0,   0.5) {$x$};
-\node[box, fill=green!8] (lbn)  at (3.0, 0.5)
-    {BN\\[2pt]\scriptsize$x_{bn}=\dfrac{x-\mu}{\sigma}$};
-\node[annot]             at (3.0, -0.8) {Update $\sigma,\mu$};
-\node[box]               (lmul) at (6.5, 0.5) {Matmul};
-\node[box]               (ladd) at (9.5, 0.5) {Add};
-\node[param]             (lz)   at (12.0, 0.5) {$z$};
+% Main flow
+\node[param]             (x)   at (0.5, 2.0) {$X$};
+\node[box, fill=green!5] (bn)  at (3.0, 2.0) {BN};
+\node[box]               (mul) at (5.5, 2.0) {Mult};
+\node[box]               (add) at (8.0, 2.0) {Add};
+\node[param]             (out) at (10.5, 2.0) {output};
 
-% Parameters for Matmul (red) - initialized with σ
-\node[param, fill=red!8]  (lvt) at (6.5,  2.2) {$\tilde{V}$};
-\node[annot] at (6.5,  3.0) {$W\!\cdot\!\sigma_0$};
+% Annotation below BN
+\node[annot] at (3.0, 1.2) {Update $s,m$};
 
-% Parameters for Add (blue) - initialized with μ
-\node[box, fill=blue!8]   (lbias) at (9.5, 2.2) {$b + W\mu$};
-\node[annot] at (9.5,  3.0) {bias init};
+% Main arrows
+\draw[arr] (x) -- (bn);
+\draw[arr] (bn) -- (mul);
+\draw[arr] (mul) -- (add);
+\draw[arr] (add) -- (out);
 
-% Main forward arrows
-\draw[arr]  (lx)  -- (lbn);
-\draw[arr]  (lbn) -- node[above, annot]{$x_{bn}$} (lmul);
-\draw[arr]  (lmul)-- (ladd);
-\draw[arr]  (ladd)-- (lz);
-\draw[radd] (lvt) -- (lmul);
-\draw[badd] (lbias) -- (ladd);
-
-% σ flows from top to V̂
-\draw[darrw] (lsigma) -- (lvt);
-
-% μ flows from top to bias box
-\draw[darrw] (lmu) -- (lbias);
-
-% Statistics update from BN
-\draw[darrw, in=90, out=180] (lsigma) to (lbn);
-\draw[darrw, in=90, out=0] (lmu) to (lbn);
+% Parameter arrows
+\draw[radd] (V) -- (mul);
+\draw[badd] (b) -- (add);
 
 \end{tikzpicture}
 \end{document}
