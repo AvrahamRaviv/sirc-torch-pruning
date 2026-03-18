@@ -35,11 +35,11 @@
 \node[param, fill=blue!8] (lm)  at (9.5,  2.8) {$m$};
 \node[annot]              at (9.5,  3.8) {Trainable: $m^{(0)} = b + W\mu_0$};
 
-% BN running parameters (frozen in forward, updated in backward)
-\node[param, fill=green!20] (lmu)   at (3.0, -1.2) {$\mu$};
-\node[param, fill=green!20] (lsigma) at (3.0, -2.2) {$\sigma$};
-\node[annot, text width=3.5cm, align=center] at (3.0, -3.5)
-    {\textbf{Running stats}\\auto-update each batch\\(momentum: 0.1)};
+% BN running parameters (to the right, below BN)
+\node[param, fill=green!20] (lmu)   at (4.5, -0.8) {$\mu$};
+\node[param, fill=green!20] (lsigma) at (4.5, -1.8) {$\sigma$};
+\node[annot, text width=2.8cm, align=center] at (4.5, -3.0)
+    {Running stats\\auto-update\\(momentum: 0.1)};
 
 % Main forward arrows
 \draw[arr]  (lx)  -- (lbn);
@@ -49,45 +49,8 @@
 \draw[radd] (lvt) -- (lmul);
 \draw[badd] (lm)  -- (ladd);
 
-% Feedback arrows: BN uses its running stats
-\draw[darrw] (lmu)    -- (lbn);
-\draw[darrw] (lsigma) -- (lbn);
-
-% ═══════════════════════════════════════════════════════════════════════
-% Update dynamics section below
-
-\node[font=\normalsize\bfseries] at (6.0, -4.8) {\underline{Update Dynamics (per Training Batch)}};
-
-% BN Stats Update Box
-\node[draw, fill=green!3, rounded corners=3pt, text width=3.2cm, align=center, minimum height=1.8cm]
-    at (1.8, -7.5)
-    {\textbf{BN Running Stats}\\[3pt]
-     $\mu \leftarrow 0.9\mu + 0.1\bar{x}_{\text{batch}}$\\
-     $\sigma \leftarrow 0.9\sigma + 0.1\sigma_{\text{batch}}$\\
-     {\tiny (no gradient, automatic)}};
-
-% V_tilde Update Box
-\node[draw, fill=red!3, rounded corners=3pt, text width=3.2cm, align=center, minimum height=1.8cm]
-    at (5.5, -7.5)
-    {\textbf{Weight $\tilde{V}$}\\[3pt]
-     $\tilde{V} \leftarrow \tilde{V} - \alpha \nabla_{\tilde{V}} L$\\
-     $+ \text{reg loss: } \lambda\|v_{:,k}\|_2$\\
-     {\tiny (backprop + regularization)}};
-
-% m (bias) Update Box
-\node[draw, fill=blue!3, rounded corners=3pt, text width=3.2cm, align=center, minimum height=1.8cm]
-    at (9.2, -7.5)
-    {\textbf{Bias $m$}\\[3pt]
-     $m \leftarrow m - \alpha \nabla_m L$\\
-     No weight decay\\
-     {\tiny (backprop only)}};
-
-% Legend/Key
-\node[draw, fill=yellow!5, rounded corners=3pt, text width=8cm, align=left, font=\small, minimum height=1.2cm]
-    at (6.0, -9.5)
-    {\textbf{Key:}\ $\alpha$ = learning rate\ \ \ $L$ = task loss + regularization\ \ \
-     \textcolor{red}{red arrows} = learnable weight pathways\ \ \
-     \textcolor{blue}{blue arrows} = learnable bias pathways};
-
+% Dashed arrows: BN uses running stats (curved to avoid overlap)
+\draw[darrw, in=270, out=180] (lmu) to (lbn);
+\draw[darrw, in=270, out=180] (lsigma) to (lbn);
 \end{tikzpicture}
 \end{document}
