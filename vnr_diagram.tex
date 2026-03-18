@@ -1,0 +1,93 @@
+\documentclass[tikz,border=14pt]{standalone}
+\usepackage{tikz}
+\usepackage{amsmath}
+\usetikzlibrary{arrows.meta,calc,positioning}
+
+\begin{document}
+\begin{tikzpicture}[
+  >=Stealth,
+  box/.style={draw, rounded corners=3pt, minimum width=1.8cm, minimum height=0.7cm,
+              inner sep=5pt, font=\small, align=center},
+  param/.style={draw, circle, minimum size=0.9cm, inner sep=1pt, font=\small},
+  annot/.style={font=\footnotesize, text=black!55},
+  arr/.style={->, thick},
+  radd/.style={->, red!70!black, thick},
+  badd/.style={->, blue!55!black, thick},
+  darrw/.style={->, dashed, black!45, thick},
+  update/.style={->, purple!60!black, thick, densely dotted},
+]
+
+%% ═══ LINEAR ═══════════════════════════════════════════════════════════
+\node[font=\normalsize\bfseries] at (6.0, 4.8) {Linear Layer — VNR (Variance Normalization Reparameterization)};
+
+% Main forward pass (inference + training)
+\node[param]             (lx)   at (0,   0.5) {$x$};
+\node[box, fill=green!8] (lbn)  at (3.0, 0.5)
+    {BN\\[2pt]\scriptsize$x_{bn}=\dfrac{x-\mu}{\sigma}$};
+\node[box]               (lmul) at (6.5, 0.5) {Matmul};
+\node[box]               (ladd) at (9.5, 0.5) {Add};
+\node[param]             (lz)   at (12.0, 0.5) {$z$};
+
+% Parameters above
+\node[param, fill=red!8]  (lvt) at (6.5,  2.8) {$\tilde{V}$};
+\node[annot]              at (6.5,  3.8)
+    {Trainable: $V\!^{(0)} = W\!\cdot\!\sigma_0$};
+\node[param, fill=blue!8] (lm)  at (9.5,  2.8) {$m$};
+\node[annot]              at (9.5,  3.8) {Trainable: $m^{(0)} = b + W\mu_0$};
+
+% BN running parameters (frozen in forward, updated in backward)
+\node[param, fill=green!20] (lmu)   at (3.0, -1.2) {$\mu$};
+\node[param, fill=green!20] (lsigma) at (3.0, -2.2) {$\sigma$};
+\node[annot, text width=3.5cm, align=center] at (3.0, -3.5)
+    {\textbf{Running stats}\\auto-update each batch\\(momentum: 0.1)};
+
+% Main forward arrows
+\draw[arr]  (lx)  -- (lbn);
+\draw[arr]  (lbn) -- node[above, annot]{$x_{bn}$} (lmul);
+\draw[arr]  (lmul)-- (ladd);
+\draw[arr]  (ladd)-- (lz);
+\draw[radd] (lvt) -- (lmul);
+\draw[badd] (lm)  -- (ladd);
+
+% Feedback arrows: BN uses its running stats
+\draw[darrw] (lmu)    -- (lbn);
+\draw[darrw] (lsigma) -- (lbn);
+
+% ═══════════════════════════════════════════════════════════════════════
+% Update dynamics section below
+
+\node[font=\normalsize\bfseries] at (6.0, -4.8) {\underline{Update Dynamics (per Training Batch)}};
+
+% BN Stats Update Box
+\node[draw, fill=green!3, rounded corners=3pt, text width=3.2cm, align=center, minimum height=1.8cm]
+    at (1.8, -7.5)
+    {\textbf{BN Running Stats}\\[3pt]
+     $\mu \leftarrow 0.9\mu + 0.1\bar{x}_{\text{batch}}$\\
+     $\sigma \leftarrow 0.9\sigma + 0.1\sigma_{\text{batch}}$\\
+     {\tiny (no gradient, automatic)}};
+
+% V_tilde Update Box
+\node[draw, fill=red!3, rounded corners=3pt, text width=3.2cm, align=center, minimum height=1.8cm]
+    at (5.5, -7.5)
+    {\textbf{Weight $\tilde{V}$}\\[3pt]
+     $\tilde{V} \leftarrow \tilde{V} - \alpha \nabla_{\tilde{V}} L$\\
+     $+ \text{reg loss: } \lambda\|v_{:,k}\|_2$\\
+     {\tiny (backprop + regularization)}};
+
+% m (bias) Update Box
+\node[draw, fill=blue!3, rounded corners=3pt, text width=3.2cm, align=center, minimum height=1.8cm]
+    at (9.2, -7.5)
+    {\textbf{Bias $m$}\\[3pt]
+     $m \leftarrow m - \alpha \nabla_m L$\\
+     No weight decay\\
+     {\tiny (backprop only)}};
+
+% Legend/Key
+\node[draw, fill=yellow!5, rounded corners=3pt, text width=8cm, align=left, font=\small, minimum height=1.2cm]
+    at (6.0, -9.5)
+    {\textbf{Key:}\ $\alpha$ = learning rate\ \ \ $L$ = task loss + regularization\ \ \
+     \textcolor{red}{red arrows} = learnable weight pathways\ \ \
+     \textcolor{blue}{blue arrows} = learnable bias pathways};
+
+\end{tikzpicture}
+\end{document}
