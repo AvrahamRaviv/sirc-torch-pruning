@@ -273,8 +273,14 @@ def load_model(args, device):
         if checkpoint:
             state = torch.load(checkpoint, map_location="cpu", weights_only=True)
             state = _merge_vnr_state_dict(state)
-            model.load_state_dict(state, strict=True)
-            log_info(f"Loaded ViT arch from {args.model_name}, weights from {checkpoint}")
+            try:
+                model.load_state_dict(state, strict=True)
+                log_info(f"Loaded ViT arch from {args.model_name}, weights from {checkpoint}")
+            except RuntimeError:
+                from torch_pruning.utils import load_state_dict_pruned
+                model, _, _ = load_state_dict_pruned(model, state)
+                log_info(f"Loaded pruned ViT from {checkpoint} (shape mismatch, using load_state_dict_pruned)")
+                args.is_pruned_checkpoint = True
         else:
             log_info(f"Loaded ViT from {args.model_name}")
         model = model.to(device)
@@ -301,8 +307,14 @@ def load_model(args, device):
             state = torch.load(ckpt, map_location="cpu", weights_only=True)
             if "model" in state:
                 state = state["model"]
-            model.load_state_dict(state, strict=True)
-            log_info(f"Loaded ConvNeXt checkpoint from {ckpt}")
+            try:
+                model.load_state_dict(state, strict=True)
+                log_info(f"Loaded ConvNeXt checkpoint from {ckpt}")
+            except RuntimeError:
+                from torch_pruning.utils import load_state_dict_pruned
+                model, _, _ = load_state_dict_pruned(model, state)
+                log_info(f"Loaded pruned ConvNeXt from {ckpt} (shape mismatch, using load_state_dict_pruned)")
+                args.is_pruned_checkpoint = True
         else:
             log_info(f"WARNING: Checkpoint not found at {ckpt}, using random weights")
         model = model.to(device)
@@ -328,9 +340,15 @@ def load_model(args, device):
             args.bn_recalibration = False
         state = torch.load(ckpt, map_location='cpu', weights_only=True)
         state = _merge_vnr_state_dict(state)
-        model.load_state_dict(state, strict=True)
+        try:
+            model.load_state_dict(state, strict=True)
+            log_info(f"Loaded {args.cnn_arch} from {ckpt}")
+        except RuntimeError:
+            from torch_pruning.utils import load_state_dict_pruned
+            model, _, _ = load_state_dict_pruned(model, state)
+            log_info(f"Loaded pruned {args.cnn_arch} from {ckpt} (shape mismatch, using load_state_dict_pruned)")
+            args.is_pruned_checkpoint = True
         model = model.to(device)
-        log_info(f"Loaded {args.cnn_arch} from {ckpt}")
 
     else:
         raise ValueError(f"Unsupported model_type: {args.model_type}")
