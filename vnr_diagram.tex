@@ -16,11 +16,11 @@
 ]
 
 % Title with collection info
-\node at (5.5, 5.8) {\footnotesize collect statistics $s_0, m_0$};
+\node at (5.5, 5.8) {\footnotesize collect statistics $\sigma_r, \mu_r$};
 
 % Parameters at top
-\node[param, fill=red!8]  (V)   at (5.0, 4.8) {$V=Ws_0$};
-\node[param, fill=blue!8] (b)   at (8.0, 4.8) {$b+Wm_0$};
+\node[param, fill=red!8]  (V)   at (5.0, 4.8) {$V=W\sigma_r$};
+\node[param, fill=blue!8] (b)   at (8.0, 4.8) {$b+W\mu_r$};
 
 % Main flow
 \node[param]             (x)   at (0.5, 2.0) {$X$};
@@ -30,7 +30,7 @@
 \node[param]             (out) at (11.0, 2.0) {output};
 
 % Annotation below BN
-\node[annot] at (3.0, 1.2) {Update $s,m$};
+\node[annot] at (3.0, 1.2) {Update $\sigma_r,\mu_r$};
 
 % Main arrows
 \draw[arr] (x) -- (bn);
