@@ -43,7 +43,7 @@
 \draw[badd] (b) -- (add);
 
 % Self-cycle at BN showing update
-\draw[arr] (bn.north east) arc(45:315:0.5cm);
+\draw[arr, out=-90, in=-90] (bn.south west) to (bn.south east);
 
 \end{tikzpicture}
 \end{document}
