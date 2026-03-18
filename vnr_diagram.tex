@@ -16,10 +16,10 @@
 ]
 
 % Title with collection info
-\node at (5.5, 5.8) {\footnotesize collect statistics $\sigma_r, \mu_r$};
+\node at (5.5, 5.8) {\footnotesize at init, collect statistics $\sigma_0, \mu_0$};
 
 % Parameters at top
-\node[param, fill=red!8]  (V)   at (5.0, 4.8) {$V=W\sigma_r$};
+\node[param, fill=red!8]  (V)   at (5.0, 4.8) {$\tilde{V}=W\sigma_r$};
 \node[param, fill=blue!8] (b)   at (8.0, 4.8) {$b+W\mu_r$};
 
 % Main flow
@@ -41,6 +41,9 @@
 % Parameter arrows
 \draw[radd] (V) -- (mul);
 \draw[badd] (b) -- (add);
+
+% Self-cycle at BN showing update
+\draw[arr] (bn.north east) arc(45:315:0.5cm);
 
 \end{tikzpicture}
 \end{document}
