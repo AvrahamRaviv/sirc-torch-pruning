@@ -14,32 +14,31 @@
   radd/.style={->, red!70!black, thick},
   badd/.style={->, blue!55!black, thick},
   darrw/.style={->, dashed, black!45, thick},
-  update/.style={->, purple!60!black, thick, densely dotted},
 ]
 
 %% ═══ LINEAR ═══════════════════════════════════════════════════════════
-\node[font=\normalsize\bfseries] at (6.0, 4.8) {Linear Layer — VNR (Variance Normalization Reparameterization)};
+\node[font=\normalsize\bfseries] at (6.0, 4.8) {Linear Layer — VNR};
 
-% Main forward pass (inference + training)
+% Main forward pass
 \node[param]             (lx)   at (0,   0.5) {$x$};
 \node[box, fill=green!8] (lbn)  at (3.0, 0.5)
     {BN\\[2pt]\scriptsize$x_{bn}=\dfrac{x-\mu}{\sigma}$};
+\node[annot]             at (3.0, -0.8) {Update $\sigma,\mu$};
 \node[box]               (lmul) at (6.5, 0.5) {Matmul};
 \node[box]               (ladd) at (9.5, 0.5) {Add};
 \node[param]             (lz)   at (12.0, 0.5) {$z$};
 
-% Parameters above
-\node[param, fill=red!8]  (lvt) at (6.5,  2.8) {$\tilde{V}$};
-\node[annot, align=center]  at (6.5,  3.95)
-    {Trainable:\\$V\!^{(0)} = W\!\cdot\!\sigma_0$};
-\node[param, fill=blue!8] (lm)  at (9.5,  2.8) {$m$};
-\node[annot, align=center]  at (9.5,  3.95) {Trainable:\\$m^{(0)} = b + W\mu_0$};
+% Parameters for Matmul (red)
+\node[param, fill=red!8]  (lvt) at (6.5,  2.6) {$\tilde{V}$};
+\node[annot] at (6.5,  3.4) {$W\!\cdot\!\sigma_0$};
 
-% BN running parameters (to the right, below BN)
-\node[param, fill=green!20] (lmu)   at (4.5, -0.8) {$\mu$};
-\node[param, fill=green!20] (lsigma) at (4.5, -1.8) {$\sigma$};
-\node[annot, text width=2.8cm, align=center] at (4.5, -3.0)
-    {Running stats\\auto-update\\(momentum: 0.1)};
+% Parameters for Add (blue): effective bias using σ and μ
+\node[box, fill=blue!8]   (lbias) at (9.5, 2.6) {$m - \tilde{V}\mu$};
+\node[annot] at (9.5,  3.4) {bias correction};
+
+% BN statistics flowing out
+\node[param, fill=green!20] (lmu)   at (3.8, -1.5) {$\mu$};
+\node[param, fill=green!20] (lsigma) at (3.8, -2.4) {$\sigma$};
 
 % Main forward arrows
 \draw[arr]  (lx)  -- (lbn);
@@ -47,10 +46,11 @@
 \draw[arr]  (lmul)-- (ladd);
 \draw[arr]  (ladd)-- (lz);
 \draw[radd] (lvt) -- (lmul);
-\draw[badd] (lm)  -- (ladd);
+\draw[badd] (lbias) -- (ladd);
 
-% Dashed arrows: BN uses running stats (curved to avoid overlap)
-\draw[darrw, in=270, out=180] (lmu) to (lbn);
-\draw[darrw, in=270, out=180] (lsigma) to (lbn);
+% Statistics flowing from BN to operations
+\draw[darrw] (lmu) -- (lbias);
+\draw[darrw] (lsigma) -- (lmul);
+
 \end{tikzpicture}
 \end{document}
