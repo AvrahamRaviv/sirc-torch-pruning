@@ -1280,46 +1280,86 @@ def _grad_fn_to_activation(grad_fn_str):
 
 
 def _compose_post_act(conv_node):
-    """Walk forward from conv node to find BN + activation, return composed callable or None.
+    """Walk forward from conv node through BN → activation, then optionally through
+    depthwise conv chains (BN → activation), returning a composed callable.
+
+    This ensures variance is measured at the consumer conv's input rather than
+    the producer conv's output. Critical for architectures like MobileNetV2 where
+    a depthwise conv sits between the prunable expand conv and the project conv:
+    without this, sigma is measured post-expand instead of post-DW, misaligning
+    VBP importance with what VNR regularizes.
 
     Returns:
-        (post_act_fn, description_str) or (None, None)
+        callable (x -> transformed x), or None if no transformation found.
     """
     from ..ops import _ElementWiseOp
 
-    bn_module = None
-    act_fn = None
+    def _find_bn_act(node):
+        """Scan immediate outputs of `node` for (BN, activation, activation_node).
 
-    # Walk immediate outputs of conv node
-    for out_node in conv_node.outputs:
-        mod = out_node.module
-        # Check for BatchNorm
-        if isinstance(mod, nn.modules.batchnorm._BatchNorm):
-            bn_module = mod
-            # Walk further from BN to find activation
-            for bn_out in out_node.outputs:
-                bn_out_mod = bn_out.module
-                if isinstance(bn_out_mod, _ElementWiseOp):
-                    act_fn = _grad_fn_to_activation(bn_out_mod._grad_fn)
-                    if act_fn is not None:
-                        break
-            break
-        # Check for direct activation (no BN)
-        if isinstance(mod, _ElementWiseOp):
-            act_fn = _grad_fn_to_activation(mod._grad_fn)
-            if act_fn is not None:
+        Returns (bn_module_or_None, act_fn_or_None, act_node_or_None).
+        act_node is the DG node for the activation op, used to continue walking.
+        """
+        for out_node in node.outputs:
+            mod = out_node.module
+            if isinstance(mod, nn.modules.batchnorm._BatchNorm):
+                for bn_out in out_node.outputs:
+                    if isinstance(bn_out.module, _ElementWiseOp):
+                        fn = _grad_fn_to_activation(bn_out.module._grad_fn)
+                        if fn is not None:
+                            return mod, fn, bn_out
+                return mod, None, None
+            if isinstance(mod, _ElementWiseOp):
+                fn = _grad_fn_to_activation(mod._grad_fn)
+                if fn is not None:
+                    return None, fn, out_node
+        return None, None, None
+
+    # Step 1: BN + activation immediately after the conv
+    bn0, act0, act_node = _find_bn_act(conv_node)
+
+    transforms = []
+    if bn0 is not None and act0 is not None:
+        transforms.append(lambda x, _bn=bn0, _a=act0: _a(_bn(x)))
+    elif bn0 is not None:
+        transforms.append(bn0)
+    elif act0 is not None:
+        transforms.append(act0)
+
+    # Step 2: Walk through any depthwise conv chain that follows.
+    # For MobileNetV2: expand → BN → ReLU6 → DW → BN → ReLU6 → project
+    # We continue until the next output is not a depthwise conv.
+    while act_node is not None:
+        dw_conv = None
+        dw_node = None
+        for out_node in act_node.outputs:
+            mod = out_node.module
+            if isinstance(mod, nn.Conv2d) and mod.groups == mod.out_channels and mod.out_channels > 1:
+                dw_conv = mod
+                dw_node = out_node
                 break
+        if dw_conv is None:
+            break
 
-    # Compose
-    if bn_module is not None and act_fn is not None:
-        def _composed(x, _bn=bn_module, _act=act_fn):
-            return _act(_bn(x))
-        return _composed
-    elif bn_module is not None:
-        return bn_module
-    elif act_fn is not None:
-        return act_fn
-    return None
+        bn_dw, act_dw, act_node = _find_bn_act(dw_node)
+        transforms.append(lambda x, _dw=dw_conv: _dw(x))
+        if bn_dw is not None and act_dw is not None:
+            transforms.append(lambda x, _bn=bn_dw, _a=act_dw: _a(_bn(x)))
+        elif bn_dw is not None:
+            transforms.append(bn_dw)
+        elif act_dw is not None:
+            transforms.append(act_dw)
+
+    if not transforms:
+        return None
+    if len(transforms) == 1:
+        return transforms[0]
+
+    def _chain(x, _fns=transforms):
+        for fn in _fns:
+            x = fn(x)
+        return x
+    return _chain
 
 
 def build_cnn_target_layers(model, DG):
