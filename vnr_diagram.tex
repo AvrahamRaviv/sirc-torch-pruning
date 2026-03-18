@@ -30,10 +30,10 @@
 
 % Parameters above
 \node[param, fill=red!8]  (lvt) at (6.5,  2.8) {$\tilde{V}$};
-\node[annot]              at (6.5,  3.8)
-    {Trainable: $V\!^{(0)} = W\!\cdot\!\sigma_0$};
+\node[annot, align=center]  at (6.5,  3.95)
+    {Trainable:\\$V\!^{(0)} = W\!\cdot\!\sigma_0$};
 \node[param, fill=blue!8] (lm)  at (9.5,  2.8) {$m$};
-\node[annot]              at (9.5,  3.8) {Trainable: $m^{(0)} = b + W\mu_0$};
+\node[annot, align=center]  at (9.5,  3.95) {Trainable:\\$m^{(0)} = b + W\mu_0$};
 
 % BN running parameters (to the right, below BN)
 \node[param, fill=green!20] (lmu)   at (4.5, -0.8) {$\mu$};
