@@ -42,8 +42,8 @@
 \draw[radd] (V) -- (mul);
 \draw[badd] (b) -- (add);
 
-% Self-cycle at BN showing update
-\draw[arr, out=-90, in=-90] (bn.south west) to (bn.south east);
+% Self-cycle at BN showing update (full circle)
+\draw[arr] (bn.south) arc(-90:270:0.45cm);
 
 \end{tikzpicture}
 \end{document}
