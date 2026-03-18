@@ -102,7 +102,7 @@ def build_pruning_config(args, model, config_dir):
 
     config = {
         "channel_sparsity_args": {
-            "is_prune": True,
+            "is_prune": not getattr(args, 'is_pruned_checkpoint', False),
             "pruning_method": _CRITERION_TO_METHOD[args.criterion],
             "global_pruning": args.global_pruning,
             "block_size": 1,
