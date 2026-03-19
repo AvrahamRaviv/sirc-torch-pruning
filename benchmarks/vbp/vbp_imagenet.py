@@ -65,7 +65,7 @@ try:
         build_dataloaders, load_model, forward_logits,
         validate, train_one_epoch, build_cosine_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
-        build_consumer_weight_map,
+        build_consumer_weight_map, build_producer_weight_map,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -75,7 +75,7 @@ except ImportError:
         build_dataloaders, load_model, forward_logits,
         validate, train_one_epoch, build_cosine_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
-        build_consumer_weight_map,
+        build_consumer_weight_map, build_producer_weight_map,
     )
 
 # ---------------------------------------------------------------------------
@@ -318,11 +318,14 @@ def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
 # ---------------------------------------------------------------------------
 # Pruner setup
 # ---------------------------------------------------------------------------
-def build_importance(criterion, norm_per_layer=False, importance_mode="variance"):
+def build_importance(criterion, norm_per_layer=False, importance_mode="variance",
+                     wv_base_mode="weight_variance", mag_guided_delta=0.2):
     """Map criterion string to importance object."""
     if criterion == "variance":
         return tp.importance.VarianceImportance(norm_per_layer=norm_per_layer,
-                                                 importance_mode=importance_mode)
+                                                 importance_mode=importance_mode,
+                                                 wv_base_mode=wv_base_mode,
+                                                 mag_guided_delta=mag_guided_delta)
     elif criterion == "magnitude":
         return tp.importance.MagnitudeImportance(p=2)
     elif criterion == "lamp":
@@ -656,17 +659,31 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
         log_info(f"{'='*60}")
 
         # 1. Create importance and collect stats (VBP only)
+        imp_mode = getattr(args, 'importance_mode', 'variance')
         imp = build_importance(args.criterion, norm_per_layer=args.norm_per_layer,
-                               importance_mode=getattr(args, 'importance_mode', 'variance'))
+                               importance_mode=imp_mode,
+                               wv_base_mode=getattr(args, 'wv_base_mode', 'weight_variance'),
+                               mag_guided_delta=getattr(args, 'mag_guided_delta', 0.2))
         if is_vbp:
             collect_and_sync_stats(model, train_loader, device, imp, args)
-            # Set consumer weight norms for weight×variance mode
-            if getattr(args, 'importance_mode', 'variance') == 'weight_variance':
+            # Determine if consumer/producer weight norms are needed
+            wv_base = getattr(args, 'wv_base_mode', 'weight_variance')
+            _needs_consumer = imp_mode in ('weight_variance', 'weight_variance_both') or (
+                imp_mode in ('rank_fusion', 'mag_guided') and wv_base in ('weight_variance', 'weight_variance_both'))
+            _needs_producer = imp_mode == 'weight_variance_both' or (
+                imp_mode in ('rank_fusion', 'mag_guided') and wv_base == 'weight_variance_both')
+            if _needs_consumer:
                 w_map = build_consumer_weight_map(model, args.model_type,
                                                    architecture=getattr(args, 'cnn_arch', None))
                 if w_map:
                     imp.set_weight_norms(w_map)
-                    log_info(f"Weight×variance mode: set weight norms for {len(w_map)} layers")
+                    log_info(f"Set consumer weight norms for {len(w_map)} layers")
+            if _needs_producer:
+                p_map = build_producer_weight_map(model, args.model_type,
+                                                    architecture=getattr(args, 'cnn_arch', None))
+                if p_map:
+                    imp.set_producer_weight_norms(p_map)
+                    log_info(f"Set producer weight norms for {len(p_map)} layers")
 
             if is_main():
                 var_metrics = compute_variance_entropy(imp)
@@ -917,8 +934,14 @@ def parse_args():
                              choices=["variance", "magnitude", "lamp", "random"],
                              help="Importance criterion (variance=VBP, others use BasePruner)")
     prune_group.add_argument("--importance_mode", default="variance",
-                             choices=["variance", "weight_variance"],
-                             help="Importance scoring: variance (σ²) or weight_variance (||W_fc2[:,k]||·σ_k)")
+                             choices=["variance", "weight_variance", "weight_variance_both", "combined", "rank_fusion", "mag_guided"],
+                             help="Importance scoring: variance (σ²), weight_variance (||W_fc2[:,k]||·σ_k), "
+                                  "weight_variance_both, combined, rank_fusion, or mag_guided")
+    prune_group.add_argument("--wv_base_mode", default="weight_variance",
+                             choices=["variance", "weight_variance", "weight_variance_both"],
+                             help="WV formula for rank_fusion/mag_guided modes (default: weight_variance)")
+    prune_group.add_argument("--mag_guided_delta", type=float, default=0.2,
+                             help="Tolerance for mag_guided mode (default: 0.2)")
 
     # Fine-tuning
     ft_group = parser.add_argument_group("Fine-tuning")

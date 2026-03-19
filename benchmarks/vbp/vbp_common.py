@@ -518,6 +518,38 @@ def build_consumer_weight_map(model, model_type, architecture=None):
     return weight_map
 
 
+def build_producer_weight_map(model, model_type, architecture=None):
+    """Map fc1 modules to per-channel L2 row norms of fc1's own weight.
+
+    Returns:
+        Dict[nn.Module, torch.Tensor]: fc1_module → ||W_fc1[k,:]||₂ shape [d_intermediate].
+    """
+    weight_map = {}
+    if model_type == "vit":
+        for block in model.vit.encoder.layer:
+            fc1 = block.intermediate.dense
+            weight_map[fc1] = fc1.weight.detach().norm(p=2, dim=1)
+    elif model_type == "cnn":
+        if architecture and "mobilenet" in architecture.lower():
+            for name, m in model.named_modules():
+                if not hasattr(m, 'conv'):
+                    continue
+                for sub in m.conv.modules():
+                    if isinstance(sub, nn.Conv2d) and sub.groups == 1 and sub.kernel_size == (1, 1):
+                        if sub.out_channels > sub.in_channels:
+                            W = sub.weight.detach().squeeze(-1).squeeze(-1)
+                            weight_map[sub] = W.norm(p=2, dim=1)
+        else:
+            for name, m in model.named_modules():
+                if hasattr(m, 'conv1') and hasattr(m, 'conv3'):
+                    fc1 = m.conv1
+                    W = fc1.weight.detach().squeeze(-1).squeeze(-1) if fc1.weight.dim() == 4 else fc1.weight.detach()
+                    weight_map[fc1] = W.norm(p=2, dim=1)
+    if weight_map:
+        log_info(f"Producer weight map: {len(weight_map)} fc1 layers ({model_type})")
+    return weight_map
+
+
 def build_layers_to_prune(model, model_type, architecture=None, interior_only=True):
     """Return list of module names to prune (fc1 / pwconv1 / interior convs)."""
     layers = []
