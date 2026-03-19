@@ -1034,14 +1034,12 @@ class VarianceImportance(Importance):
     """
 
     def __init__(self, norm_per_layer: bool = False, eps: float = 1e-8,
-                 similarity_discount: bool = False, importance_mode: str = "variance",
-                 min_pruning_ratio: float = 0.0):
+                 similarity_discount: bool = False, importance_mode: str = "variance"):
         super().__init__()
         self.norm_per_layer = norm_per_layer
         self.eps = eps
         self.similarity_discount = similarity_discount
         self.importance_mode = importance_mode  # "variance" or "weight_variance"
-        self.min_pruning_ratio = min_pruning_ratio  # floor: each group prunes at least this fraction
 
         # Exact accumulators: module -> tensors
         self.sum = {}
@@ -1255,17 +1253,6 @@ class VarianceImportance(Importance):
             layer_mean = scores.mean()
             if layer_mean > 0:
                 scores = scores / (layer_mean + self.eps)
-
-        # Guarantee a minimum pruning floor per group: force the bottom n_floor channels
-        # to score 0, ensuring they fall below any positive global threshold.
-        # The remaining global budget is still allocated by WV ranking across layers.
-        if self.min_pruning_ratio > 0.0 and len(scores) > 1:
-            import math
-            n_floor = max(1, math.ceil(self.min_pruning_ratio * len(scores)))
-            n_floor = min(n_floor, len(scores) - 1)  # keep at least 1 channel
-            scores = scores.clone()
-            floor_indices = scores.argsort()[:n_floor]
-            scores[floor_indices] = 0.0
 
         return scores
 
