@@ -592,8 +592,9 @@ def parse_args():
     parser.add_argument("--reparam_entropy_lambda", type=float, default=0.0,
                         help="Entropy regularization strength for VNR mode")
     parser.add_argument("--importance_mode", default="variance",
-                        choices=["variance", "weight_variance"],
-                        help="Importance scoring: variance (σ²) or weight_variance (||W_fc2[:,k]||·σ_k)")
+                        choices=["variance", "weight_variance", "weight_variance_both"],
+                        help="Importance scoring: variance (σ²), weight_variance (||W_fc2[:,k]||·σ_k), "
+                             "or weight_variance_both (||W_fc1[k,:]||·σ_k·||W_fc2[:,k]||)")
 
     # KD
     parser.add_argument("--use_kd", action="store_true")

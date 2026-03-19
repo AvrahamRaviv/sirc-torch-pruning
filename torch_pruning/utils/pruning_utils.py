@@ -394,11 +394,17 @@ class ChannelPruning:
             self._post_stats_hook(self, model)
 
         # Set consumer weight norms for weight×variance importance mode
-        if self._importance_mode == "weight_variance" and self.pruning_method == PruningMethod.VBP:
+        if self._importance_mode in ("weight_variance", "weight_variance_both") and self.pruning_method == PruningMethod.VBP:
             weight_map = self._build_consumer_weight_map(model)
             if weight_map:
                 imp.set_weight_norms(weight_map)
-                _log(log, f"Weight×variance mode: set weight norms for {len(weight_map)} layers")
+                _log(log, f"Weight×variance mode: set consumer weight norms for {len(weight_map)} layers")
+
+        if self._importance_mode == "weight_variance_both" and self.pruning_method == PruningMethod.VBP:
+            producer_map = self._build_producer_weight_map(model)
+            if producer_map:
+                imp.set_producer_weight_norms(producer_map)
+                _log(log, f"Weight×variance_both: set producer weight norms for {len(producer_map)} layers")
 
         # Set mean_dict on pruner for bias compensation
         if not self._no_compensation and self._compensation_means:
@@ -743,6 +749,25 @@ class ChannelPruning:
                 weight_map[fc1] = W.norm(p=2, dim=0)  # per-input-channel norm
 
         return weight_map
+
+    def _build_producer_weight_map(self, model):
+        """Map fc1/expand modules → ||W_fc1[k,:]||₂ (row norms of fc1's own weight, shape [C_out]).
+
+        For weight_variance_both: I_k = ||W_fc1[k,:]||₂ · σ_k · ||W_fc2[:,k]||₂.
+        """
+        from torch_pruning.pruner.importance import build_target_layers
+        target_layers = build_target_layers(model, self.pruner.DG)
+        if not target_layers:
+            return {}
+
+        producer_map = {}
+        for fc1, _ in target_layers:
+            W = fc1.weight.detach()
+            if W.dim() == 4:  # Conv2d: [C_out, C_in, kH, kW]
+                W = W.squeeze(-1).squeeze(-1)
+            producer_map[fc1] = W.norm(p=2, dim=1)  # [C_out] — one norm per output channel
+
+        return producer_map
 
     def set_layers_to_prune(self, model):
         """Build ignored_layers and per-layer pruning ratio dict.

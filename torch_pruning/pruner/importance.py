@@ -1039,7 +1039,7 @@ class VarianceImportance(Importance):
         self.norm_per_layer = norm_per_layer
         self.eps = eps
         self.similarity_discount = similarity_discount
-        self.importance_mode = importance_mode  # "variance" or "weight_variance"
+        self.importance_mode = importance_mode  # "variance", "weight_variance", or "weight_variance_both"
 
         # Exact accumulators: module -> tensors
         self.sum = {}
@@ -1052,6 +1052,9 @@ class VarianceImportance(Importance):
 
         # Consumer weight norms for weight×variance mode: module -> ||W_fc2[:,k]||₂ [C]
         self.weight_norms = {}
+
+        # Producer weight norms for weight_variance_both mode: module -> ||W_fc1[k,:]||₂ [C]
+        self.producer_weight_norms = {}
 
         # Similarity discount accumulators
         self.gram = {}           # module -> A^T A [C, C] accumulated
@@ -1205,6 +1208,10 @@ class VarianceImportance(Importance):
         """
         self.weight_norms = weight_norms
 
+    def set_producer_weight_norms(self, producer_weight_norms: dict):
+        """Per-channel L2 row norms of the expand/fc1 weight: shape [C]."""
+        self.producer_weight_norms = producer_weight_norms
+
     # ---------------------------------------------------------
     # 2. Torch-Pruning interface: importance(group)
     # ---------------------------------------------------------
@@ -1240,6 +1247,13 @@ class VarianceImportance(Importance):
         if self.importance_mode == "weight_variance" and module in self.weight_norms:
             w_norms = self.weight_norms[module].to(scores.device)
             scores = w_norms[idxs] * scores.clamp(min=0.0).sqrt()
+        # Full-path: I_k = ||W_fc1[k,:]||₂ · σ_k · ||W_fc2[:,k]||₂
+        elif self.importance_mode == "weight_variance_both" and module in self.weight_norms:
+            w_norms = self.weight_norms[module].to(scores.device)
+            scores = w_norms[idxs] * scores.clamp(min=0.0).sqrt()
+            if module in self.producer_weight_norms:
+                p_norms = self.producer_weight_norms[module].to(scores.device)
+                scores = p_norms[idxs] * scores
         # else: plain variance (σ_k²), the default
 
         # Apply similarity discount: high similarity → lower importance
