@@ -516,6 +516,9 @@ def collect_and_sync_stats(model, train_loader, device, imp, args):
                 "means": {module_to_name[m]: v.cpu() for m, v in imp.means.items()
                            if m in module_to_name},
             }
+            if imp._similarity:
+                stats_dict["similarity"] = {module_to_name[m]: v.cpu() for m, v in imp._similarity.items()
+                                             if m in module_to_name}
         else:
             stats_dict = None
 
@@ -531,6 +534,10 @@ def collect_and_sync_stats(model, train_loader, device, imp, args):
                     imp.variance[mod] = var.to(device)
                     if name in stats_dict["means"]:
                         imp.means[mod] = stats_dict["means"][name].to(device)
+            if "similarity" in stats_dict:
+                for name, sim in stats_dict["similarity"].items():
+                    if name in name_to_module:
+                        imp._similarity[name_to_module[name]] = sim.to(device)
 
         dist.barrier()
 
