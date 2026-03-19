@@ -1183,12 +1183,6 @@ class VarianceImportance(Importance):
             # Numerical safety
             var = torch.clamp(var, min=0.0)
 
-            # Optional normalization per layer
-            if self.norm_per_layer:
-                layer_mean = var.mean()
-                if layer_mean > 0:
-                    var = var / (layer_mean + self.eps)
-
             self.means[module] = mean.clone()   # <-- for VBP compensation
             self.variance[module] = var         # <-- for importance
 
@@ -1252,6 +1246,13 @@ class VarianceImportance(Importance):
         if self.similarity_discount and module in self._similarity:
             R = self._similarity[module].to(scores.device)
             scores = scores * (1.0 - R[idxs])
+
+        # Normalize scores to mean=1 per layer so global threshold ≈ equal prune fraction
+        # Applied last so it works correctly for both variance and weight_variance modes
+        if self.norm_per_layer:
+            layer_mean = scores.mean()
+            if layer_mean > 0:
+                scores = scores / (layer_mean + self.eps)
 
         return scores
 
