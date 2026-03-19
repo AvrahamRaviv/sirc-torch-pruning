@@ -318,12 +318,11 @@ def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
 # ---------------------------------------------------------------------------
 # Pruner setup
 # ---------------------------------------------------------------------------
-def build_importance(criterion, norm_per_layer=False, importance_mode="variance", min_pruning_ratio=0.0):
+def build_importance(criterion, norm_per_layer=False, importance_mode="variance"):
     """Map criterion string to importance object."""
     if criterion == "variance":
         return tp.importance.VarianceImportance(norm_per_layer=norm_per_layer,
-                                                 importance_mode=importance_mode,
-                                                 min_pruning_ratio=min_pruning_ratio)
+                                                 importance_mode=importance_mode)
     elif criterion == "magnitude":
         return tp.importance.MagnitudeImportance(p=2)
     elif criterion == "lamp":
@@ -658,8 +657,7 @@ def run_pat(model, teacher, train_loader, train_sampler, val_loader,
 
         # 1. Create importance and collect stats (VBP only)
         imp = build_importance(args.criterion, norm_per_layer=args.norm_per_layer,
-                               importance_mode=getattr(args, 'importance_mode', 'variance'),
-                               min_pruning_ratio=getattr(args, 'min_pruning_ratio', 0.0))
+                               importance_mode=getattr(args, 'importance_mode', 'variance'))
         if is_vbp:
             collect_and_sync_stats(model, train_loader, device, imp, args)
             # Set consumer weight norms for weight×variance mode
@@ -911,8 +909,6 @@ def parse_args():
                              help="Max fraction of channels to prune per layer (e.g. 0.8 = keep at least 20%%)")
     prune_group.add_argument("--norm_per_layer", action="store_true",
                              help="Normalize variance per layer")
-    prune_group.add_argument("--min_pruning_ratio", type=float, default=0.0,
-                             help="Minimum fraction of channels to prune per layer (e.g. 0.05 = at least 5%% per layer)")
     prune_group.add_argument("--no_compensation", action="store_true",
                              help="Disable VBP bias compensation")
     prune_group.add_argument("--no_recalib", action="store_true",
