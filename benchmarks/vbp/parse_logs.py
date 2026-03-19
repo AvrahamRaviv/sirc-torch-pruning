@@ -112,16 +112,17 @@ def parse_step_retentions(text):
 def parse_pruning_channels(text):
     """Extract per-layer pruning channel counts from Prune+comp lines.
 
-    Returns list of dicts: {layer, kept, total, pruned_pct}.
+    Log format: "Prune+comp <pruned>/<total> channels on <layer>."
+    Returns list of dicts: {layer, pruned, total, pruned_pct}.
     """
     layers = []
     for m in re.finditer(r"Prune\+comp\s+(\d+)/(\d+)\s+channels?\s+on\s+(\S+)", text):
-        kept, total = int(m.group(1)), int(m.group(2))
+        pruned, total = int(m.group(1)), int(m.group(2))
         layers.append({
             "layer": m.group(3).rstrip("."),
-            "kept": kept,
+            "pruned": pruned,
             "total": total,
-            "pruned_pct": 100.0 * (1 - kept / total) if total > 0 else 0.0,
+            "pruned_pct": 100.0 * pruned / total if total > 0 else 0.0,
         })
     return layers
 
@@ -369,20 +370,51 @@ def print_compact(results):
         if orig:
             print(f"  Original: {orig:.4f}")
 
-    # Per-layer pruning channels breakdown (all setups/KRs)
+    # Per-layer pruning channels: one table per setup, KRs as columns
     has_pruning = any(data.get("pruning_channels") for data in results.values())
     if has_pruning:
         print(f"\n{'='*70}")
-        print("Per-layer pruning channels")
+        print("Per-layer pruning (pruned%)")
         print(f"{'='*70}")
-        for key, data in results.items():
-            channels = data.get("pruning_channels", [])
-            if not channels:
+        for setup, entries in by_setup.items():
+            # Filter to entries with pruning data, sorted by KR descending
+            pruned_entries = [(kr, d) for kr, d in entries if d.get("pruning_channels")]
+            if not pruned_entries:
                 continue
-            print(f"\n--- {key} ---")
-            print(f"  {'Layer':<45} {'Kept':>5} {'Total':>5} {'Pruned%':>7}")
-            for ch in channels:
-                print(f"  {ch['layer']:<45} {ch['kept']:>5}/{ch['total']:<5} {ch['pruned_pct']:>6.1f}%")
+            pruned_entries.sort(key=lambda x: -x[1]["hyperparams"].get("keep_ratio", 0))
+
+            # Collect all layer names (preserve order from first KR that has them)
+            all_layers = []
+            seen = set()
+            for _, d in pruned_entries:
+                for ch in d["pruning_channels"]:
+                    if ch["layer"] not in seen:
+                        all_layers.append(ch["layer"])
+                        seen.add(ch["layer"])
+
+            # Build per-KR lookup: layer → {pruned, total, pruned_pct}
+            kr_labels = []
+            kr_lookups = []
+            for kr_folder, d in pruned_entries:
+                kr = d["hyperparams"].get("keep_ratio", kr_folder)
+                kr_labels.append(str(kr))
+                lookup = {ch["layer"]: ch for ch in d["pruning_channels"]}
+                kr_lookups.append(lookup)
+
+            col_w = 7
+            kr_hdr = "".join(f" {k:>{col_w}}" for k in kr_labels)
+            print(f"\n--- {setup} ---")
+            print(f"  {'Layer':<40} {'Tot':>4}{kr_hdr}")
+            for layer in all_layers:
+                # Total from first KR that has this layer
+                total = next((lk[layer]["total"] for lk in kr_lookups if layer in lk), "?")
+                cells = ""
+                for lk in kr_lookups:
+                    if layer in lk:
+                        cells += f" {lk[layer]['pruned_pct']:>{col_w}.1f}"
+                    else:
+                        cells += f" {'-':>{col_w}}"
+                print(f"  {layer:<40} {total:>4}{cells}")
 
 
 def main():
