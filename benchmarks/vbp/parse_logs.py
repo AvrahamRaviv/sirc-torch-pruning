@@ -109,6 +109,23 @@ def parse_step_retentions(text):
     return retentions
 
 
+def parse_pruning_channels(text):
+    """Extract per-layer pruning channel counts from Prune+comp lines.
+
+    Returns list of dicts: {layer, kept, total, pruned_pct}.
+    """
+    layers = []
+    for m in re.finditer(r"Prune\+comp\s+(\d+)/(\d+)\s+channels?\s+on\s+(\S+)", text):
+        kept, total = int(m.group(1)), int(m.group(2))
+        layers.append({
+            "layer": m.group(3).rstrip("."),
+            "kept": kept,
+            "total": total,
+            "pruned_pct": 100.0 * (1 - kept / total) if total > 0 else 0.0,
+        })
+    return layers
+
+
 def parse_summary(text):
     """Extract final summary block."""
     summary = {}
@@ -171,6 +188,7 @@ def parse_log(log_path):
         "step_retentions": parse_step_retentions(text),
         "epochs": parse_epochs(text),
         "summary": parse_summary(text),
+        "pruning_channels": parse_pruning_channels(text),
     }
 
     # Infer keep_ratio from folder name if not in log
@@ -350,6 +368,21 @@ def print_compact(results):
         orig = entries[0][1]["summary"].get("original_acc")
         if orig:
             print(f"  Original: {orig:.4f}")
+
+    # Per-layer pruning channels breakdown (all setups/KRs)
+    has_pruning = any(data.get("pruning_channels") for data in results.values())
+    if has_pruning:
+        print(f"\n{'='*70}")
+        print("Per-layer pruning channels")
+        print(f"{'='*70}")
+        for key, data in results.items():
+            channels = data.get("pruning_channels", [])
+            if not channels:
+                continue
+            print(f"\n--- {key} ---")
+            print(f"  {'Layer':<45} {'Kept':>5} {'Total':>5} {'Pruned%':>7}")
+            for ch in channels:
+                print(f"  {ch['layer']:<45} {ch['kept']:>5}/{ch['total']:<5} {ch['pruned_pct']:>6.1f}%")
 
 
 def main():
