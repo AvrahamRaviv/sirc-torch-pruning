@@ -1024,11 +1024,15 @@ class MACAwareImportance(GroupMagnitudeImportance):
 
 
 def _to_percentile_rank(scores):
-    """Convert scores to percentile ranks ∈ [0, 1] within the given tensor."""
+    """Convert scores to percentile ranks ∈ [0, 1] within the given tensor.
+
+    Uses stable sort to guarantee deterministic tie-breaking across DDP ranks
+    (CUDA non-stable sort is non-deterministic for tied values).
+    """
     n = len(scores)
     if n <= 1:
         return torch.ones_like(scores)
-    order = scores.argsort().argsort().float()
+    order = scores.argsort(stable=True).argsort(stable=True).float()
     return order / (n - 1)
 
 
