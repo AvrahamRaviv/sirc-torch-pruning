@@ -332,7 +332,9 @@ class ChannelPruning:
                 imp = tp.importance.VarianceImportance(
                     norm_per_layer=self._vbp_norm_per_layer,
                     similarity_discount=self._similarity_discount,
-                    importance_mode=self._importance_mode)
+                    importance_mode=self._importance_mode,
+                    alpha=self.channel_sparsity_args.get("alpha", 0.5),
+                    normalize=self.channel_sparsity_args.get("normalize_importance", False))
                 self.vbp_importance = imp
             pruner_entry = partial(tp.pruner.VBPPruner)
         elif self.pruning_method == PruningMethod.LAMP:
