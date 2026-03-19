@@ -1034,12 +1034,15 @@ class VarianceImportance(Importance):
     """
 
     def __init__(self, norm_per_layer: bool = False, eps: float = 1e-8,
-                 similarity_discount: bool = False, importance_mode: str = "variance"):
+                 similarity_discount: bool = False, importance_mode: str = "variance",
+                 alpha: float = 0.5, normalize: bool = False):
         super().__init__()
         self.norm_per_layer = norm_per_layer
         self.eps = eps
         self.similarity_discount = similarity_discount
-        self.importance_mode = importance_mode  # "variance", "weight_variance", or "weight_variance_both"
+        self.importance_mode = importance_mode  # "variance", "weight_variance", "weight_variance_both", or "combined"
+        self.alpha = alpha
+        self.normalize = normalize
 
         # Exact accumulators: module -> tensors
         self.sum = {}
@@ -1254,6 +1257,22 @@ class VarianceImportance(Importance):
             if module in self.producer_weight_norms:
                 p_norms = self.producer_weight_norms[module].to(scores.device)
                 scores = p_norms[idxs] * scores
+        # Combined magnitude + variance: linearly blend normalized scores
+        elif self.importance_mode == "combined":
+            var_scores = scores.clamp(min=0.0).sqrt()  # σ_k
+            w = module.weight.view(module.weight.shape[0], -1)
+            mag_scores = w.norm(p=2, dim=1)[idxs].to(scores.device)
+
+            # Optional per-layer normalization
+            if self.normalize:
+                var_mean = var_scores.mean()
+                mag_mean = mag_scores.mean()
+                if var_mean > self.eps:
+                    var_scores = var_scores / var_mean
+                if mag_mean > self.eps:
+                    mag_scores = mag_scores / mag_mean
+
+            scores = self.alpha * mag_scores + (1 - self.alpha) * var_scores
         # else: plain variance (σ_k²), the default
 
         # Apply similarity discount: high similarity → lower importance
@@ -1269,6 +1288,112 @@ class VarianceImportance(Importance):
                 scores = scores / (layer_mean + self.eps)
 
         return scores
+
+    @torch.no_grad()
+    def decompose_combined(self, group, verbose=True):
+        """Decompose combined importance into magnitude and variance contributions.
+
+        Returns a dict with per-channel breakdown:
+            {
+                "mag": magnitude scores,
+                "var": variance scores,
+                "combined": blended scores,
+                "mag_pct": percentage of combined from magnitude,
+                "var_pct": percentage of combined from variance,
+            }
+
+        Args:
+            group: Pruning group (same as __call__)
+            verbose: If True, print summary statistics
+
+        Returns:
+            dict with decomposed scores and percentages
+        """
+        if self.importance_mode != "combined":
+            raise ValueError(f"decompose_combined only works with combined mode, got {self.importance_mode}")
+
+        dep, idxs = group[0]
+        module = dep.target.module
+
+        if module not in self.variance:
+            # Search group for any module with stats
+            for dep_i, _ in group:
+                candidate = dep_i.target.module
+                if candidate in self.variance and len(self.variance[candidate]) == len(idxs):
+                    module = candidate
+                    break
+            else:
+                return None
+
+        var = self.variance[module]
+        idxs = torch.as_tensor(idxs, dtype=torch.long)
+        var_scores = var[idxs].clone().clamp(min=0.0).sqrt()  # σ_k
+
+        # Magnitude: L2 norms per row
+        w = module.weight.view(module.weight.shape[0], -1)
+        mag_scores = w.norm(p=2, dim=1)[idxs].to(var_scores.device)
+
+        # Normalize if requested
+        mag_scores_norm = mag_scores.clone()
+        var_scores_norm = var_scores.clone()
+        if self.normalize:
+            var_mean = var_scores.mean()
+            mag_mean = mag_scores.mean()
+            if var_mean > self.eps:
+                var_scores_norm = var_scores / var_mean
+            if mag_mean > self.eps:
+                mag_scores_norm = mag_scores / mag_mean
+
+        # Combined
+        combined = self.alpha * mag_scores_norm + (1 - self.alpha) * var_scores_norm
+
+        # Apply similarity discount if enabled
+        if self.similarity_discount and module in self._similarity:
+            R = self._similarity[module].to(combined.device)
+            combined = combined * (1.0 - R[idxs])
+
+        # Apply norm_per_layer if enabled
+        if self.norm_per_layer:
+            layer_mean = combined.mean()
+            if layer_mean > 0:
+                combined = combined / (layer_mean + self.eps)
+
+        # Compute percentage contributions
+        mag_contrib = self.alpha * mag_scores_norm
+        var_contrib = (1 - self.alpha) * var_scores_norm
+        total = mag_contrib + var_contrib
+        mag_pct = (mag_contrib / (total + self.eps) * 100).cpu().numpy()
+        var_pct = (var_contrib / (total + self.eps) * 100).cpu().numpy()
+
+        result = {
+            "mag": mag_scores.cpu().numpy(),
+            "var": var_scores.cpu().numpy(),
+            "combined": combined.cpu().numpy(),
+            "mag_pct": mag_pct,
+            "var_pct": var_pct,
+        }
+
+        if verbose:
+            print(f"Combined importance decomposition for {module.__class__.__name__}:")
+            print(f"  Alpha (mag weight): {self.alpha:.2f}")
+            print(f"  Magnitude stats:")
+            print(f"    Mean: {mag_scores.mean():.4f}, Std: {mag_scores.std():.4f}")
+            print(f"    Min: {mag_scores.min():.4f}, Max: {mag_scores.max():.4f}")
+            print(f"  Variance stats:")
+            print(f"    Mean: {var_scores.mean():.4f}, Std: {var_scores.std():.4f}")
+            print(f"    Min: {var_scores.min():.4f}, Max: {var_scores.max():.4f}")
+            print(f"  Combined contribution:")
+            print(f"    Magnitude: {mag_pct.mean():.1f}% ± {mag_pct.std():.1f}%")
+            print(f"    Variance:  {var_pct.mean():.1f}% ± {var_pct.std():.1f}%")
+            print(f"  Top 5 channels by combined score:")
+            top_idx = torch.argsort(torch.tensor(result["combined"]), descending=True)[:5]
+            for i, ch_idx in enumerate(top_idx, 1):
+                ch_idx = ch_idx.item()
+                print(f"    {i}. Ch {ch_idx}: mag={result['mag'][ch_idx]:.4f} ({result['mag_pct'][ch_idx]:.0f}%) "
+                      f"+ var={result['var'][ch_idx]:.4f} ({result['var_pct'][ch_idx]:.0f}%) "
+                      f"= {result['combined'][ch_idx]:.4f}")
+
+        return result
 
 
 # ---------------------------------------------------------------------------

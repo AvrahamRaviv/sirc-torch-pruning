@@ -34,6 +34,20 @@ data
 
 cache/
 
+# Research artifacts, reports, and diagrams (local only)
+report/preview-*.png
+report/preview-*.pdf
+*.pdf
+!Documentation/**/*.pdf
+vnr_*.md
+vnr_*.pdf
+vnr_*.tex
+vnr_*.aux
+benchmarks/vbp/*.md
+benchmarks/vbp/*.png
+mean_residual_*.pdf
+img.png
+
 # Local project management (not pushed to remote)
 CLAUDE.md
 STATUS.md

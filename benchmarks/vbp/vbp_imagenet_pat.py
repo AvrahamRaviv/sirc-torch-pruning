@@ -142,6 +142,8 @@ def build_pruning_config(args, model, config_dir):
             "reparam_during_pat": getattr(args, 'reparam_during_pat', False),
             "reparam_target": getattr(args, 'reparam_target', 'fc2'),
             "importance_mode": getattr(args, 'importance_mode', 'variance'),
+            "alpha": getattr(args, 'alpha', 0.5),
+            "normalize_importance": getattr(args, 'normalize_importance', False),
         },
         "slice_sparsity_args": None,
     }
@@ -592,9 +594,13 @@ def parse_args():
     parser.add_argument("--reparam_entropy_lambda", type=float, default=0.0,
                         help="Entropy regularization strength for VNR mode")
     parser.add_argument("--importance_mode", default="variance",
-                        choices=["variance", "weight_variance", "weight_variance_both"],
+                        choices=["variance", "weight_variance", "weight_variance_both", "combined"],
                         help="Importance scoring: variance (σ²), weight_variance (||W_fc2[:,k]||·σ_k), "
-                             "or weight_variance_both (||W_fc1[k,:]||·σ_k·||W_fc2[:,k]||)")
+                             "weight_variance_both (||W_fc1[k,:]||·σ_k·||W_fc2[:,k]||), or combined (blend magnitude + variance)")
+    parser.add_argument("--alpha", type=float, default=0.5,
+                        help="Blend weight for combined mode: alpha*magnitude + (1-alpha)*variance")
+    parser.add_argument("--normalize_importance", action="store_true", default=False,
+                        help="Per-layer normalize magnitude and variance before combining in combined mode")
 
     # KD
     parser.add_argument("--use_kd", action="store_true")
