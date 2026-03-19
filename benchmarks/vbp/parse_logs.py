@@ -110,13 +110,22 @@ def parse_step_retentions(text):
 
 
 def parse_pruning_channels(text):
-    """Extract per-layer pruning channel counts from Prune+comp lines.
+    """Extract per-layer pruning channel counts from physical Prune lines.
 
-    Log format: "Prune+comp <pruned>/<total> channels on <layer>."
+    Only parses lines after "Last pruning step: switching to physical channel removal"
+    to avoid counting earlier Mask steps. Matches both "Prune" and "Prune+comp".
     Returns list of dicts: {layer, pruned, total, pruned_pct}.
     """
+    # Find the last physical pruning block
+    anchor = text.rfind("Last pruning step: switching to physical channel removal")
+    if anchor == -1:
+        # Fallback: no anchor found, scan entire text for Prune (not Mask) lines
+        region = text
+    else:
+        region = text[anchor:]
+
     layers = []
-    for m in re.finditer(r"Prune\+comp\s+(\d+)/(\d+)\s+channels?\s+on\s+(\S+)", text):
+    for m in re.finditer(r"Prune(?:\+comp)?\s+(\d+)/(\d+)\s+channels?\s+on\s+(\S+)", region):
         pruned, total = int(m.group(1)), int(m.group(2))
         layers.append({
             "layer": m.group(3).rstrip("."),
