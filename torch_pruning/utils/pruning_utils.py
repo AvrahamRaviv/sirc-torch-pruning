@@ -334,7 +334,9 @@ class ChannelPruning:
                     similarity_discount=self._similarity_discount,
                     importance_mode=self._importance_mode,
                     alpha=self.channel_sparsity_args.get("alpha", 0.5),
-                    normalize=self.channel_sparsity_args.get("normalize_importance", False))
+                    normalize=self.channel_sparsity_args.get("normalize_importance", False),
+                    wv_base_mode=self.channel_sparsity_args.get("wv_base_mode", "weight_variance"),
+                    mag_guided_delta=self.channel_sparsity_args.get("mag_guided_delta", 0.2))
                 self.vbp_importance = imp
             pruner_entry = partial(tp.pruner.VBPPruner)
         elif self.pruning_method == PruningMethod.LAMP:
@@ -396,13 +398,25 @@ class ChannelPruning:
             self._post_stats_hook(self, model)
 
         # Set consumer weight norms for weight×variance importance mode
-        if self._importance_mode in ("weight_variance", "weight_variance_both") and self.pruning_method == PruningMethod.VBP:
+        # Determine if consumer/producer weight norms are needed
+        _needs_consumer_norms = (
+            self._importance_mode in ("weight_variance", "weight_variance_both")
+            or (self._importance_mode in ("rank_fusion", "mag_guided")
+                and self.channel_sparsity_args.get("wv_base_mode", "weight_variance") in ("weight_variance", "weight_variance_both"))
+        )
+        _needs_producer_norms = (
+            self._importance_mode == "weight_variance_both"
+            or (self._importance_mode in ("rank_fusion", "mag_guided")
+                and self.channel_sparsity_args.get("wv_base_mode", "weight_variance") == "weight_variance_both")
+        )
+
+        if _needs_consumer_norms and self.pruning_method == PruningMethod.VBP:
             weight_map = self._build_consumer_weight_map(model)
             if weight_map:
                 imp.set_weight_norms(weight_map)
                 _log(log, f"Weight×variance mode: set consumer weight norms for {len(weight_map)} layers")
 
-        if self._importance_mode == "weight_variance_both" and self.pruning_method == PruningMethod.VBP:
+        if _needs_producer_norms and self.pruning_method == PruningMethod.VBP:
             producer_map = self._build_producer_weight_map(model)
             if producer_map:
                 imp.set_producer_weight_norms(producer_map)

@@ -1023,6 +1023,15 @@ class MACAwareImportance(GroupMagnitudeImportance):
         return combined_importance
 
 
+def _to_percentile_rank(scores):
+    """Convert scores to percentile ranks ∈ [0, 1] within the given tensor."""
+    n = len(scores)
+    if n <= 1:
+        return torch.ones_like(scores)
+    order = scores.argsort().argsort().float()
+    return order / (n - 1)
+
+
 class VarianceImportance(Importance):
     """
     Variance-based activation importance (Exact VBP).
@@ -1035,14 +1044,18 @@ class VarianceImportance(Importance):
 
     def __init__(self, norm_per_layer: bool = False, eps: float = 1e-8,
                  similarity_discount: bool = False, importance_mode: str = "variance",
-                 alpha: float = 0.5, normalize: bool = False):
+                 alpha: float = 0.5, normalize: bool = False,
+                 wv_base_mode: str = "weight_variance",
+                 mag_guided_delta: float = 0.2):
         super().__init__()
         self.norm_per_layer = norm_per_layer
         self.eps = eps
         self.similarity_discount = similarity_discount
-        self.importance_mode = importance_mode  # "variance", "weight_variance", "weight_variance_both", or "combined"
+        self.importance_mode = importance_mode  # "variance", "weight_variance", "weight_variance_both", "combined", "rank_fusion", "mag_guided"
         self.alpha = alpha
         self.normalize = normalize
+        self.wv_base_mode = wv_base_mode  # WV formula for rank_fusion/mag_guided: "variance", "weight_variance", "weight_variance_both"
+        self.mag_guided_delta = mag_guided_delta  # tolerance param for mag_guided mode
 
         # Exact accumulators: module -> tensors
         self.sum = {}
@@ -1216,6 +1229,34 @@ class VarianceImportance(Importance):
         self.producer_weight_norms = producer_weight_norms
 
     # ---------------------------------------------------------
+    # Helper: compute WV scores for a given mode
+    # ---------------------------------------------------------
+    def _compute_wv_scores(self, module, idxs, var, mode):
+        """Compute WV importance scores for the given mode.
+
+        Args:
+            module: The layer module with collected stats.
+            idxs: Channel indices (LongTensor).
+            var: Variance tensor for this module.
+            mode: One of "variance", "weight_variance", "weight_variance_both".
+
+        Returns:
+            Tensor of per-channel scores.
+        """
+        scores = var[idxs].clone()
+        if mode == "weight_variance" and module in self.weight_norms:
+            w_norms = self.weight_norms[module].to(scores.device)
+            scores = w_norms[idxs] * scores.clamp(min=0.0).sqrt()
+        elif mode == "weight_variance_both" and module in self.weight_norms:
+            w_norms = self.weight_norms[module].to(scores.device)
+            scores = w_norms[idxs] * scores.clamp(min=0.0).sqrt()
+            if module in self.producer_weight_norms:
+                p_norms = self.producer_weight_norms[module].to(scores.device)
+                scores = p_norms[idxs] * scores
+        # else: plain variance (σ_k²)
+        return scores
+
+    # ---------------------------------------------------------
     # 2. Torch-Pruning interface: importance(group)
     # ---------------------------------------------------------
     @torch.no_grad()
@@ -1244,48 +1285,66 @@ class VarianceImportance(Importance):
 
         var = self.variance[module]
         idxs = torch.as_tensor(idxs, dtype=torch.long)
-        scores = var[idxs].clone()
 
-        # Weight×variance: I_k = ||W_fc2[:,k]||₂ · σ_k
-        if self.importance_mode == "weight_variance" and module in self.weight_norms:
-            w_norms = self.weight_norms[module].to(scores.device)
-            scores = w_norms[idxs] * scores.clamp(min=0.0).sqrt()
-        # Full-path: I_k = ||W_fc1[k,:]||₂ · σ_k · ||W_fc2[:,k]||₂
-        elif self.importance_mode == "weight_variance_both" and module in self.weight_norms:
-            w_norms = self.weight_norms[module].to(scores.device)
-            scores = w_norms[idxs] * scores.clamp(min=0.0).sqrt()
-            if module in self.producer_weight_norms:
-                p_norms = self.producer_weight_norms[module].to(scores.device)
-                scores = p_norms[idxs] * scores
-        # Combined magnitude + variance: linearly blend normalized scores
-        elif self.importance_mode == "combined":
-            var_scores = scores.clamp(min=0.0).sqrt()  # σ_k
-            w = module.weight.view(module.weight.shape[0], -1)
-            mag_scores = w.norm(p=2, dim=1)[idxs].to(scores.device)
+        # --- rank_fusion: percentile-rank blend of WV and magnitude ---
+        if self.importance_mode == "rank_fusion":
+            wv_scores = self._compute_wv_scores(module, idxs, var, mode=self.wv_base_mode)
+            # Apply similarity discount to WV scores
+            if self.similarity_discount and module in self._similarity:
+                R = self._similarity[module].to(wv_scores.device)
+                wv_scores = wv_scores * (1.0 - R[idxs])
+            mag_scores = module.weight.view(module.weight.shape[0], -1).norm(p=2, dim=1)[idxs].to(wv_scores.device)
+            rank_wv = _to_percentile_rank(wv_scores)
+            rank_mag = _to_percentile_rank(mag_scores)
+            scores = self.alpha * rank_mag + (1 - self.alpha) * rank_wv
 
-            # Optional per-layer normalization
-            if self.normalize:
-                var_mean = var_scores.mean()
-                mag_mean = mag_scores.mean()
-                if var_mean > self.eps:
-                    var_scores = var_scores / var_mean
-                if mag_mean > self.eps:
-                    mag_scores = mag_scores / mag_mean
+        # --- mag_guided: magnitude controls cross-layer budget, WV controls within-layer order ---
+        elif self.importance_mode == "mag_guided":
+            wv_scores = self._compute_wv_scores(module, idxs, var, mode=self.wv_base_mode)
+            # Apply similarity discount to WV scores
+            if self.similarity_discount and module in self._similarity:
+                R = self._similarity[module].to(wv_scores.device)
+                wv_scores = wv_scores * (1.0 - R[idxs])
+            wv_rank = _to_percentile_rank(wv_scores)
+            mag_all = module.weight.view(module.weight.shape[0], -1).norm(p=2, dim=1)
+            mag_layer_mean = mag_all.mean().to(wv_rank.device)
+            delta = self.mag_guided_delta
+            scores = mag_layer_mean * (delta + (1 - delta) * wv_rank)
 
-            scores = self.alpha * mag_scores + (1 - self.alpha) * var_scores
-        # else: plain variance (σ_k²), the default
+        else:
+            scores = self._compute_wv_scores(module, idxs, var, mode=self.importance_mode)
 
-        # Apply similarity discount: high similarity → lower importance
-        if self.similarity_discount and module in self._similarity:
-            R = self._similarity[module].to(scores.device)
-            scores = scores * (1.0 - R[idxs])
+            # Combined magnitude + variance: linearly blend normalized scores
+            if self.importance_mode == "combined":
+                var_scores = var[idxs].clone().clamp(min=0.0).sqrt()  # σ_k
+                w = module.weight.view(module.weight.shape[0], -1)
+                mag_scores = w.norm(p=2, dim=1)[idxs].to(scores.device)
+
+                # Optional per-layer normalization
+                if self.normalize:
+                    var_mean = var_scores.mean()
+                    mag_mean = mag_scores.mean()
+                    if var_mean > self.eps:
+                        var_scores = var_scores / var_mean
+                    if mag_mean > self.eps:
+                        mag_scores = mag_scores / mag_mean
+
+                scores = self.alpha * mag_scores + (1 - self.alpha) * var_scores
+
+            # Apply similarity discount: high similarity → lower importance
+            if self.similarity_discount and module in self._similarity:
+                R = self._similarity[module].to(scores.device)
+                scores = scores * (1.0 - R[idxs])
 
         # Normalize scores to mean=1 per layer so global threshold ≈ equal prune fraction
-        # Applied last so it works correctly for both variance and weight_variance modes
+        # Skipped for mag_guided (would destroy cross-layer magnitude signal)
         if self.norm_per_layer:
-            layer_mean = scores.mean()
-            if layer_mean > 0:
-                scores = scores / (layer_mean + self.eps)
+            if self.importance_mode == "mag_guided":
+                warnings.warn("norm_per_layer is skipped for mag_guided mode (would destroy cross-layer signal)")
+            else:
+                layer_mean = scores.mean()
+                if layer_mean > 0:
+                    scores = scores / (layer_mean + self.eps)
 
         return scores
 

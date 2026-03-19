@@ -144,6 +144,8 @@ def build_pruning_config(args, model, config_dir):
             "importance_mode": getattr(args, 'importance_mode', 'variance'),
             "alpha": getattr(args, 'alpha', 0.5),
             "normalize_importance": getattr(args, 'normalize_importance', False),
+            "wv_base_mode": getattr(args, 'wv_base_mode', 'weight_variance'),
+            "mag_guided_delta": getattr(args, 'mag_guided_delta', 0.2),
         },
         "slice_sparsity_args": None,
     }
@@ -594,13 +596,19 @@ def parse_args():
     parser.add_argument("--reparam_entropy_lambda", type=float, default=0.0,
                         help="Entropy regularization strength for VNR mode")
     parser.add_argument("--importance_mode", default="variance",
-                        choices=["variance", "weight_variance", "weight_variance_both", "combined"],
+                        choices=["variance", "weight_variance", "weight_variance_both", "combined", "rank_fusion", "mag_guided"],
                         help="Importance scoring: variance (σ²), weight_variance (||W_fc2[:,k]||·σ_k), "
-                             "weight_variance_both (||W_fc1[k,:]||·σ_k·||W_fc2[:,k]||), or combined (blend magnitude + variance)")
+                             "weight_variance_both (||W_fc1[k,:]||·σ_k·||W_fc2[:,k]||), combined (blend magnitude + variance), "
+                             "rank_fusion (percentile-rank blend), mag_guided (magnitude budget + WV ordering)")
     parser.add_argument("--alpha", type=float, default=0.5,
-                        help="Blend weight for combined mode: alpha*magnitude + (1-alpha)*variance")
+                        help="Blend weight for combined/rank_fusion: alpha*magnitude + (1-alpha)*variance")
     parser.add_argument("--normalize_importance", action="store_true", default=False,
                         help="Per-layer normalize magnitude and variance before combining in combined mode")
+    parser.add_argument("--wv_base_mode", default="weight_variance",
+                        choices=["variance", "weight_variance", "weight_variance_both"],
+                        help="WV formula for rank_fusion/mag_guided modes (default: weight_variance)")
+    parser.add_argument("--mag_guided_delta", type=float, default=0.2,
+                        help="Tolerance for mag_guided mode: higher = more magnitude-like (default: 0.2)")
 
     # KD
     parser.add_argument("--use_kd", action="store_true")
