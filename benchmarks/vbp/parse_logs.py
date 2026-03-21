@@ -281,11 +281,11 @@ def flatten_for_csv(results):
     return rows
 
 
-def print_compact(results):
+def print_compact(results, prune_channels=False):
     """Print compact summary optimized for LLM analysis.
 
     Layout: one config block per setup, then a table with one row per KR
-    showing retention → epoch-by-epoch val_acc → best/final.
+    showing retention → val_acc every 20 epochs → best/final.
     Minimal tokens, maximum information density.
     """
     # Group by setup
@@ -331,14 +331,17 @@ def print_compact(results):
                 cells += "".join(f" {'':>13}" for _ in range(max_sp_epochs - len(sp_eps)))
                 print(f"  {kr:>5}{cells}")
 
-        # Collect all FT epoch counts to build header
+        # Collect all FT epoch counts to build sampled header (every 20 epochs)
         max_ft_epochs = 0
         for _, data in entries:
             ft_eps = [e for e in data["epochs"] if e["phase"] == "FT"]
             max_ft_epochs = max(max_ft_epochs, len(ft_eps))
 
+        # Sampled epoch indices (every 20th, 0-based)
+        sample_indices = list(range(19, max_ft_epochs, 20))  # E20, E40, E60, ...
+
         # Header
-        ep_cols = "".join(f" {'E'+str(i+1):>6}" for i in range(max_ft_epochs))
+        ep_cols = "".join(f" {'E'+str(i+1):>6}" for i in sample_indices)
         print(f"  {'KR':>5} {'SpBest':>7} {'Ret':>7} {ep_cols} {'Best':>7} {'MACs':>6}")
 
         # One row per keep ratio
@@ -356,11 +359,14 @@ def print_compact(results):
             # Retention (last step)
             ret_str = f"{retentions[-1]['acc']:.4f}" if retentions else "  -"
 
-            # Per-epoch FT val_acc
+            # Per-epoch FT val_acc (sampled every 20 epochs)
             ft_eps = [e for e in epochs if e["phase"] == "FT"]
-            ep_vals = "".join(f" {e['val_acc']:>6.4f}" for e in ft_eps)
-            # Pad if fewer epochs than max
-            ep_vals += "".join("      -" for _ in range(max_ft_epochs - len(ft_eps)))
+            ep_vals = ""
+            for idx in sample_indices:
+                if idx < len(ft_eps):
+                    ep_vals += f" {ft_eps[idx]['val_acc']:>6.4f}"
+                else:
+                    ep_vals += "      -"
 
             # Best FT (from summary or FT epochs)
             best = summary.get("best_acc")
@@ -381,7 +387,7 @@ def print_compact(results):
 
     # Per-layer pruning channels: one table per setup, KRs as columns
     has_pruning = any(data.get("pruning_channels") for data in results.values())
-    if has_pruning:
+    if has_pruning and prune_channels:
         print(f"\n{'='*70}")
         print("Per-layer pruning (pruned%)")
         print(f"{'='*70}")
@@ -443,6 +449,8 @@ def main():
                         help="Output file path (default: <root>/experiment_summary.<fmt>)")
     parser.add_argument("--stdout", action="store_true",
                         help="Print compact summary to stdout instead of saving file")
+    parser.add_argument("--prune_channels", action="store_true",
+                        help="Show per-layer pruning channel breakdown")
     args = parser.parse_args()
 
     results = scan_experiments(args.root, args.setups, args.keep_ratios)
@@ -455,7 +463,7 @@ def main():
     print(f"Parsed {len(results)} experiment(s)")
 
     if args.stdout:
-        print_compact(results)
+        print_compact(results, prune_channels=args.prune_channels)
         return
 
     out_path = args.output or os.path.join(
