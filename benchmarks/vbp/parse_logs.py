@@ -368,10 +368,11 @@ def print_compact(results, prune_channels=False):
                 else:
                     ep_vals += "      -"
 
-            # Best training acc (from summary or PAT+FT epochs)
+            # Best acc after physical pruning (FT phase only)
+            ft_eps = [e for e in epochs if e["phase"] == "FT"]
             best = summary.get("best_acc")
-            if best is None and train_eps:
-                best = max(e["val_acc"] for e in train_eps)
+            if best is None and ft_eps:
+                best = max(e["val_acc"] for e in ft_eps)
             best_str = f"{best:.4f}" if best else "  -"
 
             # MACs
