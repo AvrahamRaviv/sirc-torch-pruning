@@ -96,13 +96,11 @@ class Pruning:
             slice_sa = sparsity_args['slice_sparsity_args']
             _log(log, "=> Init pruner module")
         except Exception as e:
-            if os.path.exists(os.path.join(config_folder, "pruning_config.json")):
-                print("There is pruning_config.json in output folder, but it is failed with the following error:")
-                print(e)
-            else:
-                print("There is no pruning_config.json in output folder")
+            config_path = os.path.join(config_folder, "pruning_config.json")
+            if os.path.exists(config_path):
+                _log(log, f"=> Corrupt pruning_config.json ({e}), deleting and re-creating")
+                os.remove(config_path)
             channel_sa, slice_sa = None, None
-            _log(log, "=> Unable to find a valid pruning configuration.")
 
         self.channel_pruner = ChannelPruning(channel_sa, model, config_folder, forward_fn, log, device,
                                              train_loader=train_loader, post_stats_hook=post_stats_hook)

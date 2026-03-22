@@ -351,9 +351,11 @@ def main(argv):
 
     # Build pruning config and Pruning class
     config_dir = os.path.join(args.save_dir, "pruning_config")
-    build_pruning_config(args, model, config_dir)
-
     use_ddp = not args.disable_ddp and dist.is_initialized()
+    if not use_ddp or is_main():
+        build_pruning_config(args, model, config_dir)
+    if use_ddp:
+        dist.barrier()  # wait for rank 0 to write config before others read it
     stats_hook = _make_stats_sync_hook(device) if use_ddp else None
     prune_log = logger if is_main() else None
 
