@@ -281,11 +281,11 @@ def flatten_for_csv(results):
     return rows
 
 
-def print_compact(results, prune_channels=False):
+def print_compact(results, prune_channels=False, epoch_interval=20):
     """Print compact summary optimized for LLM analysis.
 
     Layout: one config block per setup, then a table with one row per KR
-    showing retention → val_acc every 20 epochs → best/final.
+    showing retention → val_acc every N epochs → best/final.
     Minimal tokens, maximum information density.
     """
     # Group by setup
@@ -337,8 +337,8 @@ def print_compact(results, prune_channels=False):
             train_eps = [e for e in data["epochs"] if e["phase"] in ("FT", "PAT")]
             max_train_epochs = max(max_train_epochs, len(train_eps))
 
-        # Sampled epoch indices (every 20th, 0-based)
-        sample_indices = list(range(19, max_train_epochs, 20))  # E20, E40, E60, ...
+        # Sampled epoch indices (every Nth, 0-based)
+        sample_indices = list(range(epoch_interval - 1, max_train_epochs, epoch_interval))
 
         # Header
         ep_cols = "".join(f" {'E'+str(i+1):>6}" for i in sample_indices)
@@ -450,6 +450,8 @@ def main():
                         help="Output file path (default: <root>/experiment_summary.<fmt>)")
     parser.add_argument("--stdout", action="store_true",
                         help="Print compact summary to stdout instead of saving file")
+    parser.add_argument("--epoch_interval", type=int, default=20,
+                        help="Show val_acc every N epochs in compact output")
     parser.add_argument("--prune_channels", action="store_true",
                         help="Show per-layer pruning channel breakdown")
     args = parser.parse_args()
@@ -464,7 +466,8 @@ def main():
     print(f"Parsed {len(results)} experiment(s)")
 
     if args.stdout:
-        print_compact(results, prune_channels=args.prune_channels)
+        print_compact(results, prune_channels=args.prune_channels,
+                      epoch_interval=args.epoch_interval)
         return
 
     out_path = args.output or os.path.join(
