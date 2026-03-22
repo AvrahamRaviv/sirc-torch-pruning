@@ -394,6 +394,12 @@ def main(argv):
 
     best_acc = 0.0
     for epoch in range(total):
+        # 0. Tear down DDP before prune() when reparam may replace modules
+        #    (avoids replacing modules under a live DDP wrapper → CUDA crash)
+        if use_ddp and args.reparam_during_pat and cp.prune_channels:
+            del train_model
+            train_model = model  # raw model for prune() + reparameterize()
+
         # 1. Prune / sparse lifecycle / no-op (phase decided internally)
         pruner.prune(model, epoch, log=prune_log, mask_only=not args.no_mask_only)
 
@@ -401,13 +407,12 @@ def main(argv):
         stepped = cp.step_completed
         changed = cp.model_changed
         if stepped and is_main():
-            eval_model = train_model.module if isinstance(train_model, DDP) else train_model
-            acc_ret, loss_ret = validate(eval_model, val_loader, device, args.model_type)
-            pruned_macs, _ = tp.utils.count_ops_and_params(eval_model, example_inputs)
+            acc_ret, loss_ret = validate(model, val_loader, device, args.model_type)
+            pruned_macs, _ = tp.utils.count_ops_and_params(model, example_inputs)
             log_info(f"Step retention: acc={acc_ret:.4f}, loss={loss_ret:.4f}, "
                      f"MACs={pruned_macs / 1e9:.2f}G")
 
-        # 3. Rebuild optimizer/DDP only after physical removal
+        # 3. Rebuild optimizer/DDP after model changes (reparam, prune, sparse)
         if use_ddp and changed:
             _broadcast_model_state(model)
         if changed:
@@ -420,9 +425,14 @@ def main(argv):
                 sched_epochs = max(1, total - epoch)
                 scheduler, step_per_batch = build_ft_scheduler(optimizer, sched_epochs, len(train_loader), eta_min=args.ft_eta_min)
             if use_ddp:
-                del train_model
                 train_model = DDP(model, device_ids=[args.local_rank],
                                   output_device=args.local_rank)
+                dist.barrier()
+        elif use_ddp and args.reparam_during_pat and not isinstance(train_model, DDP):
+            # Re-wrap DDP if we tore it down but prune() didn't trigger changes
+            train_model = DDP(model, device_ids=[args.local_rank],
+                              output_device=args.local_rank)
+            dist.barrier()
 
         # 4. Train with phase-appropriate losses
         phase = cp.phase
