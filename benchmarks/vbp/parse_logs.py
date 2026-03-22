@@ -331,14 +331,14 @@ def print_compact(results, prune_channels=False):
                 cells += "".join(f" {'':>13}" for _ in range(max_sp_epochs - len(sp_eps)))
                 print(f"  {kr:>5}{cells}")
 
-        # Collect all FT epoch counts to build sampled header (every 20 epochs)
-        max_ft_epochs = 0
+        # Collect all training epoch counts (PAT + FT) to build sampled header
+        max_train_epochs = 0
         for _, data in entries:
-            ft_eps = [e for e in data["epochs"] if e["phase"] == "FT"]
-            max_ft_epochs = max(max_ft_epochs, len(ft_eps))
+            train_eps = [e for e in data["epochs"] if e["phase"] in ("FT", "PAT")]
+            max_train_epochs = max(max_train_epochs, len(train_eps))
 
         # Sampled epoch indices (every 20th, 0-based)
-        sample_indices = list(range(19, max_ft_epochs, 20))  # E20, E40, E60, ...
+        sample_indices = list(range(19, max_train_epochs, 20))  # E20, E40, E60, ...
 
         # Header
         ep_cols = "".join(f" {'E'+str(i+1):>6}" for i in sample_indices)
@@ -359,19 +359,19 @@ def print_compact(results, prune_channels=False):
             # Retention (last step)
             ret_str = f"{retentions[-1]['acc']:.4f}" if retentions else "  -"
 
-            # Per-epoch FT val_acc (sampled every 20 epochs)
-            ft_eps = [e for e in epochs if e["phase"] == "FT"]
+            # Per-epoch val_acc (PAT + FT combined, sampled every 20 epochs)
+            train_eps = [e for e in epochs if e["phase"] in ("FT", "PAT")]
             ep_vals = ""
             for idx in sample_indices:
-                if idx < len(ft_eps):
-                    ep_vals += f" {ft_eps[idx]['val_acc']:>6.4f}"
+                if idx < len(train_eps):
+                    ep_vals += f" {train_eps[idx]['val_acc']:>6.4f}"
                 else:
                     ep_vals += "      -"
 
-            # Best FT (from summary or FT epochs)
+            # Best training acc (from summary or PAT+FT epochs)
             best = summary.get("best_acc")
-            if best is None and ft_eps:
-                best = max(e["val_acc"] for e in ft_eps)
+            if best is None and train_eps:
+                best = max(e["val_acc"] for e in train_eps)
             best_str = f"{best:.4f}" if best else "  -"
 
             # MACs
