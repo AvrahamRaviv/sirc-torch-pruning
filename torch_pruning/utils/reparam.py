@@ -33,6 +33,23 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 logger.propagate = False  # prevent duplicate output via root logger
 
+
+def _is_main_rank():
+    """Check if this is rank 0 (or non-DDP)."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
+
+
+def _log_info(msg):
+    if _is_main_rank():
+        logger.info(msg)
+
+
+def _log_warning(msg):
+    if _is_main_rank():
+        logger.warning(msg)
+
 # Numerical stability constants
 MIN_VARIANCE = 1e-12
 MIN_SIGMA = 1e-6
@@ -254,10 +271,10 @@ def fold_all_conv_bn(model: nn.Module) -> int:
 
             # Replace BN with Identity
             setattr(parent_module, key_b, nn.Identity())
-            logger.info(f"fold_all_conv_bn: folded {key_b}(BN) into {key_a}(Conv/Linear)")
+            _log_info(f"fold_all_conv_bn: folded {key_b}(BN) into {key_a}(Conv/Linear)")
             folded += 1
 
-    logger.info(f"fold_all_conv_bn: total {folded} BNs folded into preceding layers")
+    _log_info(f"fold_all_conv_bn: total {folded} BNs folded into preceding layers")
     return folded
 
 
@@ -327,7 +344,7 @@ class BaseReparamManager(ABC):
 
         self._active = True
         cls_name = type(self).__name__
-        logger.info(f"{cls_name}: reparameterized {len(targets)} {self.reparam_target} modules"
+        _log_info(f"{cls_name}: reparameterized {len(targets)} {self.reparam_target} modules"
                      f"{' (scale-invariant)' if self.scale_invariant else ''}"
                      f" [norm_dim={self.norm_dim}]")
         # Log initial V-norms as baseline for tracking regularization progress
@@ -346,7 +363,7 @@ class BaseReparamManager(ABC):
                 reparam.bn.running_mean.div_(world_size)
                 torch.distributed.all_reduce(reparam.bn.running_var)
                 reparam.bn.running_var.div_(world_size)
-        logger.info(f"{type(self).__name__}: synced BN running stats across {world_size} ranks")
+        _log_info(f"{type(self).__name__}: synced BN running stats across {world_size} ranks")
 
     def merge_back(self):
         """Restore standard nn.Linear/nn.Conv2d from reparam modules."""
@@ -362,7 +379,7 @@ class BaseReparamManager(ABC):
 
         self._reparam_modules.clear()
         self._active = False
-        logger.info(f"{type(self).__name__}: merged back to standard modules")
+        _log_info(f"{type(self).__name__}: merged back to standard modules")
 
     def reparam_param_ids(self):
         """Return set of id(p) for all trainable reparam parameters."""
@@ -384,7 +401,7 @@ class BaseReparamManager(ABC):
         os.makedirs(save_dir, exist_ok=True)
         path = os.path.join(save_dir, "reparam_vnorms.pt")
         torch.save(vnorms, path)
-        logger.info(f"Saved V-norm snapshot to {path} ({len(vnorms)} layers)")
+        _log_info(f"Saved V-norm snapshot to {path} ({len(vnorms)} layers)")
 
     def log_channel_stats(self, verbose=True):
         """Log per-layer and aggregate residual-weight norm summary.
@@ -397,10 +414,10 @@ class BaseReparamManager(ABC):
         target_desc = f"fc1 ({axis_desc}-norms)" if self.reparam_target == "fc1" else f"fc2 ({axis_desc}-norms)"
 
         if verbose:
-            logger.info(f"V-norm per-layer ({target_desc}):")
+            _log_info(f"V-norm per-layer ({target_desc}):")
             for name, s in stats.items():
                 short = name.split('.')[-2] + '.' + name.split('.')[-1] if '.' in name else name
-                logger.info(
+                _log_info(
                     f"  {short}: mean={s['v_col_norm_mean']:.4f} std={s['v_col_norm_std']:.4f} "
                     f"min={s['v_col_norm_min']:.4f} max={s['v_col_norm_max']:.4f} "
                     f"<0.01={s['frac_below_0.01']:.1%} <0.1={s['frac_below_0.1']:.1%} "
@@ -416,7 +433,7 @@ class BaseReparamManager(ABC):
                 all_norms.append(norms)
             all_norms = torch.cat(all_norms)
             n_total = len(all_norms)
-            logger.info(
+            _log_info(
                 f"V-norm aggregate ({target_desc}, {len(stats)} layers, {n_total} channels): "
                 f"mean={all_norms.mean():.4f} median={all_norms.median():.4f} "
                 f"std={all_norms.std():.4f} "
@@ -463,7 +480,7 @@ class BaseReparamManager(ABC):
         cls_name = type(self).__name__
         for name in self.target_names:
             if name not in name_to_module:
-                logger.warning(f"{cls_name}: target '{name}' not found, skipping")
+                _log_warning(f"{cls_name}: target '{name}' not found, skipping")
                 continue
             module = name_to_module[name]
             if isinstance(module, nn.Linear):
@@ -471,7 +488,7 @@ class BaseReparamManager(ABC):
             elif isinstance(module, nn.Conv2d) and module.groups == 1:
                 targets[name] = module
             else:
-                logger.warning(f"{cls_name}: skipping '{name}' "
+                _log_warning(f"{cls_name}: skipping '{name}' "
                                f"({type(module).__name__}, groups={getattr(module, 'groups', 'N/A')})")
         return targets
 
@@ -536,9 +553,9 @@ class BaseReparamManager(ABC):
                     mu_dict[name] = torch.zeros(module.in_channels, device=self.device)
                 elif hasattr(module, 'mu_x'):
                     mu_dict[name] = torch.zeros_like(module.mu_x)
-                logger.warning(f"{type(self).__name__}: no data for '{name}', using zero μ_x")
+                _log_warning(f"{type(self).__name__}: no data for '{name}', using zero μ_x")
 
-        logger.info(f"{type(self).__name__}: calibrated μ_x for {len(mu_dict)} modules "
+        _log_info(f"{type(self).__name__}: calibrated μ_x for {len(mu_dict)} modules "
                      f"({sum(a['count'] for a in accumulators.values()) // max(len(accumulators), 1)} samples avg)")
         return mu_dict
 
@@ -650,7 +667,7 @@ class MeanResidualManager(BaseReparamManager):
                     reparam.m.add_(reparam.v.sum(dim=(2, 3)) @ delta)
                 reparam.mu_x.copy_(mu_new)
 
-        logger.info("MeanResidualManager: refreshed μ_x (function-preserving)")
+        _log_info("MeanResidualManager: refreshed μ_x (function-preserving)")
 
     def regularization_loss(self):
         """L_{2,1} regularization on V along self.norm_dim.
@@ -791,9 +808,9 @@ class NormalizedResidualManager(BaseReparamManager):
                     torch.zeros(d, device=self.device),
                     torch.ones(d, device=self.device),
                 )
-                logger.warning(f"{cls_name}: no data for '{name}', using zero μ_x / unit σ_x")
+                _log_warning(f"{cls_name}: no data for '{name}', using zero μ_x / unit σ_x")
 
-        logger.info(f"{cls_name}: calibrated μ_x, σ_x for {len(cal_dict)} modules "
+        _log_info(f"{cls_name}: calibrated μ_x, σ_x for {len(cal_dict)} modules "
                      f"({sum(a['count'] for a in accumulators.values()) // max(len(accumulators), 1)} samples avg)")
         return cal_dict
 
@@ -840,7 +857,7 @@ class NormalizedResidualManager(BaseReparamManager):
         """No-op: BN(affine=False) auto-updates running stats during training."""
         if not self._active:
             return
-        logger.info("NormalizedResidualManager: BN running stats auto-updated (no manual refresh needed)")
+        _log_info("NormalizedResidualManager: BN running stats auto-updated (no manual refresh needed)")
 
     def regularization_loss(self):
         """L_{2,1} on Ṽ along self.norm_dim."""
