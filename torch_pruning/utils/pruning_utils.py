@@ -516,6 +516,14 @@ class ChannelPruning:
                 self._reparam_manager.save_vnorm_snapshot(self.config_folder)
             self._reparam_manager.merge_back()
             self._model_changed = True
+            # Broadcast merged weights from rank 0 so all ranks compute
+            # identical importance scores (weights diverge during sparse training
+            # because each rank sees different data via DistributedSampler).
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                for param in model.parameters():
+                    torch.distributed.broadcast(param.data, src=0)
+                for buf in model.buffers():
+                    torch.distributed.broadcast(buf, src=0)
             self.init_channel_pruner(model, log, collect_stats=True)
 
         # GMP masking for sparse pre-training (before start_epoch)
