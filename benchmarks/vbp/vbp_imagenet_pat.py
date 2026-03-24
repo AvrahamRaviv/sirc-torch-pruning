@@ -400,8 +400,11 @@ def main(argv):
     for epoch in range(total):
         # 0. Tear down DDP before prune() when modules may be replaced
         #    (reparam or fold_bn_before_prune — avoids CUDA crash from stale DDP wrapper)
+        #    Only tear down when structural changes are expected (at or past start_epoch),
+        #    not during sparse epochs where prune() returns early with no changes.
         _needs_ddp_teardown = (args.reparam_during_pat and cp.prune_channels) or (
-            getattr(args, 'fold_bn_before_prune', False) and cp.prune_channels)
+            getattr(args, 'fold_bn_before_prune', False) and cp.prune_channels
+            and epoch >= cp.start_epoch)
         if use_ddp and _needs_ddp_teardown:
             del train_model
             train_model = model  # raw model for prune() + structural changes
