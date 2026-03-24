@@ -321,10 +321,11 @@ def main(argv):
 
     # For CNN + checkpoint, fold_bn_init was already applied inside load_model
     # (must happen before loading the checkpoint so key names match).
+    folded_bn_locations = getattr(args, '_folded_bn_locations', None)
     if getattr(args, 'fold_bn_init', False) and not (
             args.model_type == "cnn" and getattr(args, 'checkpoint', None)):
         from torch_pruning.utils.reparam import fold_all_conv_bn
-        n = fold_all_conv_bn(model)
+        n, folded_bn_locations = fold_all_conv_bn(model)
         log_info(f"[fold_bn_init] Folded {n} post-layer BNs into Conv/Linear weights")
         args.bn_recalibration = False
 
@@ -413,6 +414,13 @@ def main(argv):
             pruned_macs, _ = tp.utils.count_ops_and_params(model, example_inputs)
             log_info(f"Step retention: acc={acc_ret:.4f}, loss={loss_ret:.4f}, "
                      f"MACs={pruned_macs / 1e9:.2f}G")
+
+        # 2b. Re-insert BN after final physical pruning for FT recovery
+        if changed and folded_bn_locations and not cp.prune_channels:
+            from torch_pruning.utils.reparam import reinsert_bn
+            n_bn = reinsert_bn(model, folded_bn_locations)
+            log_info(f"[fold_bn_init] Re-inserted {n_bn} fresh BN layers for fine-tuning")
+            folded_bn_locations = None  # one-shot: don't re-insert again
 
         # 3. Rebuild optimizer/DDP after model changes (reparam, prune, sparse)
         if use_ddp and changed:

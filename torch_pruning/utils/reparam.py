@@ -219,17 +219,22 @@ class BNResidualConv2d(nn.Module):
 # BN folding utility
 # =====================================================================
 
-def fold_all_conv_bn(model: nn.Module) -> int:
+def fold_all_conv_bn(model: nn.Module):
     """Fold each BatchNorm that immediately follows a Conv2d/Linear in a Sequential
-    into that layer's weights. Replaces the BN with nn.Identity permanently.
+    into that layer's weights. Replaces the BN with nn.Identity.
 
     Walks all nn.Sequential modules looking for Conv/Linear → BN2d/BN1d pairs.
-    Returns the number of BNs folded.
+    Returns (num_folded, folded_locations) where folded_locations is a list of
+    (parent_name, bn_key, bn_type) tuples for later re-insertion via reinsert_bn.
     """
     folded = 0
+    folded_locations = []
+    named_modules = {id(m): n for n, m in model.named_modules()}
+
     for parent_module in model.modules():
         if not isinstance(parent_module, nn.Sequential):
             continue
+        parent_name = named_modules.get(id(parent_module), "")
         children = list(parent_module.named_children())
         for i in range(len(children) - 1):
             key_a, mod_a = children[i]
@@ -240,6 +245,7 @@ def fold_all_conv_bn(model: nn.Module) -> int:
                 continue
 
             bn = mod_b
+            bn_type = type(bn).__name__  # "BatchNorm2d" or "BatchNorm1d"
             eps = bn.eps
             mean = bn.running_mean          # [C_out]
             var = bn.running_var            # [C_out]
@@ -271,11 +277,51 @@ def fold_all_conv_bn(model: nn.Module) -> int:
 
             # Replace BN with Identity
             setattr(parent_module, key_b, nn.Identity())
+            folded_locations.append((parent_name, key_a, key_b, bn_type))
             _log_info(f"fold_all_conv_bn: folded {key_b}(BN) into {key_a}(Conv/Linear)")
             folded += 1
 
     _log_info(f"fold_all_conv_bn: total {folded} BNs folded into preceding layers")
-    return folded
+    return folded, folded_locations
+
+
+def reinsert_bn(model: nn.Module, folded_locations):
+    """Re-insert fresh BatchNorm layers at locations previously folded by fold_all_conv_bn.
+
+    Each Identity placeholder is replaced with a new BN (γ=1, β=0, default running stats).
+    The preceding Conv/Linear's out_channels determines the BN num_features.
+
+    Args:
+        model: The (possibly pruned) model.
+        folded_locations: List of (parent_name, conv_key, bn_key, bn_type) from fold_all_conv_bn.
+
+    Returns:
+        Number of BN layers re-inserted.
+    """
+    name_to_module = dict(model.named_modules())
+    reinserted = 0
+    for parent_name, conv_key, bn_key, bn_type in folded_locations:
+        parent = name_to_module.get(parent_name)
+        if parent is None:
+            _log_warning(f"reinsert_bn: parent '{parent_name}' not found, skipping")
+            continue
+        current = getattr(parent, bn_key, None)
+        if not isinstance(current, nn.Identity):
+            _log_warning(f"reinsert_bn: {parent_name}.{bn_key} is {type(current).__name__}, not Identity, skipping")
+            continue
+        conv = getattr(parent, conv_key, None)
+        if conv is None or not isinstance(conv, (nn.Conv2d, nn.Linear)):
+            _log_warning(f"reinsert_bn: {parent_name}.{conv_key} is not Conv/Linear, skipping")
+            continue
+        num_features = conv.weight.shape[0]
+        if bn_type == "BatchNorm2d":
+            new_bn = nn.BatchNorm2d(num_features).to(conv.weight.device)
+        else:
+            new_bn = nn.BatchNorm1d(num_features).to(conv.weight.device)
+        setattr(parent, bn_key, new_bn)
+        reinserted += 1
+    _log_info(f"reinsert_bn: re-inserted {reinserted} fresh BN layers")
+    return reinserted
 
 
 # =====================================================================
