@@ -148,10 +148,24 @@ def parse_summary(text):
     if m:
         summary["final_acc"] = float(m.group(1))
 
-    # Use last match — first may be from sparse phase (before pruning)
-    best_matches = list(re.finditer(r"Best [Aa]cc(?:uracy)?:\s*([\d.]+)", text))
-    if best_matches:
-        summary["best_acc"] = float(best_matches[-1].group(1))
+    # Extract best accuracy separately for sparse and FT phases from epoch logs
+    # Parse epochs to identify which are sparse vs FT
+    epochs = parse_epochs(text)
+    sparse_accs = [e["val_acc"] for e in epochs if e["phase"] in ("Sparse", "sparse")]
+    ft_accs = [e["val_acc"] for e in epochs if e["phase"] in ("FT", "ft", "PAT", "pat")]
+
+    if ft_accs:
+        # FT phase best (preferred when available)
+        summary["best_acc_ft"] = max(ft_accs)
+        summary["best_acc"] = summary["best_acc_ft"]  # Default to FT best
+    elif sparse_accs:
+        # Fallback to sparse best if no FT
+        summary["best_acc_sparse"] = max(sparse_accs)
+        summary["best_acc"] = summary["best_acc_sparse"]
+
+    # Also store sparse best separately if it exists
+    if sparse_accs and "best_acc_sparse" not in summary:
+        summary["best_acc_sparse"] = max(sparse_accs)
 
     m = re.search(r"Baseline:\s*([\d.]+)G MACs,\s*([\d.]+)M params", text)
     if m:
@@ -368,9 +382,11 @@ def print_compact(results, prune_channels=False, epoch_interval=20):
                 else:
                     ep_vals += "      -"
 
-            # Best acc after physical pruning (FT phase only)
+            # Best acc after physical pruning (FT phase only, not sparse)
             ft_eps = [e for e in epochs if e["phase"] == "FT"]
-            best = summary.get("best_acc")
+            best = summary.get("best_acc_ft")  # Prefer FT-only best
+            if best is None:
+                best = summary.get("best_acc")  # Fallback to stored best
             if best is None and ft_eps:
                 best = max(e["val_acc"] for e in ft_eps)
             best_str = f"{best:.4f}" if best else "  -"
