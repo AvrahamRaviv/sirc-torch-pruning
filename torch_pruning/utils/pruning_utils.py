@@ -212,6 +212,8 @@ class ChannelPruning:
         self._similarity_discount = self.channel_sparsity_args.get("similarity_discount", False)
         self._importance_mode = self.channel_sparsity_args.get("importance_mode", "variance")
         self._post_stats_hook = post_stats_hook  # callable(cp, model) — called after stats collection (e.g., DDP sync)
+        self._fold_bn_before_prune = self.channel_sparsity_args.get("fold_bn_before_prune", False)
+        self._folded_bn_locations = None  # set by fold after merge-back, consumed by reinsert after final prune
 
         # Build ignored_layers (needed before MAC estimation)
         self.set_layers_to_prune(model)
@@ -257,6 +259,11 @@ class ChannelPruning:
         # Skip stats at init when sparse pre-training precedes pruning
         # (stats will be stale by the first prune epoch)
         skip_stats = (self._sparse_mode != 'none' and self.start_epoch > 0)
+        # Fold BN before first pruner init when no sparse phase precedes
+        if self._fold_bn_before_prune and not skip_stats and self._folded_bn_locations is None:
+            from torch_pruning.utils.reparam import fold_all_conv_bn
+            n, self._folded_bn_locations = fold_all_conv_bn(model)
+            _log(log, f"Folded {n} BN layers into Conv/Linear weights before pruning")
         self.init_channel_pruner(model, log, print_layers=True,
                                  collect_stats=not skip_stats)
 
@@ -524,6 +531,11 @@ class ChannelPruning:
                     torch.distributed.broadcast(param.data, src=0)
                 for buf in model.buffers():
                     torch.distributed.broadcast(buf, src=0)
+            # Fold BN into conv weights for accurate WVW importance (after sparse, before pruning)
+            if self._fold_bn_before_prune and self._folded_bn_locations is None:
+                from torch_pruning.utils.reparam import fold_all_conv_bn
+                n, self._folded_bn_locations = fold_all_conv_bn(model)
+                _log(log, f"Folded {n} BN layers into Conv/Linear weights before pruning")
             self.init_channel_pruner(model, log, collect_stats=True)
 
         # GMP masking for sparse pre-training (before start_epoch)
@@ -679,6 +691,14 @@ class ChannelPruning:
             self._reparam_manager.reparameterize(loader)
             self._model_changed = True
             _log(log, f" Reparam active between PAT steps (λ={self._reparam_lambda})")
+
+        # Re-insert BN after final pruning step for FT recovery
+        if not self.prune_channels and self._folded_bn_locations is not None:
+            from torch_pruning.utils.reparam import reinsert_bn
+            n_bn = reinsert_bn(model, self._folded_bn_locations)
+            self._folded_bn_locations = None
+            self._model_changed = True
+            _log(log, f" Re-inserted {n_bn} fresh BN layers for fine-tuning")
 
         # After final step, persist is_prune=False so future loads skip pruning.
         # Only write from main rank (log is non-None) to avoid DDP race on the file.

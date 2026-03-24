@@ -146,6 +146,7 @@ def build_pruning_config(args, model, config_dir):
             "normalize_importance": getattr(args, 'normalize_importance', False),
             "wv_base_mode": getattr(args, 'wv_base_mode', 'weight_variance'),
             "mag_guided_delta": getattr(args, 'mag_guided_delta', 0.2),
+            "fold_bn_before_prune": getattr(args, 'fold_bn_before_prune', False),
         },
         "slice_sparsity_args": None,
     }
@@ -571,6 +572,10 @@ def parse_args():
     parser.add_argument('--fold_bn_init', action='store_true',
                         help='Fold post-Conv/Linear BN into preceding layer weights at init '
                              '(permanent; removes need for bn_recalibration in CNN models)')
+    parser.add_argument('--fold_bn_before_prune', action='store_true',
+                        help='Fold BN after sparse merge-back but before pruning (keeps BN '
+                             'during sparse for normal training, folds for accurate WVW importance, '
+                             'then re-inserts fresh BN for FT)')
 
     # PAT schedule
     parser.add_argument("--pat_steps", type=int, default=1,
