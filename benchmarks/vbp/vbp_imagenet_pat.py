@@ -398,11 +398,13 @@ def main(argv):
 
     best_acc = 0.0
     for epoch in range(total):
-        # 0. Tear down DDP before prune() when reparam may replace modules
-        #    (avoids replacing modules under a live DDP wrapper → CUDA crash)
-        if use_ddp and args.reparam_during_pat and cp.prune_channels:
+        # 0. Tear down DDP before prune() when modules may be replaced
+        #    (reparam or fold_bn_before_prune — avoids CUDA crash from stale DDP wrapper)
+        _needs_ddp_teardown = (args.reparam_during_pat and cp.prune_channels) or (
+            getattr(args, 'fold_bn_before_prune', False) and cp.prune_channels)
+        if use_ddp and _needs_ddp_teardown:
             del train_model
-            train_model = model  # raw model for prune() + reparameterize()
+            train_model = model  # raw model for prune() + structural changes
 
         # 1. Prune / sparse lifecycle / no-op (phase decided internally)
         pruner.prune(model, epoch, log=prune_log, mask_only=not args.no_mask_only)
@@ -439,7 +441,7 @@ def main(argv):
                 train_model = DDP(model, device_ids=[args.local_rank],
                                   output_device=args.local_rank)
                 dist.barrier()
-        elif use_ddp and args.reparam_during_pat and not isinstance(train_model, DDP):
+        elif use_ddp and _needs_ddp_teardown and not isinstance(train_model, DDP):
             # Re-wrap DDP if we tore it down but prune() didn't trigger changes
             train_model = DDP(model, device_ids=[args.local_rank],
                               output_device=args.local_rank)

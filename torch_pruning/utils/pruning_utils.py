@@ -644,11 +644,6 @@ class ChannelPruning:
         if not use_mask:
             self._model_changed = True
 
-        # BN recalibration after pruning step
-        if self._bn_recalibration and self.train_loader is not None:
-            _recalibrate_bn(model, self.train_loader, self.device, log,
-                            max_batches=self._bn_recalib_batches)
-
         # Signal that a pruning step (mask or physical) completed
         self._step_completed = True
 
@@ -692,13 +687,18 @@ class ChannelPruning:
             self._model_changed = True
             _log(log, f" Reparam active between PAT steps (λ={self._reparam_lambda})")
 
-        # Re-insert BN after final pruning step for FT recovery
+        # Re-insert BN after final pruning step for FT recovery (before recalibration)
         if not self.prune_channels and self._folded_bn_locations is not None:
             from torch_pruning.utils.reparam import reinsert_bn
             n_bn = reinsert_bn(model, self._folded_bn_locations)
             self._folded_bn_locations = None
             self._model_changed = True
             _log(log, f" Re-inserted {n_bn} fresh BN layers for fine-tuning")
+
+        # BN recalibration after pruning step (skip when BN is folded — no BN to calibrate)
+        if self._bn_recalibration and self.train_loader is not None and self._folded_bn_locations is None:
+            _recalibrate_bn(model, self.train_loader, self.device, log,
+                            max_batches=self._bn_recalib_batches)
 
         # After final step, persist is_prune=False so future loads skip pruning.
         # Only write from main rank (log is non-None) to avoid DDP race on the file.
