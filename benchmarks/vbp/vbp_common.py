@@ -335,7 +335,8 @@ def load_model(args, device):
             # Checkpoint was saved with BNs already folded (replaced by Identity).
             # Must fold the base architecture first so key names match before loading.
             from torch_pruning.utils.reparam import fold_all_conv_bn
-            n = fold_all_conv_bn(model)
+            n, locs = fold_all_conv_bn(model)
+            args._folded_bn_locations = locs
             log_info(f"[fold_bn_init] Folded {n} BNs before loading checkpoint")
             args.bn_recalibration = False
         state = torch.load(ckpt, map_location='cpu', weights_only=True)
