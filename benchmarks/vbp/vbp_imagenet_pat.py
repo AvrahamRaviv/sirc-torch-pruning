@@ -171,12 +171,13 @@ def build_pruning_config(args, model, config_dir):
 # ---------------------------------------------------------------------------
 # Optimizer with reparam-aware weight decay grouping
 # ---------------------------------------------------------------------------
-def build_optimizer(model, args, reparam_manager=None):
+def build_optimizer(model, args, reparam_manager=None, lr_override=None):
     """Build optimizer with optional param group splitting for reparam.
 
     When reparam is active, v and m parameters get weight_decay=0 (regularized
     via aux loss instead). Other parameters use standard weight decay.
     """
+    lr = lr_override if lr_override is not None else args.lr
     params = list(model.parameters())
     if reparam_manager and reparam_manager.is_active:
         reparam_ids = reparam_manager.reparam_param_ids()
@@ -190,8 +191,8 @@ def build_optimizer(model, args, reparam_manager=None):
         groups = [{"params": params, "weight_decay": args.wd}]
 
     if args.opt == "sgd":
-        return torch.optim.SGD(groups, lr=args.lr, momentum=0.9)
-    return torch.optim.AdamW(groups, lr=args.lr)
+        return torch.optim.SGD(groups, lr=lr, momentum=0.9)
+    return torch.optim.AdamW(groups, lr=lr)
 
 
 # ---------------------------------------------------------------------------
@@ -380,13 +381,15 @@ def main(argv):
                                                target_layers=cnn_target_layers)
 
     # --- Unified training loop ---
-    optimizer = build_optimizer(model, args, cp._reparam_manager)
+    ft_lr = args.ft_lr if args.ft_lr is not None else args.lr
     # Build scheduler for sparse phase only. FT rebuilds its own after pruning.
     # Use epochs_sparse+1 so cosine doesn't fully reach zero during sparse.
     if args.sparse_mode != "none" and args.epochs_sparse > 0:
+        optimizer = build_optimizer(model, args, cp._reparam_manager)
         initial_sched_epochs = args.epochs_sparse + 1
         scheduler, step_per_batch = build_sparse_scheduler(optimizer, initial_sched_epochs, len(train_loader))
     else:
+        optimizer = build_optimizer(model, args, cp._reparam_manager, lr_override=ft_lr)
         initial_sched_epochs = total
         scheduler, step_per_batch = build_ft_scheduler(optimizer, initial_sched_epochs, len(train_loader), eta_min=args.ft_eta_min, warmup_epochs=args.ft_warmup_epochs)
 
@@ -432,7 +435,9 @@ def main(argv):
         if use_ddp and changed:
             _broadcast_model_state(model)
         if changed:
-            optimizer = build_optimizer(model, args, cp._reparam_manager)
+            ft_lr = args.ft_lr if args.ft_lr is not None else args.lr
+            phase_lr = args.lr if cp.phase == "Sparse" else ft_lr
+            optimizer = build_optimizer(model, args, cp._reparam_manager, lr_override=phase_lr)
             # During sparse phase, keep the sparse scheduler config;
             # after pruning (FT phase), use remaining epochs.
             if cp.phase == "Sparse":
@@ -594,6 +599,8 @@ def parse_args():
     parser.add_argument("--ft_warmup_epochs", type=float, default=0,
                         help="Linear warmup epochs for FT scheduler (0 = no warmup)")
     parser.add_argument("--lr", type=float, default=1.5e-5)
+    parser.add_argument("--ft_lr", type=float, default=None,
+                        help="Learning rate for FT phase (defaults to --lr if not set)")
     parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd"])
     parser.add_argument("--wd", type=float, default=0.01,
                         help="Weight decay (applied to non-reparam params)")
