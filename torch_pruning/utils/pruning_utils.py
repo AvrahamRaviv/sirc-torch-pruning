@@ -54,14 +54,28 @@ def _unpack_images(batch):
 
 
 def _recalibrate_bn(model, train_loader, device, log=None, max_batches=100):
-    """Recalibrate BN running stats after structural pruning."""
+    """Recalibrate BN running stats after structural pruning.
+
+    Uses num_workers=0 to avoid CUDA-context-after-fork errors: this runs
+    right after structural changes (prune/reinsert BN) that modify the CUDA
+    state, so forked DataLoader workers would crash.
+    """
+    from torch.utils.data import DataLoader
     for m in model.modules():
         if isinstance(m, nn.BatchNorm2d):
             m.reset_running_stats()
     model.train()
-    total = min(max_batches, len(train_loader))
+    # Build a safe single-process loader from the same dataset/sampler
+    safe_loader = DataLoader(
+        train_loader.dataset,
+        batch_size=train_loader.batch_size,
+        sampler=train_loader.sampler,
+        num_workers=0,
+        pin_memory=False,
+    )
+    total = min(max_batches, len(safe_loader))
     with torch.no_grad():
-        for batch_idx, batch in enumerate(train_loader):
+        for batch_idx, batch in enumerate(safe_loader):
             if batch_idx >= max_batches:
                 break
             images = _unpack_images(batch)
