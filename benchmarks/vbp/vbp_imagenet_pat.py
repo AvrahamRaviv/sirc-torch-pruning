@@ -44,7 +44,6 @@ Usage:
 
 import argparse
 import copy
-import gc
 import json
 import os
 import sys
@@ -408,8 +407,6 @@ def main(argv):
             and epoch >= cp.start_epoch)
         if use_ddp and _needs_ddp_teardown:
             del train_model
-            gc.collect()
-            torch.cuda.empty_cache()
             train_model = model  # raw model for prune() + structural changes
 
         # 1. Prune / sparse lifecycle / no-op (phase decided internally)
@@ -447,10 +444,6 @@ def main(argv):
                 train_model = DDP(model, device_ids=[args.local_rank],
                                   output_device=args.local_rank)
                 dist.barrier()
-            # Free stale CUDA allocations (old optimizer state, pruned tensors,
-            # old DDP gradient buckets) to prevent fragmentation/corruption.
-            gc.collect()
-            torch.cuda.empty_cache()
         elif use_ddp and _needs_ddp_teardown and not isinstance(train_model, DDP):
             # Re-wrap DDP if we tore it down but prune() didn't trigger changes
             train_model = DDP(model, device_ids=[args.local_rank],
