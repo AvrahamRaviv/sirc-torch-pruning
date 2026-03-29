@@ -117,7 +117,7 @@ def build_pruning_config(args, model, config_dir):
             "input_shape": [1, 3, 224, 224],
             "layers": layers,
             "reparam_layers": reparam_layers,
-            "regularize": {"reg": 0, "mac_reg": 0},
+            "regularize": {"reg": getattr(args, 'reg', 0), "mac_reg": 0},
             "MAC_params": {},
             # VBP-specific
             "model_type": args.model_type,
@@ -147,6 +147,7 @@ def build_pruning_config(args, model, config_dir):
             "wv_base_mode": getattr(args, 'wv_base_mode', 'weight_variance'),
             "mag_guided_delta": getattr(args, 'mag_guided_delta', 0.2),
             "fold_bn_before_prune": getattr(args, 'fold_bn_before_prune', False),
+            "isomorphic": getattr(args, 'isomorphic', False),
         },
         "slice_sparsity_args": None,
     }
@@ -568,6 +569,8 @@ def parse_args():
                         choices=["variance", "magnitude", "lamp", "random"])
     parser.add_argument("--keep_ratio", type=float, default=0.65)
     parser.add_argument("--global_pruning", action="store_true")
+    parser.add_argument("--isomorphic", action="store_true",
+                        help="Isomorphic pruning: per-topology-scope thresholds (ECCV 2024)")
     parser.add_argument("--norm_per_layer", action="store_true")
     parser.add_argument("--mac_target", action="store_true",
                         help="Use MAC-target mode: analytically compute channel ratio from keep_ratio")
@@ -633,10 +636,11 @@ def parse_args():
     parser.add_argument("--reparam_entropy_lambda", type=float, default=0.0,
                         help="Entropy regularization strength for VNR mode")
     parser.add_argument("--importance_mode", default="variance",
-                        choices=["variance", "weight_variance", "weight_variance_both", "combined", "rank_fusion", "mag_guided"],
+                        choices=["variance", "weight_variance", "weight_variance_both", "combined", "rank_fusion", "mag_guided", "tp_variance"],
                         help="Importance scoring: variance (σ²), weight_variance (||W_fc2[:,k]||·σ_k), "
                              "weight_variance_both (||W_fc1[k,:]||·σ_k·||W_fc2[:,k]||), combined (blend magnitude + variance), "
-                             "rank_fusion (percentile-rank blend), mag_guided (magnitude budget + WV ordering)")
+                             "rank_fusion (percentile-rank blend), mag_guided (magnitude budget + WV ordering), "
+                             "tp_variance (TP group magnitude × activation std, uses GroupNorm regularization)")
     parser.add_argument("--alpha", type=float, default=0.5,
                         help="Blend weight for combined/rank_fusion: alpha*magnitude + (1-alpha)*variance")
     parser.add_argument("--normalize_importance", action="store_true", default=False,
@@ -646,6 +650,8 @@ def parse_args():
                         help="WV formula for rank_fusion/mag_guided modes (default: weight_variance)")
     parser.add_argument("--mag_guided_delta", type=float, default=0.2,
                         help="Tolerance for mag_guided mode: higher = more magnitude-like (default: 0.2)")
+    parser.add_argument("--reg", type=float, default=0,
+                        help="GroupNorm regularization strength (used by tp_variance mode, e.g. 1e-4)")
 
     # KD
     parser.add_argument("--use_kd", action="store_true")

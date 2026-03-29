@@ -1055,7 +1055,9 @@ class VarianceImportance(Importance):
         self.norm_per_layer = norm_per_layer
         self.eps = eps
         self.similarity_discount = similarity_discount
-        self.importance_mode = importance_mode  # "variance", "weight_variance", "weight_variance_both", "combined", "rank_fusion", "mag_guided"
+        self.importance_mode = importance_mode  # "variance", "weight_variance", "weight_variance_both", "combined", "rank_fusion", "mag_guided", "tp_variance"
+        # Cached GMI for tp_variance mode (raw group magnitude before normalization)
+        self._gmi = GroupMagnitudeImportance(p=2, group_reduction="mean", normalizer=None)
         self.alpha = alpha
         self.normalize = normalize
         self.wv_base_mode = wv_base_mode  # WV formula for rank_fusion/mag_guided: "variance", "weight_variance", "weight_variance_both"
@@ -1290,8 +1292,16 @@ class VarianceImportance(Importance):
         var = self.variance[module]
         idxs = torch.as_tensor(idxs, dtype=torch.long)
 
+        # --- tp_variance: TP group magnitude × activation std ---
+        if self.importance_mode == "tp_variance":
+            tp_raw = self._gmi(group)
+            if tp_raw is None:
+                return torch.ones(len(idxs))
+            sigma = var[idxs].clamp(min=0.0).sqrt().to(tp_raw.device)
+            scores = tp_raw * sigma
+
         # --- rank_fusion: percentile-rank blend of WV and magnitude ---
-        if self.importance_mode == "rank_fusion":
+        elif self.importance_mode == "rank_fusion":
             wv_scores = self._compute_wv_scores(module, idxs, var, mode=self.wv_base_mode)
             # Apply similarity discount to WV scores
             if self.similarity_discount and module in self._similarity:

@@ -355,7 +355,13 @@ class ChannelPruning:
                     wv_base_mode=self.channel_sparsity_args.get("wv_base_mode", "weight_variance"),
                     mag_guided_delta=self.channel_sparsity_args.get("mag_guided_delta", 0.2))
                 self.vbp_importance = imp
-            pruner_entry = partial(tp.pruner.VBPPruner)
+            # tp_variance uses GroupNormPruner for group-level regularization on ALL members
+            if self._importance_mode == "tp_variance":
+                pruner_entry = partial(tp.pruner.GroupNormPruner)
+                if not self._fold_bn_before_prune:
+                    _log(log, "WARNING: tp_variance without --fold_bn_before_prune may double-count BN gamma")
+            else:
+                pruner_entry = partial(tp.pruner.VBPPruner)
         elif self.pruning_method == PruningMethod.LAMP:
             imp = tp.importance.LAMPImportance(p=2)
             pruner_entry = partial(tp.pruner.GroupNormPruner)
@@ -382,7 +388,7 @@ class ChannelPruning:
             isomorphic=self.channels_pruner_args["isomorphic"],
             iterative_steps=self.iterative_steps,
         )
-        if self.pruning_method == PruningMethod.VBP:
+        if self.pruning_method == PruningMethod.VBP and self._importance_mode != "tp_variance":
             pruner_kwargs["verbose"] = self.verbose > 0
         else:
             pruner_kwargs["reg"] = self.channels_pruner_args["reg"]
@@ -747,8 +753,9 @@ class ChannelPruning:
             return 0.0
         if self.current_epoch > self.end_epoch:
             return 0.0
-        # VBP does not use traditional regularization; var loss is handled externally
-        if self.pruning_method == PruningMethod.VBP:
+        # VBP does not use traditional regularization; var loss is handled externally.
+        # Exception: tp_variance uses GroupNormPruner's group-level regularization.
+        if self.pruning_method == PruningMethod.VBP and self._importance_mode != "tp_variance":
             return 0.0
         if self.channels_pruner_args["reg"] == 0:
             return 0.0
