@@ -24,13 +24,13 @@
 
 % Main flow
 \node[param]             (x)   at (0.5, 2.0) {$X$};
-\node[box, fill=green!5] (bn)  at (3.0, 2.0) {BN};
+\node[box, fill=green!5, align=center] (bn)  at (3.0, 2.0) {BN\\[-2pt]{\tiny $x\!=\!(x\!-\!m)/s$}};
 \node[box]               (mul) at (5.0, 2.0) {Mult};
 \node[box]               (add) at (8.0, 2.0) {Add};
 \node[param]             (out) at (11.0, 2.0) {output};
 
-% Annotation below BN
-\node[annot] at (3.0, 1.2) {Update $\sigma_r,\mu_r$};
+% Annotation below BN loop
+\node[annot] at (3.0, 0.8) {Update $\sigma_r,\mu_r$};
 
 % Main arrows
 \draw[arr] (x) -- (bn);
@@ -42,8 +42,8 @@
 \draw[radd] (V) -- (mul);
 \draw[badd] (b) -- (add);
 
-% Self-cycle at BN showing update - curved loop matching reference
-\draw[arr] (bn.south west) arc(180:0:0.35cm);
+% Self-cycle at BN showing update - small circular loop below the box
+\draw[arr] ([xshift=-6pt]bn.south) to[out=-130,in=-50,looseness=6] ([xshift=6pt]bn.south);
 
 \end{tikzpicture}
 \end{document}

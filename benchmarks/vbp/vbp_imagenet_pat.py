@@ -617,8 +617,8 @@ def parse_args():
 
     # Sparse pre-training
     parser.add_argument("--sparse_mode", default="none",
-                        choices=["l1_group", "gmp", "reparam", "vnr", "none"],
-                        help="Sparse pre-training mode (none = skip)")
+                        choices=["l1_group", "gmp", "reparam", "vnr", "group_norm", "none"],
+                        help="Sparse pre-training mode (none = skip, group_norm = GroupNorm reg only via --reg)")
     parser.add_argument("--epochs_sparse", type=int, default=0,
                         help="Sparse pre-training epochs (shifts pruning start)")
     parser.add_argument("--l1_lambda", type=float, default=1e-4,
