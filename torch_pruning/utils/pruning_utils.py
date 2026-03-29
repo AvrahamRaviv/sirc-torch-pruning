@@ -334,7 +334,9 @@ class ChannelPruning:
             imp = tp.importance.BNScaleImportance()
             pruner_entry = partial(tp.pruner.BNScalePruner, group_lasso=True)
         elif self.pruning_method == PruningMethod.GROUP_NORM:
-            imp = tp.importance.GroupMagnitudeImportance(p=2)
+            # normalizer=None: defer to norm_per_layer (same as tp_variance's internal _gmi)
+            # so --criterion magnitude --norm_per_layer is a fair non-VBP control for tp_variance
+            imp = tp.importance.GroupMagnitudeImportance(p=2, normalizer=None)
             pruner_entry = partial(tp.pruner.GroupNormPruner)
         elif self.pruning_method == PruningMethod.MAC_AWARE:
             L_MACs = {k: v[0] for k, v in self.MACs_per_layer.items()}
