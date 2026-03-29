@@ -1300,6 +1300,30 @@ class VarianceImportance(Importance):
             sigma = var[idxs].clamp(min=0.0).sqrt().to(tp_raw.device)
             scores = tp_raw * sigma
 
+        # --- dw_proj_var: ||W_dw[k]|| × ||W_proj[:,k]|| × σ_k ---
+        elif self.importance_mode == "dw_proj_var":
+            dw_layer, dw_idxs_i = None, None
+            proj_layer, proj_idxs_i = None, None
+            for dep_i, idxs_i in group:
+                lay = dep_i.layer
+                fn = dep_i.pruning_fn
+                if isinstance(lay, nn.Conv2d) and lay.groups == lay.out_channels and lay.groups > 1:
+                    dw_layer, dw_idxs_i = lay, idxs_i
+                elif (isinstance(lay, nn.Conv2d) and lay.groups == 1
+                      and fn == function.prune_conv_in_channels):
+                    proj_layer, proj_idxs_i = lay, idxs_i
+            sigma = var[idxs].clamp(min=0.0).sqrt()
+            if dw_layer is not None and proj_layer is not None:
+                dw_w = dw_layer.weight.data[list(dw_idxs_i)].flatten(1).abs().pow(2).sum(1)
+                proj_w = (proj_layer.weight.data.transpose(0, 1)
+                          .flatten(1).abs().pow(2).sum(1))[list(proj_idxs_i)]
+                scores = dw_w.to(sigma.device) * proj_w.to(sigma.device) * sigma
+            elif dw_layer is not None:
+                dw_w = dw_layer.weight.data[list(dw_idxs_i)].flatten(1).abs().pow(2).sum(1)
+                scores = dw_w.to(sigma.device) * sigma
+            else:
+                scores = sigma  # fallback: pure variance (no DW in group)
+
         # --- rank_fusion: percentile-rank blend of WV and magnitude ---
         elif self.importance_mode == "rank_fusion":
             wv_scores = self._compute_wv_scores(module, idxs, var, mode=self.wv_base_mode)

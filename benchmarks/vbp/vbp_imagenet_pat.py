@@ -641,11 +641,12 @@ def parse_args():
     parser.add_argument("--reparam_entropy_lambda", type=float, default=0.0,
                         help="Entropy regularization strength for VNR mode")
     parser.add_argument("--importance_mode", default="variance",
-                        choices=["variance", "weight_variance", "weight_variance_both", "combined", "rank_fusion", "mag_guided", "tp_variance"],
+                        choices=["variance", "weight_variance", "weight_variance_both", "combined", "rank_fusion", "mag_guided", "tp_variance", "dw_proj_var"],
                         help="Importance scoring: variance (σ²), weight_variance (||W_fc2[:,k]||·σ_k), "
                              "weight_variance_both (||W_fc1[k,:]||·σ_k·||W_fc2[:,k]||), combined (blend magnitude + variance), "
                              "rank_fusion (percentile-rank blend), mag_guided (magnitude budget + WV ordering), "
-                             "tp_variance (TP group magnitude × activation std, uses GroupNorm regularization)")
+                             "tp_variance (TP group magnitude × activation std, uses GroupNorm regularization), "
+                             "dw_proj_var (||W_dw[k]||·||W_proj[:,k]||·σ_k, explicit DW×proj×variance)")
     parser.add_argument("--alpha", type=float, default=0.5,
                         help="Blend weight for combined/rank_fusion: alpha*magnitude + (1-alpha)*variance")
     parser.add_argument("--normalize_importance", action="store_true", default=False,

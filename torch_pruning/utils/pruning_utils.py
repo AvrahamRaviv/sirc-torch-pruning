@@ -362,9 +362,9 @@ class ChannelPruning:
                     mag_guided_delta=self.channel_sparsity_args.get("mag_guided_delta", 0.2))
                 self.vbp_importance = imp
             # tp_variance uses GroupNormPruner for group-level regularization on ALL members
-            if self._importance_mode == "tp_variance":
+            if self._importance_mode in ("tp_variance", "dw_proj_var"):
                 pruner_entry = partial(tp.pruner.GroupNormPruner)
-                if not self._fold_bn_before_prune:
+                if self._importance_mode == "tp_variance" and not self._fold_bn_before_prune:
                     _log(log, "WARNING: tp_variance without --fold_bn_before_prune may double-count BN gamma")
             else:
                 pruner_entry = partial(tp.pruner.VBPPruner)
