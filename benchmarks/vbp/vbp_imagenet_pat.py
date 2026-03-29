@@ -124,6 +124,7 @@ def build_pruning_config(args, model, config_dir):
             "max_batches": args.max_batches,
             "var_loss_weight": args.var_loss_weight,
             "norm_per_layer": args.norm_per_layer,
+            "group_reduction": getattr(args, 'group_reduction', 'mean'),
             "no_compensation": args.no_compensation,
             "similarity_discount": getattr(args, 'similarity_discount', False),
             "verbose": 1,
@@ -567,6 +568,10 @@ def parse_args():
     # Pruning
     parser.add_argument("--criterion", default="variance",
                         choices=["variance", "magnitude", "lamp", "random"])
+    parser.add_argument("--group_reduction", default="mean",
+                        choices=["mean", "sum", "prod", "max", "first"],
+                        help="GroupMagnitudeImportance reduction across group members (magnitude criterion only). "
+                             "Use 'prod' with --sparse_mode vnr to compare magnitude vs magnitude×variance.")
     parser.add_argument("--keep_ratio", type=float, default=0.65)
     parser.add_argument("--global_pruning", action="store_true")
     parser.add_argument("--isomorphic", action="store_true",
