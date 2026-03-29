@@ -569,8 +569,10 @@ def parse_args():
     parser.add_argument("--criterion", default="variance",
                         choices=["variance", "magnitude", "lamp", "random"])
     parser.add_argument("--group_reduction", default="mean",
-                        choices=["mean", "sum", "prod", "max", "first"],
+                        choices=["mean", "sum", "prod", "max", "first", "dw_proj", "ww"],
                         help="GroupMagnitudeImportance reduction across group members (magnitude criterion only). "
+                             "'dw_proj': ||W_dw[k]||·||W_proj[:,k]|| (non-VBP variant of dw_proj_var). "
+                             "'ww': ||W_expand[k,:]||·||W_proj[:,k]|| (non-VBP variant of WVW). "
                              "Use 'prod' with --sparse_mode vnr to compare magnitude vs magnitude×variance.")
     parser.add_argument("--keep_ratio", type=float, default=0.65)
     parser.add_argument("--global_pruning", action="store_true")

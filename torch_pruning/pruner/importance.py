@@ -192,6 +192,35 @@ class GroupMagnitudeImportance(Importance):
     
     @torch.no_grad()
     def __call__(self, group: Group):
+        # --- Selective 2-layer product modes (early return, bypasses normal loop) ---
+        # Needed because DW's prune_fn is a bound method (not function.prune_conv_out_channels)
+        # and prod reduction would include BN/all members rather than just 2 specific layers.
+        if self.group_reduction in ("dw_proj", "ww"):
+            imp_a, imp_b = None, None
+            for dep_i, idxs_i in group:
+                lay = dep_i.layer
+                fn = dep_i.pruning_fn
+                if not isinstance(lay, nn.modules.conv._ConvNd):
+                    continue
+                if self.group_reduction == "dw_proj":
+                    if lay.groups == lay.out_channels and lay.groups > 1:
+                        w = lay.weight.data[list(idxs_i)].flatten(1)
+                        imp_a = w.abs().pow(self.p).sum(1)
+                    elif lay.groups == 1 and fn == function.prune_conv_in_channels:
+                        w = lay.weight.data.transpose(0, 1).flatten(1)
+                        imp_b = w.abs().pow(self.p).sum(1)[list(idxs_i)]
+                else:  # "ww": expand × proj
+                    if lay.groups == 1 and fn == function.prune_conv_out_channels:
+                        w = lay.weight.data[list(idxs_i)].flatten(1)
+                        imp_a = w.abs().pow(self.p).sum(1)
+                    elif lay.groups == 1 and fn == function.prune_conv_in_channels:
+                        w = lay.weight.data.transpose(0, 1).flatten(1)
+                        imp_b = w.abs().pow(self.p).sum(1)[list(idxs_i)]
+            if imp_a is None or imp_b is None:
+                return None
+            scores = imp_a.to(imp_b.device) * imp_b
+            return self._normalize(scores, self.normalizer)
+
         group_imp = []
         group_idxs = []
 
