@@ -394,7 +394,7 @@ class ChannelPruning:
             isomorphic=self.channels_pruner_args["isomorphic"],
             iterative_steps=self.iterative_steps,
         )
-        if self.pruning_method == PruningMethod.VBP and self._importance_mode != "tp_variance":
+        if self.pruning_method == PruningMethod.VBP and self._importance_mode not in ("tp_variance", "dw_proj_var"):
             pruner_kwargs["verbose"] = self.verbose > 0
         else:
             pruner_kwargs["reg"] = self.channels_pruner_args["reg"]
@@ -761,7 +761,7 @@ class ChannelPruning:
             return 0.0
         # VBP does not use traditional regularization; var loss is handled externally.
         # Exception: tp_variance uses GroupNormPruner's group-level regularization.
-        if self.pruning_method == PruningMethod.VBP and self._importance_mode != "tp_variance":
+        if self.pruning_method == PruningMethod.VBP and self._importance_mode not in ("tp_variance", "dw_proj_var"):
             return 0.0
         if self.channels_pruner_args["reg"] == 0:
             return 0.0
