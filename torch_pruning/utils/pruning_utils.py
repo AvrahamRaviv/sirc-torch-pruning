@@ -517,6 +517,7 @@ class ChannelPruning:
             return
 
         is_vbp = self.pruning_method == PruningMethod.VBP
+        is_vbp_pruner = is_vbp and self._importance_mode not in ("tp_variance", "dw_proj_var")
         loader = train_loader or self.train_loader
 
         # Reparam sparse pre-training lifecycle (reparam = mean-only, vnr = variance-normalized)
@@ -637,7 +638,7 @@ class ChannelPruning:
                 _log(log, " Last pruning step: switching to physical channel removal")
 
         # Enable VBP meancheck if applicable (needs forward pass before pruning)
-        if is_vbp and not use_mask:
+        if is_vbp_pruner and not use_mask:
             self.pruner.enable_meancheck(model)
             model.eval()
             with torch.no_grad():
@@ -663,7 +664,7 @@ class ChannelPruning:
                     _log(log, f" {mode_str}{comp_str} {len(idxs)}/{total_ch} "
                               f"channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}.")
 
-        if is_vbp and not use_mask:
+        if is_vbp_pruner and not use_mask:
             self.pruner.disable_meancheck()
 
         # Signal structural change when physical pruning occurred
