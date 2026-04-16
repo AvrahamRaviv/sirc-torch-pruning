@@ -200,22 +200,32 @@ class GroupMagnitudeImportance(Importance):
             for dep_i, idxs_i in group:
                 lay = dep_i.layer
                 fn = dep_i.pruning_fn
-                if not isinstance(lay, nn.modules.conv._ConvNd):
-                    continue
-                if self.group_reduction == "dw_proj":
-                    if lay.groups == lay.out_channels and lay.groups > 1:
-                        w = lay.weight.data[list(idxs_i)].flatten(1)
+                if isinstance(lay, nn.modules.conv._ConvNd):
+                    if self.group_reduction == "dw_proj":
+                        if lay.groups == lay.out_channels and lay.groups > 1:
+                            w = lay.weight.data[list(idxs_i)].flatten(1)
+                            imp_a = w.abs().pow(self.p).sum(1)
+                        elif lay.groups == 1 and fn == function.prune_conv_in_channels:
+                            w = lay.weight.data.transpose(0, 1).flatten(1)
+                            imp_b = w.abs().pow(self.p).sum(1)[list(idxs_i)]
+                    else:  # "ww": expand × proj
+                        if lay.groups == 1 and fn == function.prune_conv_out_channels:
+                            w = lay.weight.data[list(idxs_i)].flatten(1)
+                            imp_a = w.abs().pow(self.p).sum(1)
+                        elif lay.groups == 1 and fn == function.prune_conv_in_channels:
+                            w = lay.weight.data.transpose(0, 1).flatten(1)
+                            imp_b = w.abs().pow(self.p).sum(1)[list(idxs_i)]
+                elif isinstance(lay, nn.Linear):
+                    # Linear-only groups (e.g. ConvNeXt pwconv1/pwconv2): both dw_proj and
+                    # ww fall back to expand×proj (||W_fc1[k,:]|| × ||W_fc2[:,k]||).
+                    # dw_proj has no DW in the intermediate space for ConvNeXt, so this
+                    # is the closest meaningful analog.
+                    if fn == function.prune_linear_out_channels:
+                        w = lay.weight.data[list(idxs_i)]  # [k, in_features]
                         imp_a = w.abs().pow(self.p).sum(1)
-                    elif lay.groups == 1 and fn == function.prune_conv_in_channels:
-                        w = lay.weight.data.transpose(0, 1).flatten(1)
-                        imp_b = w.abs().pow(self.p).sum(1)[list(idxs_i)]
-                else:  # "ww": expand × proj
-                    if lay.groups == 1 and fn == function.prune_conv_out_channels:
-                        w = lay.weight.data[list(idxs_i)].flatten(1)
-                        imp_a = w.abs().pow(self.p).sum(1)
-                    elif lay.groups == 1 and fn == function.prune_conv_in_channels:
-                        w = lay.weight.data.transpose(0, 1).flatten(1)
-                        imp_b = w.abs().pow(self.p).sum(1)[list(idxs_i)]
+                    elif fn == function.prune_linear_in_channels:
+                        w = lay.weight.data.transpose(0, 1)[list(idxs_i)]  # [k, out_features]
+                        imp_b = w.abs().pow(self.p).sum(1)
             if imp_a is None or imp_b is None:
                 return None
             scores = imp_a.to(imp_b.device) * imp_b
