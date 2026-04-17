@@ -152,13 +152,13 @@ class GroupNormPruner(BasePruner):
                     _gamma = torch.index_select(gamma, 0, torch.tensor(root_idxs, device=gamma.device))
 
                     w = layer.weight.data[idxs]
-                    g = w * _gamma.view( -1, *([1]*(len(w.shape)-1)) ) #/ group_norm.view( -1, *([1]*(len(w.shape)-1)) ) * group_size #group_size #* gamma.view( -1, *([1]*(len(w.shape)-1)) )
+                    g = w * _gamma.to(w.device).view( -1, *([1]*(len(w.shape)-1)) ) #/ group_norm.view( -1, *([1]*(len(w.shape)-1)) ) * group_size #group_size #* gamma.view( -1, *([1]*(len(w.shape)-1)) )
                     layer.weight.grad.data[idxs]+=self.reg * g
                     reg_loss += (self.reg * g).abs().sum().item()
 
                     if bias and layer.bias is not None:
                         b = layer.bias.data[idxs]
-                        g = b * _gamma
+                        g = b * _gamma.to(b.device)
                         layer.bias.grad.data[idxs]+=self.reg * g
                         reg_loss += (self.reg * g).abs().sum().item()
 
@@ -180,7 +180,7 @@ class GroupNormPruner(BasePruner):
                     _gamma = torch.index_select(gamma, 0, torch.tensor(root_idxs, device=gamma.device))
 
                     w = layer.weight.data[:, idxs]
-                    g = w * _gamma.view( 1, -1, *([1]*(len(w.shape)-2))  ) #/ gn.view( 1, -1, *([1]*(len(w.shape)-2)) ) * group_size #* gamma.view( 1, -1, *([1]*(len(w.shape)-2))  )
+                    g = w * _gamma.to(w.device).view( 1, -1, *([1]*(len(w.shape)-2))  ) #/ gn.view( 1, -1, *([1]*(len(w.shape)-2)) ) * group_size #* gamma.view( 1, -1, *([1]*(len(w.shape)-2))  )
                     layer.weight.grad.data[:, idxs]+=self.reg * g
                     reg_loss += (self.reg * g).abs().sum().item()
 
@@ -193,13 +193,13 @@ class GroupNormPruner(BasePruner):
                         _gamma = torch.index_select(gamma, 0, torch.tensor(root_idxs, device=gamma.device))
 
                         w = layer.weight.data[idxs]
-                        g = w * _gamma #/ group_norm * group_size
+                        g = w * _gamma.to(w.device) #/ group_norm * group_size
                         layer.weight.grad.data[idxs]+=self.reg * g
                         reg_loss += (self.reg * g).abs().sum().item()
 
                         if bias and layer.bias is not None:
                             b = layer.bias.data[idxs]
-                            g = b * _gamma #/ group_norm * group_size
+                            g = b * _gamma.to(b.device) #/ group_norm * group_size
                             layer.bias.grad.data[idxs]+=self.reg * g
                             reg_loss += (self.reg * g).abs().sum().item()
         self.cnt+=1
