@@ -710,6 +710,7 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
         if regularize_fn is not None:
             eval_m = model.module if isinstance(model, DDP) else model
             regularize_fn(eval_m)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
         if step_per_batch:
             scheduler.step()
