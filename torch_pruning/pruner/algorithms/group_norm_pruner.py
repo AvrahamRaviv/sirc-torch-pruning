@@ -134,7 +134,10 @@ class GroupNormPruner(BasePruner):
             imp = self.estimate_importance(group).sqrt()
             if torch.any(torch.isnan(imp)):  # avoid nan
                 continue
-            gamma = alpha**((imp.max() - imp) / (imp.max() - imp.min()))
+            imp_range = imp.max() - imp.min()
+            if imp_range < 1e-8:  # all channels equal importance — no useful regularization
+                continue
+            gamma = alpha**((imp.max() - imp) / imp_range)
 
             # Update Gradient
             for i, (dep, idxs) in enumerate(group):
