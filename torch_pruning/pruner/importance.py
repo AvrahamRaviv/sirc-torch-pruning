@@ -1318,8 +1318,10 @@ class VarianceImportance(Importance):
         dep, idxs = group[0]
         module = dep.target.module
 
-        if module not in self.variance:
-            # Search group for any module with stats
+        # Require both presence AND length match (ConvNeXt pwconv2 in-channel groups
+        # have 4*dim idxs while pwconv2's own variance has only dim elements).
+        if module not in self.variance or len(self.variance[module]) != len(idxs):
+            # Search group for any module with stats of matching length
             for dep_i, _ in group:
                 candidate = dep_i.target.module
                 if candidate in self.variance and len(self.variance[candidate]) == len(idxs):
