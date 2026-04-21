@@ -645,14 +645,9 @@ class ChannelPruning:
                 model(self.example_inputs)
 
         # Unified interactive loop for all criteria (physical + mask)
-        _n_groups_yielded = 0
-        _n_channels_pruned = 0
         for group in self.pruner.step(interactive=True):
-            _n_groups_yielded += 1
             dep, idxs = group[0]
-            _log(log, f"[DIAG] yielded group target={type(dep.target.module).__name__} idxs_len={len(idxs)}")
             if len(idxs) > 0:
-                _n_channels_pruned += len(idxs)
                 if has_compensation:
                     self.pruner._apply_compensation(group, idxs)
                 if use_mask:
@@ -668,8 +663,6 @@ class ChannelPruning:
                     total_ch = dep.target.module.weight.shape[0] + (len(idxs) if not use_mask else 0)
                     _log(log, f" {mode_str}{comp_str} {len(idxs)}/{total_ch} "
                               f"channels {dep_str[dep_str.find('on'): dep_str.find('(') - 1]}.")
-
-        _log(log, f"[DIAG] total groups yielded={_n_groups_yielded}, total channels removed={_n_channels_pruned}")
 
         if is_vbp_pruner and not use_mask:
             self.pruner.disable_meancheck()
