@@ -1318,8 +1318,14 @@ class VarianceImportance(Importance):
         dep, idxs = group[0]
         module = dep.target.module
 
+        _dbg_orig_module = type(module).__name__
+        _dbg_in_variance = module in self.variance
+        _dbg_var_len = len(self.variance[module]) if _dbg_in_variance else -1
+        _dbg_variance_size = len(self.variance)
+
         # Require both presence AND length match (ConvNeXt pwconv2 in-channel groups
         # have 4*dim idxs while pwconv2's own variance has only dim elements).
+        _dbg_fallback = False
         if module not in self.variance or len(self.variance[module]) != len(idxs):
             # Search group for any module with stats of matching length
             for dep_i, _ in group:
@@ -1328,7 +1334,19 @@ class VarianceImportance(Importance):
                     module = candidate
                     break
             else:
+                _dbg_fallback = True
+                print(f"[DIAG VI] FALLBACK ones: orig_module={_dbg_orig_module} "
+                      f"in_variance={_dbg_in_variance} var_len={_dbg_var_len} "
+                      f"idxs_len={len(idxs)} variance_dict_size={_dbg_variance_size} "
+                      f"group_size={len(group)}")
+                if _dbg_variance_size > 0:
+                    print(f"[DIAG VI]   sample variance keys: "
+                          f"{[(type(k).__name__, len(v)) for k, v in list(self.variance.items())[:5]]}")
                 return torch.ones(len(idxs))
+        if not _dbg_fallback:
+            print(f"[DIAG VI] OK: orig={_dbg_orig_module} "
+                  f"resolved={type(module).__name__} var_len={len(self.variance[module])} "
+                  f"idxs_len={len(idxs)}")
 
         var = self.variance[module]
         idxs = torch.as_tensor(idxs, dtype=torch.long)
