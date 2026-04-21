@@ -550,7 +550,15 @@ class BasePruner:
                 ch_groups = self._get_channel_groups(group)
                 imp = self.estimate_importance(group)  # raw importance score
                 if imp is None:
+                    print(f"[DIAG imp=None] group root={type(group[0].dep.target.module).__name__}")
                     continue
+                try:
+                    print(f"[DIAG imp] root={type(group[0].dep.target.module).__name__} "
+                          f"len={len(imp)} min={imp.min().item():.4g} "
+                          f"max={imp.max().item():.4g} mean={imp.mean().item():.4g} "
+                          f"nan={torch.isnan(imp).any().item()}")
+                except Exception as _e:
+                    print(f"[DIAG imp] err: {_e}")
                     
                 group_size = len(imp) // ch_groups
                 # layers with dimension grouping, such as GroupConv, GroupNorm, Multi-head attention, etc.
