@@ -715,7 +715,14 @@ class BasePruner:
                                 n_pruned = self._round_to(
                                     n_pruned, current_channels, self.round_to)
                                 _pruning_indices = imp_argsort[:n_pruned]
-                            if ch_groups > 1:  
+                            # Enforce per-layer max_pruning_ratio cap in global pruning
+                            # (issue #448: global threshold ignores per-layer caps).
+                            if len(_pruning_indices) > 0 and self.max_pruning_ratio < 1:
+                                n_pruned = len(_pruning_indices)
+                                while n_pruned / get_channel_fn(module) > self.max_pruning_ratio:
+                                    n_pruned = len(_pruning_indices) - 1
+                                    _pruning_indices = imp_argsort[:n_pruned]
+                            if ch_groups > 1:
                                 # if channel grouping is enabled, we repeat the pruning indices for each channel group.
                                 # For example, w=[0,1,2,3,4,5,6,7,8] with groups=3, and the pruning indices are [0].
                                 # We extend the indices as [0, 3, 6] to remove the first element in each group.
