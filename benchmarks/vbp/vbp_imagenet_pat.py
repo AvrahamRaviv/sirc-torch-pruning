@@ -111,7 +111,7 @@ def build_pruning_config(args, model, config_dir):
             "epoch_rate": epoch_rate,
             "global_prune_rate": 1.0 - args.keep_ratio,
             "mac_target": args.keep_ratio if args.mac_target else 0.0,
-            "max_pruning_rate": 0.95,
+            "max_pruning_rate": args.max_pruning_rate,
             "prune_channels_at_init": False,
             "infer": False,
             "input_shape": [1, 3, 224, 224],
@@ -575,6 +575,9 @@ def parse_args():
                              "'ww': ||W_expand[k,:]||·||W_proj[:,k]|| (non-VBP variant of WVW). "
                              "Use 'prod' with --sparse_mode vnr to compare magnitude vs magnitude×variance.")
     parser.add_argument("--keep_ratio", type=float, default=0.65)
+    parser.add_argument("--max_pruning_rate", type=float, default=0.95,
+                        help="Per-layer cap on prune fraction (0-1). Lower = forces "
+                             "more uniform pruning across layers under global threshold.")
     parser.add_argument("--global_pruning", action="store_true")
     parser.add_argument("--isomorphic", action="store_true",
                         help="Isomorphic pruning: per-topology-scope thresholds (ECCV 2024)")
