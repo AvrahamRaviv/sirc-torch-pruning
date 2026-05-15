@@ -433,6 +433,14 @@ def main(argv):
             log_info(f"[fold_bn_init] Re-inserted {n_bn} fresh BN layers for fine-tuning")
             folded_bn_locations = None  # one-shot: don't re-insert again
 
+        # 2c. Snapshot pruned model once, right after final physical prune.
+        #     Reusable as FT starting point — skip sparse phase on later runs.
+        if changed and not cp.prune_channels and not pruned_saved and is_main():
+            pruned_path = os.path.join(args.save_dir, f"{args.criterion}_pat_pruned.pth")
+            torch.save(model.state_dict(), pruned_path)
+            log_info(f"Pruned checkpoint saved to {pruned_path}")
+            pruned_saved = True
+
         # 3. Rebuild optimizer/DDP after model changes (reparam, prune, sparse)
         if use_ddp and changed:
             _broadcast_model_state(model)
