@@ -309,20 +309,20 @@ def print_compact(results, prune_channels=False, epoch_interval=20):
         by_setup.setdefault(setup, []).append((kr_folder, data))
 
     for setup, entries in by_setup.items():
-        # Print config from first entry (shared across KRs in same setup)
-        hp = entries[0][1]["hyperparams"]
-        config_keys = [
-            "criterion", "lr", "ft_eta_min", "ft_warmup_epochs",
-            "epochs_ft", "epochs_sparse", "sparse_mode", "pat_steps",
-            "pat_epochs_per_step", "use_kd", "opt", "wd",
-            "reparam_lambda", "reparam_normalize", "reparam_during_pat",
-            "pruning_schedule", "importance_mode", "no_compensation",
-        ]
-        parts = [f"{k}={hp[k]}" for k in config_keys
-                 if k in hp and hp[k] is not None and hp[k] is not False
-                 and hp[k] != "none" and hp[k] != 0]
         print(f"\n=== {setup} ===")
-        print(f"Config: {', '.join(parts)}")
+        # Print full reconstructed command per KR
+        for kr_folder, data in sorted(entries, key=lambda x: -x[1]["hyperparams"].get("keep_ratio", 0)):
+            hp = data["hyperparams"]
+            kr = hp.get("keep_ratio", "?")
+            cmd_parts = ["python vbp_imagenet_pat.py"]
+            for k, v in hp.items():
+                if v is None or v is False or v == "none":
+                    continue
+                if v is True:
+                    cmd_parts.append(f"--{k}")
+                else:
+                    cmd_parts.append(f"--{k} {v}")
+            print(f"  KR={kr}: {' '.join(cmd_parts)}")
 
         # Sparse stats sub-table (only if any KR has sparse epochs)
         max_sp_epochs = max(
