@@ -348,11 +348,19 @@ def main(argv):
     # Teacher for KD
     teacher = None
     if args.use_kd:
-        teacher = copy.deepcopy(model)
+        if getattr(args, 'teacher_checkpoint', None):
+            teacher_args = copy.copy(args)
+            teacher_args.checkpoint = args.teacher_checkpoint
+            teacher_args.fold_bn_init = False
+            teacher_args.bn_recalibration = False
+            teacher = load_model(teacher_args, device)
+            log_info(f"Loaded KD teacher from {args.teacher_checkpoint}")
+        else:
+            teacher = copy.deepcopy(model)
+            log_info("Created teacher model for KD (deepcopy of student)")
         teacher.eval()
         for p in teacher.parameters():
             p.requires_grad = False
-        log_info("Created teacher model for KD")
 
     # Build pruning config and Pruning class
     config_dir = os.path.join(args.save_dir, "pruning_config")
@@ -402,6 +410,7 @@ def main(argv):
         dist.barrier()
 
     best_acc = 0.0
+    pruned_saved = False
     for epoch in range(total):
         # 0. Tear down DDP before prune() when modules may be replaced
         #    (reparam or fold_bn_before_prune — avoids CUDA crash from stale DDP wrapper)
@@ -561,6 +570,10 @@ def parse_args():
                         help="Architecture source (HF model ID/dir, ConvNeXt variant)")
     parser.add_argument("--checkpoint", default=None,
                         help="Optional .pth checkpoint to load weights from")
+    parser.add_argument("--teacher_checkpoint", default=None,
+                        help="Optional .pth checkpoint for KD teacher. Use when --checkpoint "
+                             "loads a pre-pruned student; teacher should be the original un-pruned model. "
+                             "If unset, teacher = deepcopy(student) at load time.")
     parser.add_argument("--cnn_arch", default=None,
                         choices=["resnet18", "resnet34", "resnet50", "resnet101", "mobilenet_v2"])
     parser.add_argument("--pretrained", action="store_true", default=True)
