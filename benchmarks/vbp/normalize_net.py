@@ -20,6 +20,7 @@ Usage (single device, MPS auto-selected on Apple Silicon):
 """
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -240,12 +241,13 @@ def build_optimizer(model, args, mgr=None):
 
 
 def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
-                     args, device, use_ddp):
+                     args, device, use_ddp, teacher=None):
     """Short training of the (optionally normalized) model. Returns best val acc.
 
     Normalized arm (mgr active): WD acts on v_tilde; mgr stays active across all epochs
     so BN(affine=False) tracks live stats by EMA — no manual refresh. Baseline arm
     (mgr=None): plain training with standard WD, for an apples-to-apples comparison.
+    teacher: if given and args.use_kd, train_one_epoch applies KD.
     """
     normalized = mgr is not None and mgr.is_active
     optimizer = build_optimizer(model, args, mgr)
@@ -264,7 +266,8 @@ def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
     for epoch in range(args.epochs):
         train_loss, _ = train_one_epoch(
             train_model, train_loader, train_sampler, optimizer, scheduler,
-            device, epoch, args, step_per_batch=step_per_batch, phase=phase)
+            device, epoch, args, teacher=teacher,
+            step_per_batch=step_per_batch, phase=phase)
 
         if is_main():
             eval_model = train_model.module if isinstance(train_model, DDP) else train_model
@@ -351,6 +354,15 @@ def main(argv):
             "params_m": base_params / 1e6 if base_params else None,
         })
 
+    # KD teacher = frozen plain pretrained net (snapshot BEFORE reparam).
+    teacher = None
+    if args.use_kd:
+        teacher = copy.deepcopy(model)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
+        log_info(f"KD enabled: teacher = frozen pretrained (alpha={args.kd_alpha}, T={args.kd_T})")
+
     mgr = None
     if not args.no_reparam:
         layer_names = build_whole_net_reparam_layers(
@@ -367,7 +379,7 @@ def main(argv):
         log_info("Baseline arm: plain training, no normalization")
 
     best = train_normalized(model, mgr, train_loader, val_loader, train_sampler,
-                            args, device, use_ddp)
+                            args, device, use_ddp, teacher=teacher)
 
     # -- Save (rank 0). Normalized: merge back + both artifacts. Baseline: plain. --
     if is_main():
