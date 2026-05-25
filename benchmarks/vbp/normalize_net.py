@@ -448,9 +448,9 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_batches", type=int, default=50,
                         help="Calibration batches for BN stats")
-    parser.add_argument("--val_resize", type=int, default=256,
-                        help="Val resize before 224 crop. 256=V1 recipe; "
-                             "232 matches torchvision ResNet50 IMAGENET1K_V2 (80.858)")
+    parser.add_argument("--val_resize", type=int, default=232,
+                        help="Val resize before 224 crop. 232 (default) matches "
+                             "torchvision ResNet50 IMAGENET1K_V2 (80.858); use 256 for V1 weights")
 
     # Whole-net selection
     parser.add_argument("--exclude_layers", nargs="*", default=None,
