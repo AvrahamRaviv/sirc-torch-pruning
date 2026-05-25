@@ -131,15 +131,16 @@ def get_train_transform(model_type):
     ])
 
 
-def get_val_transform(model_type):
-    """Validation transform."""
+def get_val_transform(model_type, resize=256):
+    """Validation transform. resize=256 = V1 recipe (default, back-compat);
+    resize=232 matches torchvision ResNet50_Weights.IMAGENET1K_V2 eval (80.858)."""
     if model_type == "convnext":
         interpolation = T.InterpolationMode.BICUBIC
     else:
         interpolation = T.InterpolationMode.BILINEAR
 
     return T.Compose([
-        T.Resize(256, interpolation=interpolation),
+        T.Resize(resize, interpolation=interpolation),
         T.CenterCrop(224),
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -149,7 +150,7 @@ def get_val_transform(model_type):
 def build_dataloaders(args, use_ddp=True):
     """Build ImageNet train/val dataloaders with optional DDP samplers."""
     train_transform = get_train_transform(args.model_type)
-    val_transform = get_val_transform(args.model_type)
+    val_transform = get_val_transform(args.model_type, resize=getattr(args, "val_resize", 256))
 
     log_info("Loading ImageNet dataset...")
 
