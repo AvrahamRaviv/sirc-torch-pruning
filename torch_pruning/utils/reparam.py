@@ -142,10 +142,11 @@ class BNResidualLinear(nn.Module):
         self.m = nn.Parameter(m)              # [out] — channel means
 
     def forward(self, x):
-        # Handle 3D [B, T, D] for ViT
-        if x.dim() == 3:
-            B, T, D = x.shape
-            x_bn = self.bn(x.reshape(B * T, D)).reshape(B, T, D)
+        # Channel dim is last; flatten all leading dims for BatchNorm1d.
+        # Covers 3D [B, T, D] (ViT) and 4D [N, H, W, C] (channels-last pointwise conv).
+        if x.dim() >= 3:
+            D = x.shape[-1]
+            x_bn = self.bn(x.reshape(-1, D)).reshape(x.shape)
         else:
             x_bn = self.bn(x)
         return F.linear(x_bn, self.v_tilde, self.m)
@@ -788,21 +789,21 @@ class NormalizedResidualManager(BaseReparamManager):
         for name, module in targets.items():
             acc = {'sum': None, 'sum_sq': None, 'count': 0}
             accumulators[name] = acc
+            is_linear = isinstance(module, nn.Linear)
 
-            def make_hook(acc_ref):
+            def make_hook(acc_ref, is_linear):
                 def hook(mod, inp, out):
                     x = inp[0].detach()
-                    if x.dim() == 4:
-                        batch_mean = x.mean(dim=(0, 2, 3))
-                        batch_mean_sq = (x * x).mean(dim=(0, 2, 3))
-                    elif x.dim() == 3:
-                        batch_mean = x.mean(dim=(0, 1))
-                        batch_mean_sq = (x * x).mean(dim=(0, 1))
-                    elif x.dim() == 2:
-                        batch_mean = x.mean(dim=0)
-                        batch_mean_sq = (x * x).mean(dim=0)
-                    else:
+                    if x.dim() < 2:
                         return
+                    # Linear: channel = last dim (2D, 3D ViT, 4D channels-last).
+                    # Conv2d: channel = dim 1 (NCHW).
+                    if is_linear:
+                        reduce_dims = tuple(range(x.dim() - 1))
+                    else:
+                        reduce_dims = (0,) + tuple(range(2, x.dim()))
+                    batch_mean = x.mean(dim=reduce_dims)
+                    batch_mean_sq = (x * x).mean(dim=reduce_dims)
                     n = x.shape[0]
                     if acc_ref['sum'] is None:
                         acc_ref['sum'] = batch_mean * n
@@ -813,7 +814,7 @@ class NormalizedResidualManager(BaseReparamManager):
                     acc_ref['count'] += n
                 return hook
 
-            hooks.append(module.register_forward_hook(make_hook(acc)))
+            hooks.append(module.register_forward_hook(make_hook(acc, is_linear)))
 
         try:
             self.model.eval()

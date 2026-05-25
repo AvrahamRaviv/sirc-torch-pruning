@@ -22,8 +22,6 @@ from torchvision.datasets.folder import default_loader
 import torchvision.transforms as T
 from tqdm import tqdm
 
-from transformers import ViTForImageClassification
-
 # Local ConvNeXt implementation (FB version)
 try:
     from .convnext import convnext_tiny, convnext_small, convnext_base, convnext_large
@@ -234,7 +232,7 @@ def _merge_vnr_state_dict(state, eps=1e-5):
         else:
             # Conv2d: v_tilde [C_out, C_in, kH, kW], sigma [C_in]
             w_eff = vt / sigma[None, :, None, None]
-            b_eff = m - (w_eff.view(vt.shape[0], -1) @ mu)
+            b_eff = m - (w_eff.sum(dim=(2, 3)) @ mu)
 
         new_state[prefix + ".weight"] = w_eff
         new_state[prefix + ".bias"] = b_eff
@@ -268,6 +266,7 @@ def load_model(args, device):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 
     if args.model_type == "vit":
+        from transformers import ViTForImageClassification
         model = ViTForImageClassification.from_pretrained(
             args.model_name, local_files_only=os.path.isdir(args.model_name))
         if checkpoint:
@@ -475,6 +474,64 @@ def build_reparam_layers(model, model_type, architecture=None, reparam_target="f
                    and m.kernel_size == (1, 1) and m.groups == 1:
                     layers.append(name)
     return layers
+
+
+def build_whole_net_reparam_layers(model, exclude=None, exclude_classifier=True,
+                                   exclude_stem=False):
+    """Return dotted names of every nn.Linear and nn.Conv2d(groups==1) in the model.
+
+    Used for normalize-net-by-construction (whole-net VNR reparam). Over-inclusion is
+    safe: NormalizedResidualManager._resolve_targets re-filters and skips depthwise/
+    grouped convs.
+
+    Args:
+        exclude: iterable of dotted names to drop.
+        exclude_classifier: drop the last nn.Linear (logits head) plus any name ending
+            in 'classifier' / '.head'.
+        exclude_stem: drop the first collected nn.Conv2d (input stem).
+    """
+    exclude = set(exclude or [])
+    linears, convs = [], []
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Linear):
+            linears.append(name)
+        elif isinstance(m, nn.Conv2d) and m.groups == 1:
+            convs.append(name)
+
+    names = linears + convs
+    drop = set(exclude)
+    if exclude_classifier and linears:
+        drop.add(linears[-1])
+        drop.update(n for n in linears
+                    if n.endswith("classifier") or n.endswith(".head") or n == "head")
+    if exclude_stem and convs:
+        drop.add(convs[0])
+
+    # Preserve named_modules() order.
+    ordered = [n for n, _ in model.named_modules()
+               if n in set(names) and n not in drop]
+    return ordered
+
+
+def attach_biases(model, layer_names):
+    """Add a zero bias Parameter to each named Conv2d/Linear whose bias is None.
+
+    After NormalizedResidualManager.merge_back(), every reparam'd layer becomes a
+    standard module with bias=True (_make_standard always sets bias=True). A plain
+    architecture built for reload may have bias=None on those layers (e.g. conv
+    before BN), so strict load would fail on the extra '.bias' keys. Attaching a
+    zero bias makes the plain-arch keys match a VNR-merged / merged-biased checkpoint.
+
+    Returns the (mutated) model.
+    """
+    name_to_module = dict(model.named_modules())
+    for name in layer_names:
+        m = name_to_module.get(name)
+        if isinstance(m, (nn.Conv2d, nn.Linear)) and m.bias is None:
+            out = m.out_channels if isinstance(m, nn.Conv2d) else m.out_features
+            m.bias = nn.Parameter(torch.zeros(out, device=m.weight.device,
+                                              dtype=m.weight.dtype))
+    return model
 
 
 def build_consumer_weight_map(model, model_type, architecture=None):
