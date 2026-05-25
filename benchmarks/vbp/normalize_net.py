@@ -375,6 +375,20 @@ def main(argv):
         if use_ddp:
             _broadcast_model_state(model)
         log_info(f"Reparameterized {len(mgr._reparam_modules)} layers (WD acts on v_tilde)")
+
+        # Immediate post-reparam (init / "epoch 0") eval. Reparam is exact in eval mode,
+        # so this MUST match pre-train acc0; a nonzero delta flags a wiring/DDP bug
+        # before we commit to the full run.
+        if is_main():
+            acc_init, _ = validate(model, val_loader, device, args.model_type)
+            log_info(f"Post-reparam (init) val_acc={acc_init:.4f} "
+                     f"(Δ vs pre-train={acc_init - acc0:+.4f})")
+            append_metrics(args, {
+                "arm": arm, "epoch": 0, "epochs": args.epochs,
+                "train_loss": None, "val_acc": round(acc_init, 6),
+                "val_loss": None, "best_val_acc": round(acc_init, 6),
+                "lr": None, "stage": "post_reparam_init",
+            })
     else:
         log_info("Baseline arm: plain training, no normalization")
 
