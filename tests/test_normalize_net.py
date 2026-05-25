@@ -317,3 +317,71 @@ def test_script_end_to_end(tmp_path):
     for fmt in ("vnr", "merged_biased"):
         assert os.path.exists(os.path.join(str(tmp_path), f"test_{fmt}.pth"))
         assert os.path.exists(os.path.join(str(tmp_path), f"test_{fmt}.meta.json"))
+
+
+# ---------------------------------------------------------------------------
+# Training: optimizer WD grouping + short-run smoke
+# ---------------------------------------------------------------------------
+def _train_args(**over):
+    import tempfile
+    from types import SimpleNamespace
+    base = dict(epochs=1, lr=1e-3, wd=0.05, opt="adamw", momentum=0.9,
+                ft_eta_min=1e-5, ft_warmup_epochs=0, model_type="cnn",
+                use_kd=False, local_rank=0,
+                save_dir=tempfile.mkdtemp(), save_tag="smoke")
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_build_optimizer_wd_on_vtilde():
+    """WD must act on v_tilde (decayed group); m must be excluded (no_decay)."""
+    import normalize_net as nn_mod
+
+    model = TinyMLP()
+    mgr = NormalizedResidualManager(model, ["fc1", "fc2"], CPU,
+                                    lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+
+    opt = nn_mod.build_optimizer(model, _train_args(), mgr)
+    assert len(opt.param_groups) == 2
+    decayed, no_decay = opt.param_groups[0], opt.param_groups[1]
+    assert decayed["weight_decay"] == 0.05 and no_decay["weight_decay"] == 0.0
+
+    v_ids = {id(rp.v_tilde) for rp in mgr._reparam_modules.values()}
+    m_ids = {id(rp.m) for rp in mgr._reparam_modules.values()}
+    decayed_ids = {id(p) for p in decayed["params"]}
+    no_decay_ids = {id(p) for p in no_decay["params"]}
+    assert v_ids <= decayed_ids, "v_tilde must be weight-decayed"
+    assert m_ids <= no_decay_ids, "m must be excluded from weight decay"
+
+
+def test_build_optimizer_plain():
+    """No manager -> single decayed group over all params."""
+    import normalize_net as nn_mod
+    model = TinyMLP()
+    opt = nn_mod.build_optimizer(model, _train_args(), mgr=None)
+    assert len(opt.param_groups) == 1
+    assert opt.param_groups[0]["weight_decay"] == 0.05
+
+
+def test_train_smoke_both_arms():
+    """train_normalized runs one epoch for the normalized and baseline arms."""
+    import normalize_net as nn_mod
+
+    train_loader = _img_loader(3, 16, n=8, bs=4)
+    val_loader = _img_loader(3, 16, n=8, bs=4)
+    args = _train_args(epochs=1)
+
+    # Normalized arm
+    model = TinyCNN()
+    names = build_whole_net_reparam_layers(model)  # expand, project (fc excluded)
+    mgr = NormalizedResidualManager(model, names, CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(train_loader)
+    best = nn_mod.train_normalized(model, mgr, train_loader, val_loader, None,
+                                   args, CPU, use_ddp=False)
+    assert isinstance(best, float) and 0.0 <= best <= 1.0
+
+    # Baseline arm (no reparam)
+    base = nn_mod.train_normalized(TinyCNN(), None, train_loader, val_loader, None,
+                                   args, CPU, use_ddp=False)
+    assert isinstance(base, float) and 0.0 <= base <= 1.0

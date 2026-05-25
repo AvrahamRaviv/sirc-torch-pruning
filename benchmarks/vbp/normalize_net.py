@@ -25,12 +25,17 @@ import os
 import sys
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+import torch_pruning as tp
 
 try:
     from .vbp_common import (
         logger, is_main, log_info, setup_logging,
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate, forward_logits,
+        train_one_epoch, build_ft_scheduler,
         build_whole_net_reparam_layers, attach_biases, _merge_vnr_state_dict,
     )
 except ImportError:
@@ -39,6 +44,7 @@ except ImportError:
         logger, is_main, log_info, setup_logging,
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate, forward_logits,
+        train_one_epoch, build_ft_scheduler,
         build_whole_net_reparam_layers, attach_biases, _merge_vnr_state_dict,
     )
 
@@ -69,6 +75,31 @@ def _broadcast_model_state(model):
 def _ckpt_paths(args, fmt):
     base = os.path.join(args.save_dir, f"{args.save_tag}_{fmt}")
     return base + ".pth", base + ".meta.json"
+
+
+# ---------------------------------------------------------------------------
+# Structured logging (machine-parseable artifacts for later parse / ExpHandler)
+# ---------------------------------------------------------------------------
+def _metrics_path(args):
+    return os.path.join(args.save_dir, f"{args.save_tag}_metrics.jsonl")
+
+
+def _run_path(args):
+    return os.path.join(args.save_dir, f"{args.save_tag}_run.json")
+
+
+def append_metrics(args, record):
+    """Append one JSON line (one training epoch) to <save_tag>_metrics.jsonl."""
+    os.makedirs(args.save_dir, exist_ok=True)
+    with open(_metrics_path(args), "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def write_run(args, payload):
+    """Write/overwrite the run summary JSON (config + final results)."""
+    os.makedirs(args.save_dir, exist_ok=True)
+    with open(_run_path(args), "w") as f:
+        json.dump(payload, f, indent=2)
 
 
 def save_normnet_checkpoint(state_dict, fmt, biased_layers, args):
@@ -181,6 +212,84 @@ def verify_roundtrip(model, mgr, loader, args, device, use_ddp):
 
 
 # ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+def build_optimizer(model, args, mgr=None):
+    """Optimizer with weight decay ON v_tilde (free-by-design normalized-space reg).
+
+    Only m (the folded mean/bias term) is excluded from decay; v_tilde stays in the
+    decayed group, so standard weight decay shrinks the contribution variance directly.
+    (Deliberately NOT reusing mgr.reparam_param_ids(), which lumps v_tilde + m together —
+    that would zero WD on v_tilde, the opposite of what we want here.)
+    """
+    params = list(model.parameters())
+    if mgr is not None and mgr.is_active:
+        m_ids = {id(rp.m) for rp in mgr._reparam_modules.values()}
+        decayed = [p for p in params if id(p) not in m_ids]   # includes v_tilde
+        no_decay = [p for p in params if id(p) in m_ids]
+        groups = [
+            {"params": decayed, "weight_decay": args.wd},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+    else:
+        groups = [{"params": params, "weight_decay": args.wd}]
+
+    if args.opt == "sgd":
+        return torch.optim.SGD(groups, lr=args.lr, momentum=args.momentum)
+    return torch.optim.AdamW(groups, lr=args.lr)
+
+
+def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
+                     args, device, use_ddp):
+    """Short training of the (optionally normalized) model. Returns best val acc.
+
+    Normalized arm (mgr active): WD acts on v_tilde; mgr stays active across all epochs
+    so BN(affine=False) tracks live stats by EMA — no manual refresh. Baseline arm
+    (mgr=None): plain training with standard WD, for an apples-to-apples comparison.
+    """
+    normalized = mgr is not None and mgr.is_active
+    optimizer = build_optimizer(model, args, mgr)
+    scheduler, step_per_batch = build_ft_scheduler(
+        optimizer, args.epochs, len(train_loader),
+        eta_min=args.ft_eta_min, warmup_epochs=args.ft_warmup_epochs)
+
+    train_model = model
+    if use_ddp:
+        train_model = DDP(model, device_ids=[args.local_rank],
+                          output_device=args.local_rank)
+
+    phase = "NormTrain" if normalized else "Baseline"
+    arm = "normalized" if normalized else "baseline"
+    best_acc = 0.0
+    for epoch in range(args.epochs):
+        train_loss, _ = train_one_epoch(
+            train_model, train_loader, train_sampler, optimizer, scheduler,
+            device, epoch, args, step_per_batch=step_per_batch, phase=phase)
+
+        if is_main():
+            eval_model = train_model.module if isinstance(train_model, DDP) else train_model
+            acc, val_loss = validate(eval_model, val_loader, device, args.model_type)
+            best_acc = max(best_acc, acc)
+            cur_lr = optimizer.param_groups[0]["lr"]
+            # Human line (capital "Epoch", comma-separated → parse_logs-compatible style)
+            log_info(f"[{phase}] Epoch {epoch+1}/{args.epochs}: "
+                     f"train_loss={train_loss:.4f}, val_acc={acc:.4f}, "
+                     f"val_loss={val_loss:.4f}, best={best_acc:.4f}, lr={cur_lr:.2e}")
+            # Machine line (one JSON object per epoch)
+            append_metrics(args, {
+                "arm": arm, "epoch": epoch + 1, "epochs": args.epochs,
+                "train_loss": round(train_loss, 6), "val_acc": round(acc, 6),
+                "val_loss": round(val_loss, 6), "best_val_acc": round(best_acc, 6),
+                "lr": cur_lr,
+            })
+            if normalized:
+                mgr.log_channel_stats(verbose=False)
+        if use_ddp:
+            dist.barrier()
+    return best_acc
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main(argv):
@@ -196,36 +305,100 @@ def main(argv):
         args.local_rank = 0
 
     setup_logging(args.save_dir)
+    mode = "transform + verify" if args.epochs == 0 else f"short training ({args.epochs}e)"
     if is_main():
         log_info("=" * 60)
-        log_info("Normalize-net-by-construction (transform + verify)")
+        log_info(f"Normalize-net-by-construction ({mode})")
         log_info("=" * 60)
         for k, v in vars(args).items():
             logger.info(f"  {k}: {v}")
         log_info(f"Device: {device}")
 
-    _, val_loader, _ = build_dataloaders(args, use_ddp=use_ddp)
-
+    train_loader, val_loader, train_sampler = build_dataloaders(args, use_ddp=use_ddp)
     model = load_model(args, device)
 
-    layer_names = build_whole_net_reparam_layers(
-        model,
-        exclude=args.exclude_layers,
-        exclude_classifier=args.exclude_classifier,
-        exclude_stem=args.exclude_stem,
-    )
-    log_info(f"Whole-net selector: {len(layer_names)} candidate layers")
+    # -- Transform + verify only (no training) --
+    if args.epochs == 0:
+        layer_names = build_whole_net_reparam_layers(
+            model, exclude=args.exclude_layers,
+            exclude_classifier=args.exclude_classifier, exclude_stem=args.exclude_stem)
+        log_info(f"Whole-net selector: {len(layer_names)} candidate layers")
+        mgr = NormalizedResidualManager(
+            model, layer_names, device, lambda_reg=0.0, max_batches=args.max_batches)
+        ok = verify_roundtrip(model, mgr, val_loader, args, device, use_ddp)
+        if use_ddp:
+            cleanup()
+        return 0 if ok else 1
 
-    mgr = NormalizedResidualManager(
-        model, layer_names, device,
-        lambda_reg=0.0, max_batches=args.max_batches,
-    )
+    # -- Short training: normalized arm vs --no_reparam baseline arm --
+    arm = "baseline" if args.no_reparam else "normalized"
+    acc0 = None
+    base_macs = base_params = None
+    if is_main():
+        log_info("command: " + " ".join([sys.executable, "benchmarks/vbp/normalize_net.py"] + argv))
+        try:
+            ex = torch.randn(1, 3, 224, 224).to(device)
+            base_macs, base_params = tp.utils.count_ops_and_params(model, ex)
+            log_info(f"Baseline: {base_macs / 1e9:.2f}G MACs, {base_params / 1e6:.2f}M params")
+        except Exception as e:  # MACs are informational; never block the run
+            log_info(f"MACs count skipped: {e}")
+        acc0, _ = validate(model, val_loader, device, args.model_type)
+        log_info(f"Pre-train val_acc={acc0:.4f}")
+        write_run(args, {
+            "arm": arm, "status": "running", "config": vars(args),
+            "pre_train_val_acc": acc0,
+            "macs_g": base_macs / 1e9 if base_macs else None,
+            "params_m": base_params / 1e6 if base_params else None,
+        })
 
-    ok = verify_roundtrip(model, mgr, val_loader, args, device, use_ddp)
+    mgr = None
+    if not args.no_reparam:
+        layer_names = build_whole_net_reparam_layers(
+            model, exclude=args.exclude_layers,
+            exclude_classifier=args.exclude_classifier, exclude_stem=args.exclude_stem)
+        log_info(f"Whole-net selector: {len(layer_names)} candidate layers")
+        mgr = NormalizedResidualManager(
+            model, layer_names, device, lambda_reg=0.0, max_batches=args.max_batches)
+        mgr.reparameterize(train_loader)
+        if use_ddp:
+            _broadcast_model_state(model)
+        log_info(f"Reparameterized {len(mgr._reparam_modules)} layers (WD acts on v_tilde)")
+    else:
+        log_info("Baseline arm: plain training, no normalization")
+
+    best = train_normalized(model, mgr, train_loader, val_loader, train_sampler,
+                            args, device, use_ddp)
+
+    # -- Save (rank 0). Normalized: merge back + both artifacts. Baseline: plain. --
+    if is_main():
+        ckpts = {}
+        if mgr is not None and mgr.is_active:
+            resolved = list(mgr._reparam_modules.keys())
+            vnr_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            mgr.merge_back()
+            merged_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            ckpts["merged_biased"] = save_normnet_checkpoint(merged_state, "merged_biased", resolved, args)
+            ckpts["vnr"] = save_normnet_checkpoint(vnr_state, "vnr", resolved, args)
+        else:
+            os.makedirs(args.save_dir, exist_ok=True)
+            base_path = os.path.join(args.save_dir, f"{args.save_tag}_baseline.pth")
+            torch.save({k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+                       base_path)
+            log_info(f"Saved baseline checkpoint to {base_path}")
+            ckpts["baseline"] = base_path
+        log_info(f"RESULT arm={arm}, epochs={args.epochs}, "
+                 f"pre_train_val_acc={acc0:.4f}, best_val_acc={best:.4f}")
+        write_run(args, {
+            "arm": arm, "status": "done", "config": vars(args),
+            "pre_train_val_acc": acc0, "best_val_acc": best,
+            "macs_g": base_macs / 1e9 if base_macs else None,
+            "params_m": base_params / 1e6 if base_params else None,
+            "checkpoints": ckpts, "metrics_file": _metrics_path(args),
+        })
 
     if use_ddp:
         cleanup()
-    return 0 if ok else 1
+    return 0
 
 
 def parse_args():
@@ -258,6 +431,22 @@ def parse_args():
                         action="store_false",
                         help="Also reparameterize the logits head")
     parser.add_argument("--exclude_stem", action="store_true", default=False)
+
+    # Training (epochs=0 -> transform+verify only; >0 -> short training)
+    parser.add_argument("--epochs", type=int, default=0,
+                        help="Training epochs (0 = transform+verify only)")
+    parser.add_argument("--no_reparam", action="store_true", default=False,
+                        help="Baseline arm: plain training, skip normalization")
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--wd", type=float, default=0.05,
+                        help="Weight decay (acts ON v_tilde in the normalized arm)")
+    parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd"])
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--ft_eta_min", type=float, default=1e-5)
+    parser.add_argument("--ft_warmup_epochs", type=float, default=0)
+    parser.add_argument("--use_kd", action="store_true", default=False)
+    parser.add_argument("--kd_alpha", type=float, default=0.7)
+    parser.add_argument("--kd_T", type=float, default=2.0)
 
     # Verify / output
     parser.add_argument("--verify_atol", type=float, default=1e-4)
