@@ -67,12 +67,21 @@ def _load(run_json):
 def main(argv):
     ap = argparse.ArgumentParser(description="Summarize normalize_net runs")
     ap.add_argument("paths", nargs="+", help="run dirs / parent dirs / *_run.json")
+    ap.add_argument("--setups", default=None,
+                    help="Comma-separated whitelist: only include runs whose run-dir name OR "
+                         "tag is listed (e.g. --setups v1,v2,v3). Mirrors parse_logs.py --setups.")
     ap.add_argument("--pct", action="store_true", help="show accuracies as percent")
     args = ap.parse_args(argv[1:])
 
     run_jsons = _find_run_jsons(args.paths)
+    if args.setups:
+        sel = {s.strip() for s in args.setups.split(",") if s.strip()}
+        run_jsons = [rj for rj in run_jsons
+                     if os.path.basename(os.path.dirname(rj)) in sel
+                     or os.path.basename(rj)[:-len("_run.json")] in sel]
     if not run_jsons:
-        print("No *_run.json found under:", args.paths); return 1
+        print("No *_run.json found under:", args.paths,
+              ("(setups=" + args.setups + ")") if args.setups else ""); return 1
 
     runs = [_load(rj) for rj in run_jsons]
     scale = 100.0 if args.pct else 1.0
