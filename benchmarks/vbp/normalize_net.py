@@ -22,6 +22,7 @@ Usage (single device, MPS auto-selected on Apple Silicon):
 import argparse
 import copy
 import json
+import logging
 import os
 import sys
 
@@ -308,6 +309,14 @@ def main(argv):
         args.local_rank = 0
 
     setup_logging(args.save_dir)
+    # Route torch_pruning.utils.reparam logs (the per-epoch "V-norm aggregate"
+    # health line) into the same handlers as vbp_imagenet.log. That logger has
+    # propagate=False and no handler of its own, so without this bridge the
+    # V-norm INFO lines are silently dropped (and never reach the log file).
+    _rlog = logging.getLogger("torch_pruning.utils.reparam")
+    _rlog.setLevel(logging.INFO)
+    _rlog.handlers = list(logging.getLogger("vbp_imagenet").handlers)
+    _rlog.propagate = False
     mode = "transform + verify" if args.epochs == 0 else f"short training ({args.epochs}e)"
     if is_main():
         log_info("=" * 60)
