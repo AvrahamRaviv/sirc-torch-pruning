@@ -225,7 +225,32 @@ def build_optimizer(model, args, mgr=None):
     that would zero WD on v_tilde, the opposite of what we want here.)
     """
     params = list(model.parameters())
-    if mgr is not None and mgr.is_active:
+    if mgr is None or not mgr.is_active:
+        groups = [{"params": params, "weight_decay": args.wd}]
+    elif getattr(args, "lr_scale_by_sigma2", False):
+        # Neutralize the 1/σ² W-space rescaling: SGD on v_tilde gives effective
+        # W-space lr = lr/σ², so per-layer lr ∝ mean σ² recovers a uniform W-step.
+        # Per-LAYER (mean σ²) — corrects cross-layer scale, not intra-layer channel spread.
+        v_ids = {id(rp.v_tilde) for rp in mgr._reparam_modules.values()}
+        m_ids = {id(rp.m) for rp in mgr._reparam_modules.values()}
+        groups, scales = [], []
+        for rp in mgr._reparam_modules.values():
+            sigma2 = (rp.bn.running_var + rp.bn.eps).mean().item()
+            groups.append({"params": [rp.v_tilde], "lr": args.lr * sigma2,
+                           "weight_decay": args.wd})
+            scales.append(sigma2)
+        groups.append({"params": [rp.m for rp in mgr._reparam_modules.values()],
+                       "lr": args.lr, "weight_decay": 0.0})
+        rest = [p for p in params if id(p) not in v_ids and id(p) not in m_ids]
+        if rest:
+            groups.append({"params": rest, "lr": args.lr, "weight_decay": args.wd})
+        if is_main() and scales:
+            import numpy as _np
+            s = _np.array(scales)
+            log_info(f"lr_scale_by_sigma2: {len(scales)} layers, σ² "
+                     f"min={s.min():.3g} median={_np.median(s):.3g} max={s.max():.3g} "
+                     f"→ per-layer lr {args.lr*s.min():.2e}..{args.lr*s.max():.2e}")
+    else:
         m_ids = {id(rp.m) for rp in mgr._reparam_modules.values()}
         decayed = [p for p in params if id(p) not in m_ids]   # includes v_tilde
         no_decay = [p for p in params if id(p) in m_ids]
@@ -233,8 +258,6 @@ def build_optimizer(model, args, mgr=None):
             {"params": decayed, "weight_decay": args.wd},
             {"params": no_decay, "weight_decay": 0.0},
         ]
-    else:
-        groups = [{"params": params, "weight_decay": args.wd}]
 
     if args.opt == "sgd":
         return torch.optim.SGD(groups, lr=args.lr, momentum=args.momentum)
@@ -486,6 +509,10 @@ def parse_args():
                         help="Weight decay (acts ON v_tilde in the normalized arm)")
     parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd"])
     parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--lr_scale_by_sigma2", action="store_true", default=False,
+                        help="Scale each reparam layer's SGD lr by its mean σ² (from "
+                             "calibration BN running_var) → neutralizes the 1/σ² W-space "
+                             "rescaling. Per-layer (not per-channel). Use with cosine, not flat.")
     parser.add_argument("--norm_bn_momentum", type=float, default=None,
                         help="Override inserted-BN EMA momentum after calibration. "
                              "0=freeze σ at calibration (conv: true freeze), "
