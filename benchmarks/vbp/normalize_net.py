@@ -381,6 +381,12 @@ def main(argv):
         mgr = NormalizedResidualManager(
             model, layer_names, device, lambda_reg=0.0, max_batches=args.max_batches)
         mgr.reparameterize(train_loader)
+        if args.norm_bn_momentum is not None:
+            for rp in mgr._reparam_modules.values():
+                rp.bn.momentum = args.norm_bn_momentum
+            tag = "frozen" if args.norm_bn_momentum == 0 else f"momentum={args.norm_bn_momentum}"
+            log_info(f"Inserted-BN running stats set {tag} "
+                     f"(σ {'fixed at calibration' if args.norm_bn_momentum == 0 else 'slow EMA'})")
         if use_ddp:
             _broadcast_model_state(model)
         log_info(f"Reparameterized {len(mgr._reparam_modules)} layers (WD acts on v_tilde)")
@@ -480,6 +486,10 @@ def parse_args():
                         help="Weight decay (acts ON v_tilde in the normalized arm)")
     parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd"])
     parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--norm_bn_momentum", type=float, default=None,
+                        help="Override inserted-BN EMA momentum after calibration. "
+                             "0=freeze σ at calibration (conv: true freeze), "
+                             "0.01=slow/stable EMA, unset=PyTorch default 0.1 (live).")
     parser.add_argument("--ft_eta_min", type=float, default=1e-5)
     parser.add_argument("--ft_warmup_epochs", type=float, default=0)
     parser.add_argument("--use_kd", action="store_true", default=False)
