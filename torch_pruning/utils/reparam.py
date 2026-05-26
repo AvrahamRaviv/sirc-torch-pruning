@@ -640,11 +640,27 @@ class BaseReparamManager(ABC):
 class MeanResidualManager(BaseReparamManager):
     """Lifecycle orchestrator for mean-residual reparameterization.
 
+    Trainable v = W (effective weight on raw input), forward v·(x−μ) + m. Gradient
+    ∝ (x−μ): mean-centered, uniform W-space lr → fine-tunes like the plain baseline.
+    This is the function-/gradient-correct parametrization (no 1/σ² overshoot, unlike
+    NormalizedResidualManager's v_tilde = W·σ).
+
     Usage:
         mgr = MeanResidualManager(model, target_names, device, lambda_reg=0.01)
         mgr.reparameterize(train_loader)   # calibrate μ_x, replace modules
         ...  # train with mgr.regularization_loss() as aux loss
         mgr.merge_back()                   # restore standard modules before pruning
+
+    TODO (pruning, deferred — base training is the current focus):
+      The NCI contribution-variance score is ‖v·σ‖, but this manager carries no σ
+      (it folds away σ entirely; σ cancels in the forward). To prune on the mean path:
+        1. Calibrate and store a fixed per-input-channel σ buffer (BN-EMA) on each
+           MeanResidual* module at reparameterize() time.
+        2. Score channels by ‖v·σ‖ (not ‖v‖) in channel_stats()/importance.
+        3. If contribution-variance *regularization* is wanted, add it as an EXPLICIT
+           penalty λ‖v·σ‖ in regularization_loss() — do NOT fold σ into the trainable
+           (that reintroduces the 1/σ² optimizer-geometry overshoot). This decouples the
+           whitening penalty from the optimizer step.
     """
 
     def __init__(self, model, target_names, device, lambda_reg=0.01, max_batches=200,

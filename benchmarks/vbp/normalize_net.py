@@ -2,9 +2,14 @@
 Normalize-net-by-construction: transform + verify (no training).
 
 Applies a function-preserving reparametrization across the whole network: for every
-nn.Linear and nn.Conv2d(groups==1), insert BN(affine=False) on its input and move the
-trainable weight into normalized space (v_tilde = W·σ), folding the input mean into the
-bias (m = b + W·μ). See torch_pruning/utils/reparam.py::NormalizedResidualManager.
+nn.Linear and nn.Conv2d(groups==1), fold the input mean into the bias (m = b + W·μ) and
+train a residual weight. Two parametrizations, via --reparam_variant:
+  - mean (default, CORRECT): trainable v = W, forward v·(x−μ) + m. Gradient ∝ (x−μ),
+    uniform W-space lr → fine-tunes like the plain baseline. (MeanResidualManager)
+  - bn   (legacy): insert BN(affine=False), trainable v_tilde = W·σ on normalized input.
+    Forward divides back by σ → effective W-space lr = lr/σ², a per-channel overshoot that
+    caused the v1–v6 converged-FT accuracy cliffs. (NormalizedResidualManager)
+See torch_pruning/utils/reparam.py.
 
 This script only transforms and verifies — a general-training run is the next step and
 resumes from the saved 'vnr' artifact. Two checkpoints are written:
@@ -50,7 +55,32 @@ except ImportError:
         build_whole_net_reparam_layers, attach_biases, _merge_vnr_state_dict,
     )
 
-from torch_pruning.utils.reparam import NormalizedResidualManager
+from torch_pruning.utils.reparam import (
+    NormalizedResidualManager, MeanResidualManager,
+)
+
+
+def build_reparam_manager(model, layer_names, device, args):
+    """Construct the reparam manager for the chosen --reparam_variant.
+
+    mean (default, CORRECT): trainable v = W, forward v·(x−μ) + m. Gradient ∝ (x−μ)
+        — mean-centered, uniform W-space lr. Matches plain FT; this is the doc's w̃
+        parametrization (σ cancels in the forward).
+    bn  (legacy): trainable v_tilde = W·σ, forward divides back by σ → effective
+        W-space lr = lr/σ², the per-channel overshoot behind every v1–v6 converged-FT
+        cliff. Kept only to reproduce the old behavior.
+
+    NOTE (pruning, deferred): σ is needed for the NCI contribution-variance score
+    ‖v·σ‖, which currently lives only in the bn variant. For mean-variant pruning,
+    carry a fixed σ buffer (BN-EMA) and score ‖v·σ‖ — see the TODO in reparam.py
+    (MeanResidualManager). Base training is fixed here regardless; pruning is out of
+    scope for this verify run.
+    """
+    if args.reparam_variant == "bn":
+        return NormalizedResidualManager(
+            model, layer_names, device, lambda_reg=0.0, max_batches=args.max_batches)
+    return MeanResidualManager(
+        model, layer_names, device, lambda_reg=0.0, max_batches=args.max_batches)
 
 
 def get_device():
@@ -217,19 +247,32 @@ def verify_roundtrip(model, mgr, loader, args, device, use_ddp):
 # Training
 # ---------------------------------------------------------------------------
 def build_optimizer(model, args, mgr=None):
-    """Optimizer with weight decay ON v_tilde (free-by-design normalized-space reg).
+    """Optimizer with weight decay ON the residual weight (free-by-design reg).
 
-    Only m (the folded mean/bias term) is excluded from decay; v_tilde stays in the
-    decayed group, so standard weight decay shrinks the contribution variance directly.
-    (Deliberately NOT reusing mgr.reparam_param_ids(), which lumps v_tilde + m together —
-    that would zero WD on v_tilde, the opposite of what we want here.)
+    Only m (the folded mean/bias term) is excluded from decay; the residual weight
+    stays in the decayed group.
+      - mean variant: WD on ‖v‖ = ‖W‖² (magnitude — same geometry as plain).
+      - bn   variant: WD on ‖v_tilde‖ = ‖W·σ‖² (contribution variance / NCI).
+    (Deliberately NOT reusing mgr.reparam_param_ids(), which lumps the weight + m
+    together — that would zero WD on the weight, the opposite of what we want here.)
     """
     params = list(model.parameters())
-    if mgr is None or not mgr.is_active:
+    active = mgr is not None and mgr.is_active
+    # σ²-lr-scaling only exists to undo the bn variant's 1/σ² overshoot (needs v_tilde
+    # + bn). The mean variant already has uniform W-space lr, so it's a conceptual no-op.
+    # Detect the variant from the modules, not args — single source of truth.
+    is_bn_variant = active and all(
+        hasattr(rp, "v_tilde") for rp in mgr._reparam_modules.values())
+    scale_by_sigma2 = getattr(args, "lr_scale_by_sigma2", False)
+    if scale_by_sigma2 and not is_bn_variant:
+        log_info("lr_scale_by_sigma2 ignored: only applies to the bn reparam variant")
+        scale_by_sigma2 = False
+
+    if not active:
         groups = [{"params": params, "weight_decay": args.wd}]
-    elif getattr(args, "lr_scale_by_sigma2", False):
-        # Neutralize the 1/σ² W-space rescaling: SGD on v_tilde gives effective
-        # W-space lr = lr/σ², so per-layer lr ∝ mean σ² recovers a uniform W-step.
+    elif scale_by_sigma2:
+        # Neutralize the 1/σ² W-space rescaling (bn variant): SGD on v_tilde gives
+        # effective W-space lr = lr/σ², so per-layer lr ∝ mean σ² recovers a uniform W-step.
         # Per-LAYER (mean σ²) — corrects cross-layer scale, not intra-layer channel spread.
         v_ids = {id(rp.v_tilde) for rp in mgr._reparam_modules.values()}
         m_ids = {id(rp.m) for rp in mgr._reparam_modules.values()}
@@ -252,7 +295,7 @@ def build_optimizer(model, args, mgr=None):
                      f"→ per-layer lr {args.lr*s.min():.2e}..{args.lr*s.max():.2e}")
     else:
         m_ids = {id(rp.m) for rp in mgr._reparam_modules.values()}
-        decayed = [p for p in params if id(p) not in m_ids]   # includes v_tilde
+        decayed = [p for p in params if id(p) not in m_ids]   # includes residual weight v
         no_decay = [p for p in params if id(p) in m_ids]
         groups = [
             {"params": decayed, "weight_decay": args.wd},
@@ -358,8 +401,7 @@ def main(argv):
             model, exclude=args.exclude_layers,
             exclude_classifier=args.exclude_classifier, exclude_stem=args.exclude_stem)
         log_info(f"Whole-net selector: {len(layer_names)} candidate layers")
-        mgr = NormalizedResidualManager(
-            model, layer_names, device, lambda_reg=0.0, max_batches=args.max_batches)
+        mgr = build_reparam_manager(model, layer_names, device, args)
         ok = verify_roundtrip(model, mgr, val_loader, args, device, use_ddp)
         if use_ddp:
             cleanup()
@@ -401,15 +443,18 @@ def main(argv):
             model, exclude=args.exclude_layers,
             exclude_classifier=args.exclude_classifier, exclude_stem=args.exclude_stem)
         log_info(f"Whole-net selector: {len(layer_names)} candidate layers")
-        mgr = NormalizedResidualManager(
-            model, layer_names, device, lambda_reg=0.0, max_batches=args.max_batches)
+        mgr = build_reparam_manager(model, layer_names, device, args)
         mgr.reparameterize(train_loader)
         if args.norm_bn_momentum is not None:
-            for rp in mgr._reparam_modules.values():
-                rp.bn.momentum = args.norm_bn_momentum
-            tag = "frozen" if args.norm_bn_momentum == 0 else f"momentum={args.norm_bn_momentum}"
-            log_info(f"Inserted-BN running stats set {tag} "
-                     f"(σ {'fixed at calibration' if args.norm_bn_momentum == 0 else 'slow EMA'})")
+            if args.reparam_variant == "bn":
+                for rp in mgr._reparam_modules.values():
+                    rp.bn.momentum = args.norm_bn_momentum
+                tag = "frozen" if args.norm_bn_momentum == 0 else f"momentum={args.norm_bn_momentum}"
+                log_info(f"Inserted-BN running stats set {tag} "
+                         f"(σ {'fixed at calibration' if args.norm_bn_momentum == 0 else 'slow EMA'})")
+            else:
+                log_info("norm_bn_momentum ignored: only applies to --reparam_variant bn "
+                         "(mean variant has no inserted BN; μ_x is frozen at calibration)")
         if use_ddp:
             _broadcast_model_state(model)
         log_info(f"Reparameterized {len(mgr._reparam_modules)} layers (WD acts on v_tilde)")
@@ -504,6 +549,13 @@ def parse_args():
                         help="Training epochs (0 = transform+verify only)")
     parser.add_argument("--no_reparam", action="store_true", default=False,
                         help="Baseline arm: plain training, skip normalization")
+    parser.add_argument("--reparam_variant", default="mean", choices=["mean", "bn"],
+                        help="Reparam parametrization (normalized arm). 'mean' (default, "
+                             "CORRECT): trainable v=W, forward v·(x−μ)+m → uniform W-space "
+                             "lr, matches plain FT. 'bn' (legacy): trainable v_tilde=W·σ → "
+                             "1/σ² W-space overshoot (the v1–v6 converged-FT cliff). "
+                             "NCI pruning score ‖v·σ‖ currently needs the bn variant; "
+                             "mean-variant pruning is deferred (see reparam.py TODO).")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--wd", type=float, default=0.05,
                         help="Weight decay (acts ON v_tilde in the normalized arm)")

@@ -16,7 +16,9 @@ sys.path.insert(0, os.path.join(
 import torch
 import torch.nn as nn
 
-from torch_pruning.utils.reparam import NormalizedResidualManager
+from torch_pruning.utils.reparam import (
+    NormalizedResidualManager, MeanResidualManager,
+)
 from vbp_common import (
     build_whole_net_reparam_layers, attach_biases, _merge_vnr_state_dict,
 )
@@ -385,3 +387,68 @@ def test_train_smoke_both_arms():
     base = nn_mod.train_normalized(TinyCNN(), None, train_loader, val_loader, None,
                                    args, CPU, use_ddp=False)
     assert isinstance(base, float) and 0.0 <= base <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Mean variant (the w̃-parametrization fix: trainable v=W, uniform W-space lr)
+# ---------------------------------------------------------------------------
+def test_build_reparam_manager_dispatch():
+    """--reparam_variant selects the manager: mean->MeanResidual, bn->Normalized."""
+    import normalize_net as nn_mod
+    model = TinyCNN()
+    names = build_whole_net_reparam_layers(model)
+    mean_mgr = nn_mod.build_reparam_manager(
+        model, names, CPU, _train_args(reparam_variant="mean", max_batches=4))
+    assert isinstance(mean_mgr, MeanResidualManager)
+    bn_mgr = nn_mod.build_reparam_manager(
+        model, names, CPU, _train_args(reparam_variant="bn", max_batches=4))
+    assert isinstance(bn_mgr, NormalizedResidualManager)
+
+
+def test_build_optimizer_mean_variant():
+    """Mean variant: WD on v (decayed), m excluded; trainable is v (not v_tilde)."""
+    import normalize_net as nn_mod
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+
+    opt = nn_mod.build_optimizer(model, _train_args(reparam_variant="mean"), mgr)
+    assert len(opt.param_groups) == 2
+    decayed, no_decay = opt.param_groups[0], opt.param_groups[1]
+    assert decayed["weight_decay"] == 0.05 and no_decay["weight_decay"] == 0.0
+
+    v_ids = {id(rp.v) for rp in mgr._reparam_modules.values()}
+    m_ids = {id(rp.m) for rp in mgr._reparam_modules.values()}
+    decayed_ids = {id(p) for p in decayed["params"]}
+    no_decay_ids = {id(p) for p in no_decay["params"]}
+    assert v_ids <= decayed_ids, "v must be weight-decayed (‖v‖ = magnitude)"
+    assert m_ids <= no_decay_ids, "m must be excluded from weight decay"
+
+
+def test_lr_scale_by_sigma2_ignored_on_mean():
+    """σ²-lr-scaling is a no-op on the mean variant (no 1/σ² overshoot to undo)."""
+    import normalize_net as nn_mod
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+    # Even with the flag on, mean variant must fall back to plain WD grouping (2 groups),
+    # not the per-layer σ² groups (which would need rp.bn / rp.v_tilde).
+    opt = nn_mod.build_optimizer(
+        model, _train_args(reparam_variant="mean", lr_scale_by_sigma2=True), mgr)
+    assert len(opt.param_groups) == 2
+
+
+def test_train_smoke_mean_variant():
+    """train_normalized runs one epoch with the mean-variant manager."""
+    import normalize_net as nn_mod
+    train_loader = _img_loader(3, 16, n=8, bs=4)
+    val_loader = _img_loader(3, 16, n=8, bs=4)
+    args = _train_args(epochs=1, reparam_variant="mean")
+
+    model = TinyCNN()
+    names = build_whole_net_reparam_layers(model)
+    mgr = MeanResidualManager(model, names, CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(train_loader)
+    best = nn_mod.train_normalized(model, mgr, train_loader, val_loader, None,
+                                   args, CPU, use_ddp=False)
+    assert isinstance(best, float) and 0.0 <= best <= 1.0
