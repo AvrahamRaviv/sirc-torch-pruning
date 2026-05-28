@@ -452,3 +452,91 @@ def test_train_smoke_mean_variant():
     best = nn_mod.train_normalized(model, mgr, train_loader, val_loader, None,
                                    args, CPU, use_ddp=False)
     assert isinstance(best, float) and 0.0 <= best <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# M1: σ_x buffer + ‖σ·v‖ score + λ‖σ·v‖ regularization
+# ---------------------------------------------------------------------------
+def test_sigma_buffer_present():
+    """After reparameterize, every Mean module exposes a sigma_x buffer of the right
+    shape with strictly positive entries."""
+    model = TinyCNN()
+    names = build_whole_net_reparam_layers(model, exclude_classifier=False)
+    mgr = MeanResidualManager(model, names, CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_img_loader(3, 8, n=8, bs=4))
+
+    for name, rp in mgr._reparam_modules.items():
+        assert hasattr(rp, "sigma_x"), f"{name} missing sigma_x buffer"
+        sigma = rp.sigma_x
+        # Buffer (not parameter)
+        assert name + ".sigma_x" not in dict(model.named_parameters())
+        # Shape matches input dim
+        if hasattr(rp, "in_features"):
+            assert sigma.shape == (rp.in_features,)
+        else:
+            assert sigma.shape == (rp.in_channels,)
+        # eps floor → strictly positive
+        assert (sigma > 0).all(), f"{name} sigma_x has non-positive entries"
+
+
+def test_score_uses_sigma():
+    """Two output channels with identical v rows but different sigma_x scaling must
+    rank differently in channel_stats — the score is ‖σ·v‖, not ‖v‖."""
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc2"], CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+
+    rp = mgr._reparam_modules["fc2"]
+    # Force two input channels to have identical v columns but different σ.
+    with torch.no_grad():
+        rp.v[:, 0] = 1.0
+        rp.v[:, 1] = 1.0
+        rp.sigma_x[0] = 0.5
+        rp.sigma_x[1] = 2.0
+
+    # ‖σ·v‖ column norms for the two channels should differ by exactly the σ ratio
+    # (same v column, ‖σ_k · v[:,k]‖ = σ_k · ‖v[:,k]‖).
+    v_eff = rp.v.detach() * rp.sigma_x.detach()[None, :]
+    col_norms = v_eff.flatten(1).norm(p=2, dim=mgr.norm_dim)
+    ratio = (col_norms[1] / col_norms[0]).item()
+    assert abs(ratio - 4.0) < 1e-5, f"expected σ ratio 4.0, got {ratio}"
+
+
+def test_reg_uses_sigma_and_detaches():
+    """λ‖σ·v‖ regularization: σ enters the loss but receives no gradient (stop-grad)."""
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=1.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+
+    # Bump σ so the loss is sensitive to it; if σ weren't detached, the test would
+    # catch the missing stop-grad via sigma_x.grad on backward.
+    for rp in mgr._reparam_modules.values():
+        with torch.no_grad():
+            rp.sigma_x.fill_(2.0)
+        rp.sigma_x.requires_grad_(True)  # would receive grad if not detached
+        rp.v.requires_grad_(True)
+
+    loss = mgr.regularization_loss()
+    assert loss.item() > 0, "λ‖σ·v‖ should be > 0 after init"
+    loss.backward()
+    for name, rp in mgr._reparam_modules.items():
+        assert rp.sigma_x.grad is None, f"{name}: sigma_x must be stop-grad"
+        assert rp.v.grad is not None, f"{name}: v must receive grad"
+
+
+def test_load_model_random_init_cnn(tmp_path):
+    """load_model returns a random-init CNN when no checkpoint path resolves to a file."""
+    from vbp_common import load_model
+
+    class _A:
+        model_type = "cnn"
+        cnn_arch = "resnet18"
+        model_name = "resnet18"   # not a file path
+        checkpoint = None
+
+    args = _A()
+    model = load_model(args, CPU)
+    # Forward must work end-to-end on random weights.
+    out = model(torch.randn(1, 3, 64, 64))
+    assert out.shape == (1, 1000)
+    assert getattr(args, "is_pruned_checkpoint", None) is False

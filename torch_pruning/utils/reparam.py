@@ -61,15 +61,24 @@ EPSILON = 1e-8
 # =====================================================================
 
 class MeanResidualLinear(nn.Module):
-    """Linear layer decomposed as z = m + V^T(x - μ_x), computed via effective bias."""
+    """Linear layer decomposed as z = m + V^T(x - μ_x), computed via effective bias.
 
-    def __init__(self, in_features, out_features, v, m, mu_x):
+    Carries a frozen sigma_x buffer (per-input-channel std from calibration). σ does NOT
+    enter the forward — it stays a stop-grad factor used only by the pruning score
+    ‖σ·v‖ and the optional λ‖σ·v‖ regularizer. Folding σ into the trainable produces the
+    1/σ² overshoot (the deprecated bn variant).
+    """
+
+    def __init__(self, in_features, out_features, v, m, mu_x, sigma_x=None):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.v = nn.Parameter(v)       # [out, in] — residual weights
         self.m = nn.Parameter(m)       # [out]     — channel means (frozen from WD)
         self.register_buffer('mu_x', mu_x)  # [in] — frozen input mean
+        if sigma_x is None:
+            sigma_x = torch.ones(in_features, device=mu_x.device, dtype=mu_x.dtype)
+        self.register_buffer('sigma_x', sigma_x)  # [in] — frozen input std (score-only)
 
     def forward(self, x):
         eff_bias = self.m - self.v @ self.mu_x  # [out] — tiny vector
@@ -88,12 +97,13 @@ class MeanResidualLinear(nn.Module):
 class MeanResidualConv2d(nn.Module):
     """Conv2d (groups=1) decomposed as z = m + V*(x - μ_x), computed via effective bias.
 
-    For Conv2d, μ_x is the spatial-averaged per-channel input mean [C_in].
-    The effective bias absorbs the correction: m - V.sum(dim=(2,3)) @ μ_x.
+    For Conv2d, μ_x is the spatial-averaged per-channel input mean [C_in], sigma_x is the
+    matching per-channel std (pooled over batch + spatial). σ stays out of the forward —
+    score-only, broadcast over [None,:,None,None] when computing ‖σ·v‖.
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
-                 dilation, groups, v, m, mu_x):
+                 dilation, groups, v, m, mu_x, sigma_x=None):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -105,6 +115,9 @@ class MeanResidualConv2d(nn.Module):
         self.v = nn.Parameter(v)       # [C_out, C_in, kH, kW]
         self.m = nn.Parameter(m)       # [C_out]
         self.register_buffer('mu_x', mu_x)  # [C_in]
+        if sigma_x is None:
+            sigma_x = torch.ones(in_channels, device=mu_x.device, dtype=mu_x.dtype)
+        self.register_buffer('sigma_x', sigma_x)  # [C_in] — frozen input std (score-only)
 
     def forward(self, x):
         # v.sum(dim=(2,3)) → [C_out, C_in], then @ mu_x → [C_out]
@@ -336,6 +349,25 @@ def _residual_weight(reparam):
     return reparam.v
 
 
+def _contribution_weight(reparam):
+    """Return the contribution weight σ·v — the quantity ‖·‖ of which is the paper's
+    per-layer pruning score.
+
+    - BN variant (v_tilde already absorbs σ): returns v_tilde directly.
+    - Mean variant (σ kept as stop-grad buffer): returns sigma_x · v with broadcast.
+    Falls back to _residual_weight when sigma_x is unavailable (back-compat).
+    """
+    w = _residual_weight(reparam)
+    if hasattr(reparam, 'v_tilde'):
+        return w
+    sigma = getattr(reparam, 'sigma_x', None)
+    if sigma is None:
+        return w
+    if w.dim() == 4:
+        return w * sigma[None, :, None, None]
+    return w * sigma[None, :]
+
+
 class BaseReparamManager(ABC):
     """Abstract lifecycle orchestrator for reparameterization managers.
 
@@ -381,9 +413,10 @@ class BaseReparamManager(ABC):
 
         for name, module in targets.items():
             reparam = self._make_reparam(module, cal_dict[name])
-            # Store initial norms for scale-invariant L_{2,1}
+            # Store initial norms for scale-invariant L_{2,1}. Use the contribution
+            # weight σ·v so the scale-invariance baseline matches the new ‖σ·v‖ score.
             if self.scale_invariant:
-                w = _residual_weight(reparam)
+                w = _contribution_weight(reparam)
                 init_norms = w.detach().flatten(1).norm(p=2, dim=self.norm_dim).clamp(min=EPSILON)
                 reparam.register_buffer('v_init_norms', init_norms)
             self._replace_module(name, reparam)
@@ -438,10 +471,10 @@ class BaseReparamManager(ABC):
         return ids
 
     def save_vnorm_snapshot(self, save_dir):
-        """Save per-channel residual-weight norms as .pt file."""
+        """Save per-channel ‖σ·v‖ contribution norms as .pt file (BN variant: ‖v_tilde‖)."""
         vnorms = OrderedDict()
         for name, reparam in self._reparam_modules.items():
-            w = _residual_weight(reparam).detach()
+            w = _contribution_weight(reparam).detach()
             vnorms[name] = w.flatten(1).norm(p=2, dim=self.norm_dim).cpu()
         self._last_vnorms = vnorms
 
@@ -471,11 +504,11 @@ class BaseReparamManager(ABC):
                     f"m={s['m_mean']:.4f}±{s['m_std']:.4f}"
                 )
 
-        # Aggregate summary across all layers
+        # Aggregate summary across all layers (uses σ·v contribution norms)
         if stats:
             all_norms = []
             for name, reparam in self._reparam_modules.items():
-                v = _residual_weight(reparam).detach()
+                v = _contribution_weight(reparam).detach()
                 norms = v.flatten(1).norm(p=2, dim=self.norm_dim)
                 all_norms.append(norms)
             all_norms = torch.cat(all_norms)
@@ -540,33 +573,53 @@ class BaseReparamManager(ABC):
         return targets
 
     def _calibrate_mu(self, targets, loader):
-        """Estimate μ_x for each target module via forward hooks.
+        """Back-compat shim: returns dict[name → μ_x tensor] only.
 
-        Returns dict[name → μ_x tensor]. Shared by both subclasses.
+        Prefer _calibrate_stats for new code (returns (μ, σ) tuples).
+        """
+        stats = self._calibrate_stats(targets, loader)
+        return OrderedDict((name, mu) for name, (mu, _sigma) in stats.items())
+
+    def _calibrate_stats(self, targets, loader, eps=1e-5):
+        """Estimate (μ_x, σ_x) for each target module via forward hooks (one pass).
+
+        Returns dict[name → (μ_x, σ_x)]. Both tensors are per-input-channel, pooled over
+        batch + spatial dims to match nn.BatchNorm{1d,2d} conventions. σ is the std with
+        the same eps as the bn variant — never trained; consumers must use σ.detach().
         """
         accumulators = {}
         hooks = []
 
         for name, module in targets.items():
-            acc = {'sum': None, 'count': 0}
+            acc = {'sum': None, 'sum_sq': None, 'count': 0}
             accumulators[name] = acc
 
             def make_hook(acc_ref):
                 def hook(mod, inp, out):
                     x = inp[0].detach()
                     if x.dim() == 4:
-                        batch_mean = x.mean(dim=(0, 2, 3))
+                        # Conv2d input [N,C,H,W]: per-channel mean over batch+spatial
+                        n = x.shape[0] * x.shape[2] * x.shape[3]
+                        batch_sum = x.sum(dim=(0, 2, 3))
+                        batch_sum_sq = (x * x).sum(dim=(0, 2, 3))
                     elif x.dim() == 3:
-                        batch_mean = x.mean(dim=(0, 1))
+                        # [N,T,D] (ViT/transformer): per-feature over batch+tokens
+                        n = x.shape[0] * x.shape[1]
+                        batch_sum = x.sum(dim=(0, 1))
+                        batch_sum_sq = (x * x).sum(dim=(0, 1))
                     elif x.dim() == 2:
-                        batch_mean = x.mean(dim=0)
+                        # Linear [N,D]
+                        n = x.shape[0]
+                        batch_sum = x.sum(dim=0)
+                        batch_sum_sq = (x * x).sum(dim=0)
                     else:
                         return
-                    n = x.shape[0]
                     if acc_ref['sum'] is None:
-                        acc_ref['sum'] = batch_mean * n
+                        acc_ref['sum'] = batch_sum
+                        acc_ref['sum_sq'] = batch_sum_sq
                     else:
-                        acc_ref['sum'] += batch_mean * n
+                        acc_ref['sum'] += batch_sum
+                        acc_ref['sum_sq'] += batch_sum_sq
                     acc_ref['count'] += n
                 return hook
 
@@ -588,23 +641,32 @@ class BaseReparamManager(ABC):
             for h in hooks:
                 h.remove()
 
-        mu_dict = OrderedDict()
+        stats_dict = OrderedDict()
         for name, acc in accumulators.items():
             if acc['sum'] is not None and acc['count'] > 0:
-                mu_dict[name] = acc['sum'] / acc['count']
+                mu = acc['sum'] / acc['count']
+                var = (acc['sum_sq'] / acc['count']) - mu * mu
+                sigma = torch.sqrt(var.clamp_(min=0.0) + eps)
+                stats_dict[name] = (mu, sigma)
             else:
                 module = targets[name]
                 if isinstance(module, nn.Linear):
-                    mu_dict[name] = torch.zeros(module.in_features, device=self.device)
+                    in_dim = module.in_features
                 elif isinstance(module, nn.Conv2d):
-                    mu_dict[name] = torch.zeros(module.in_channels, device=self.device)
+                    in_dim = module.in_channels
                 elif hasattr(module, 'mu_x'):
-                    mu_dict[name] = torch.zeros_like(module.mu_x)
-                _log_warning(f"{type(self).__name__}: no data for '{name}', using zero μ_x")
+                    in_dim = module.mu_x.numel()
+                else:
+                    in_dim = 0
+                mu = torch.zeros(in_dim, device=self.device)
+                sigma = torch.ones(in_dim, device=self.device)
+                stats_dict[name] = (mu, sigma)
+                _log_warning(f"{type(self).__name__}: no data for '{name}', using μ=0 σ=1")
 
-        _log_info(f"{type(self).__name__}: calibrated μ_x for {len(mu_dict)} modules "
-                     f"({sum(a['count'] for a in accumulators.values()) // max(len(accumulators), 1)} samples avg)")
-        return mu_dict
+        avg = sum(a['count'] for a in accumulators.values()) // max(len(accumulators), 1)
+        _log_info(f"{type(self).__name__}: calibrated (μ,σ) for {len(stats_dict)} modules "
+                     f"({avg} samples/positions avg)")
+        return stats_dict
 
     def _make_standard(self, reparam, weight, bias):
         """Create standard nn.Linear/Conv2d from merged params."""
@@ -676,11 +738,16 @@ class MeanResidualManager(BaseReparamManager):
         return self.refresh_stats(loader)
 
     def _calibrate(self, targets, loader):
-        """Calibrate μ_x. Returns dict[name → μ_x]."""
-        return self._calibrate_mu(targets, loader)
+        """Calibrate (μ_x, σ_x). Returns dict[name → (μ_x, σ_x)]."""
+        return self._calibrate_stats(targets, loader)
 
-    def _make_reparam(self, module, mu_x):
-        """Create MeanResidual* module from standard nn.Linear/Conv2d."""
+    def _make_reparam(self, module, stats):
+        """Create MeanResidual* module from standard nn.Linear/Conv2d.
+
+        stats: (mu_x, sigma_x) tuple from _calibrate_stats. sigma_x is stored as a frozen
+        buffer for ‖σ·v‖ scoring/regularization; it does NOT enter the forward.
+        """
+        mu_x, sigma_x = stats
         if isinstance(module, nn.Linear):
             w = module.weight.data.clone()
             b = module.bias.data.clone() if module.bias is not None else torch.zeros(
@@ -688,7 +755,7 @@ class MeanResidualManager(BaseReparamManager):
             m = b + w @ mu_x
             reparam = MeanResidualLinear(
                 module.in_features, module.out_features,
-                v=w, m=m, mu_x=mu_x)
+                v=w, m=m, mu_x=mu_x, sigma_x=sigma_x)
             return reparam.to(self.device)
 
         elif isinstance(module, nn.Conv2d):
@@ -700,15 +767,16 @@ class MeanResidualManager(BaseReparamManager):
                 module.in_channels, module.out_channels,
                 kernel_size=module.kernel_size, stride=module.stride,
                 padding=module.padding, dilation=module.dilation,
-                groups=module.groups, v=w, m=m, mu_x=mu_x)
+                groups=module.groups, v=w, m=m, mu_x=mu_x, sigma_x=sigma_x)
             return reparam.to(self.device)
 
         raise TypeError(f"Unsupported module type: {type(module)}")
 
     def refresh_stats(self, loader):
-        """Re-estimate μ_x (function-preserving): adjust m so output is unchanged.
+        """Re-estimate (μ_x, σ_x). μ refresh is function-preserving (m adjusts to absorb
+        Δμ); σ refresh is forward-irrelevant (σ does not enter forward — score-only).
 
-        m_new = m_old + V @ (μ_old - μ_new), then update mu_x buffer.
+        m_new = m_old + V @ (μ_old - μ_new); μ_x and σ_x buffers updated to fresh stats.
         """
         if not self._active:
             return
@@ -717,11 +785,11 @@ class MeanResidualManager(BaseReparamManager):
         for name, reparam in self._reparam_modules.items():
             targets[name] = reparam
 
-        mu_new_dict = self._calibrate_mu(targets, loader)
+        stats_new_dict = self._calibrate_stats(targets, loader)
 
         for name, reparam in self._reparam_modules.items():
             mu_old = reparam.mu_x
-            mu_new = mu_new_dict[name]
+            mu_new, sigma_new = stats_new_dict[name]
             delta = mu_old - mu_new
             with torch.no_grad():
                 if hasattr(reparam, 'in_features'):  # Linear
@@ -729,20 +797,28 @@ class MeanResidualManager(BaseReparamManager):
                 elif hasattr(reparam, 'in_channels'):  # Conv2d
                     reparam.m.add_(reparam.v.sum(dim=(2, 3)) @ delta)
                 reparam.mu_x.copy_(mu_new)
+                reparam.sigma_x.copy_(sigma_new)
 
-        _log_info("MeanResidualManager: refreshed μ_x (function-preserving)")
+        _log_info("MeanResidualManager: refreshed (μ_x, σ_x) — μ function-preserving, σ score-only")
 
     def regularization_loss(self):
-        """L_{2,1} regularization on V along self.norm_dim.
+        """L_{2,1} regularization on ‖σ_x·v‖ along self.norm_dim — the paper's
+        contribution-score penalty.
 
-        fc2 (dim=0): column norms → per input channel (intermediate dim).
-        fc1 (dim=1): row norms → per output channel (intermediate dim).
-        If scale_invariant=True, each norm is divided by its initial value.
+        σ is detached (stop-grad) so the penalty pushes v down without backprop'ing
+        through the data-measured spread. fc2 (dim=0): column norms → per input channel;
+        fc1 (dim=1): row norms → per output channel. If scale_invariant=True, each norm
+        is divided by its σ·v init value (set in BaseReparamManager.reparameterize).
         """
         loss = torch.tensor(0.0, device=self.device)
         for reparam in self._reparam_modules.values():
             v = reparam.v
-            norms = v.flatten(1).norm(p=2, dim=self.norm_dim)
+            sigma = reparam.sigma_x.detach()
+            if v.dim() == 4:                     # conv: [C_out, C_in, kH, kW]
+                w_eff = v * sigma[None, :, None, None]
+            else:                                 # linear: [out, in]
+                w_eff = v * sigma[None, :]
+            norms = w_eff.flatten(1).norm(p=2, dim=self.norm_dim)
             if self.scale_invariant and hasattr(reparam, 'v_init_norms'):
                 loss = loss + (norms / reparam.v_init_norms).sum()
             else:
@@ -750,11 +826,16 @@ class MeanResidualManager(BaseReparamManager):
         return self.lambda_reg * loss
 
     def channel_stats(self):
-        """Per-layer V-norm statistics along self.norm_dim."""
+        """Per-layer ‖σ_x·v‖ statistics along self.norm_dim, plus σ distribution."""
         stats = OrderedDict()
         for name, reparam in self._reparam_modules.items():
             v = reparam.v.detach()
-            col_norms = v.flatten(1).norm(p=2, dim=self.norm_dim)
+            sigma = reparam.sigma_x.detach()
+            if v.dim() == 4:
+                w_eff = v * sigma[None, :, None, None]
+            else:
+                w_eff = v * sigma[None, :]
+            col_norms = w_eff.flatten(1).norm(p=2, dim=self.norm_dim)
             m = reparam.m.detach()
             stats[name] = {
                 'v_col_norm_mean': col_norms.mean().item(),
@@ -765,6 +846,9 @@ class MeanResidualManager(BaseReparamManager):
                 'frac_below_0.1': (col_norms < 0.1).float().mean().item(),
                 'm_mean': m.mean().item(),
                 'm_std': m.std().item(),
+                'sigma_mean': sigma.mean().item(),
+                'sigma_min': sigma.min().item(),
+                'sigma_max': sigma.max().item(),
             }
         return stats
 

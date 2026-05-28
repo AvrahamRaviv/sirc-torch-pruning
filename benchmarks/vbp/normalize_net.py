@@ -459,6 +459,27 @@ def main(argv):
             _broadcast_model_state(model)
         log_info(f"Reparameterized {len(mgr._reparam_modules)} layers (WD acts on v_tilde)")
 
+        # Log calibrated σ_x spread + baseline ‖σ·v‖ range — sanity-check for the
+        # contribution-score path (mean variant only; bn variant carries σ inside v_tilde).
+        if is_main() and args.reparam_variant == "mean":
+            sigmas = []
+            contrib_norms = []
+            for rp in mgr._reparam_modules.values():
+                s = rp.sigma_x.detach()
+                v = rp.v.detach()
+                if v.dim() == 4:
+                    w_eff = v * s[None, :, None, None]
+                else:
+                    w_eff = v * s[None, :]
+                sigmas.append(s.flatten())
+                contrib_norms.append(w_eff.flatten(1).norm(p=2, dim=mgr.norm_dim))
+            import torch as _torch
+            s_all = _torch.cat(sigmas)
+            n_all = _torch.cat(contrib_norms)
+            log_info(f"σ_x: min={s_all.min():.3g} median={s_all.median():.3g} "
+                     f"max={s_all.max():.3g} ({len(mgr._reparam_modules)} layers); "
+                     f"baseline ‖σ·v‖: min={n_all.min():.3g} max={n_all.max():.3g}")
+
         # Immediate post-reparam (init / "epoch 0") eval. Reparam is exact in eval mode,
         # so this MUST match pre-train acc0; a nonzero delta flags a wiring/DDP bug
         # before we commit to the full run.
