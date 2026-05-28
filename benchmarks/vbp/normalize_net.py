@@ -80,15 +80,16 @@ def build_reparam_manager(model, layer_names, device, args):
     (MeanResidualManager). Base training is fixed here regardless; pruning is out of
     scope for this verify run.
     """
+    lam = float(getattr(args, "reparam_lambda", 0.0))
     if args.reparam_variant == "bn":
         log_info("DEPRECATED (M5): --reparam_variant=bn (NormalizedResidualManager) folds "
                  "σ into the trainable v_tilde, producing the 1/σ² W-space overshoot that "
                  "caused every v1–v6 converged-FT cliff. Use --reparam_variant=mean for "
                  "training; keep bn only for legacy reproduction.")
         return NormalizedResidualManager(
-            model, layer_names, device, lambda_reg=0.0, max_batches=args.max_batches)
+            model, layer_names, device, lambda_reg=lam, max_batches=args.max_batches)
     return MeanResidualManager(
-        model, layer_names, device, lambda_reg=0.0, max_batches=args.max_batches,
+        model, layer_names, device, lambda_reg=lam, max_batches=args.max_batches,
         ema_momentum=getattr(args, "mu_ema_momentum", 0.0))
 
 
@@ -338,12 +339,28 @@ def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
 
     phase = "NormTrain" if normalized else "Baseline"
     arm = "normalized" if normalized else "baseline"
+    # Contribution-score regularizer (M1+). Active only when the manager exists,
+    # is active, and λ > 0. Bare closure so the closure captures the mgr; reads
+    # current v / σ_x each call (and σ_x.detach() inside the manager method).
+    aux_loss_fn = None
+    lam_train = float(getattr(args, "reparam_lambda", 0.0))
+    if normalized and lam_train > 0:
+        aux_loss_fn = lambda: mgr.regularization_loss()
+        variant = getattr(args, "reparam_variant", "mean")
+        log_info(f"Contribution-score regularizer ACTIVE: λ={lam_train} "
+                 f"({'‖σ·v‖' if variant == 'mean' else '‖v_tilde‖'}). "
+                 f"Aux loss added every step.")
+    elif normalized:
+        log_info("Contribution-score regularizer disabled (--reparam_lambda 0). "
+                 "Mean-variant training is plain CE/KD only.")
+
     best_acc = 0.0
     for epoch in range(args.epochs):
         train_loss, _ = train_one_epoch(
             train_model, train_loader, train_sampler, optimizer, scheduler,
             device, epoch, args, teacher=teacher,
-            step_per_batch=step_per_batch, phase=phase)
+            step_per_batch=step_per_batch, phase=phase,
+            aux_loss_fn=aux_loss_fn)
 
         if is_main():
             eval_model = train_model.module if isinstance(train_model, DDP) else train_model
@@ -591,6 +608,12 @@ def parse_args():
                         help="Weight decay (acts ON v_tilde in the normalized arm)")
     parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd"])
     parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--reparam_lambda", type=float, default=0.0,
+                        help="M1+: λ for the contribution-score regularizer ‖σ·v‖ "
+                             "(mean variant) / ‖v_tilde‖ (bn variant). 0 (default) "
+                             "disables the auxiliary loss term. Plumbed into "
+                             "build_reparam_manager(lambda_reg=...) AND added to the "
+                             "training loss as an aux_loss_fn each step.")
     parser.add_argument("--mu_ema_momentum", type=float, default=0.0,
                         help="M4: per-step EMA momentum for μ_x / σ_x / σ_out_x inside "
                              "Mean modules. 0 (default) = frozen at calibration. "

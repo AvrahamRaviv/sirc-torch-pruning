@@ -944,6 +944,60 @@ def test_refresh_stats_channels_last_linear():
     assert (rp1.mu_x - mu_pre).abs().max() >= 0.0  # could be 0 if same data; just verifies no shape error
 
 
+def test_reparam_lambda_actually_applied_in_training():
+    """REGRESSION (audit round 4, bug #6): build_reparam_manager had lambda_reg=0.0
+    hardcoded and train_normalized never passed aux_loss_fn → the M1 ‖σ·v‖
+    regularizer was dead code. With λ > 0 a clear difference must exist between
+    train_normalized's loss path with vs without the regularizer.
+
+    Test approach: do one train step manually and verify mgr.regularization_loss()
+    returns a positive scalar AND that adding it to the loss + backward yields a
+    different gradient on v than CE alone.
+    """
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=1.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+
+    reg_loss = mgr.regularization_loss()
+    assert reg_loss.item() > 0, "regularization_loss must be positive with λ > 0"
+
+    # Verify that the wired path in build_reparam_manager passes lambda_reg through.
+    import normalize_net as nn_mod
+    args = _train_args(reparam_variant="mean", reparam_lambda=0.5, max_batches=4)
+    mgr_via_cli = nn_mod.build_reparam_manager(
+        TinyMLP(), ["fc1", "fc2"], CPU, args)
+    assert mgr_via_cli.lambda_reg == 0.5, \
+        f"reparam_lambda CLI -> manager.lambda_reg broken: {mgr_via_cli.lambda_reg}"
+
+    # Verify aux_loss_fn IS plumbed into train_normalized: train one epoch with λ > 0
+    # and a fresh setup, confirm v moves differently than λ=0 case.
+    torch.manual_seed(7)
+    m1 = TinyMLP()
+    m2 = TinyMLP()
+    m2.load_state_dict(m1.state_dict())
+    train_loader = _vec_loader(16, n=8, bs=4)
+    val_loader = _vec_loader(16, n=8, bs=4)
+
+    mgr_a = MeanResidualManager(m1, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4)
+    mgr_a.reparameterize(train_loader)
+    mgr_b = MeanResidualManager(m2, ["fc1", "fc2"], CPU, lambda_reg=1.0, max_batches=4)
+    mgr_b.reparameterize(train_loader)
+
+    args_a = _train_args(epochs=1, reparam_variant="mean", reparam_lambda=0.0)
+    args_b = _train_args(epochs=1, reparam_variant="mean", reparam_lambda=1.0)
+    torch.manual_seed(99)
+    nn_mod.train_normalized(m1, mgr_a, train_loader, val_loader, None, args_a, CPU, use_ddp=False)
+    torch.manual_seed(99)
+    nn_mod.train_normalized(m2, mgr_b, train_loader, val_loader, None, args_b, CPU, use_ddp=False)
+
+    # With λ=1, the v should be pushed toward smaller norms vs λ=0.
+    v_a = mgr_a._reparam_modules["fc2"].v.detach()
+    v_b = mgr_b._reparam_modules["fc2"].v.detach()
+    diff = (v_a - v_b).abs().max().item()
+    assert diff > 1e-6, \
+        f"reparam_lambda > 0 produced IDENTICAL v as λ=0 — aux_loss_fn not wired; diff={diff}"
+
+
 def test_build_topology_restores_modules_on_exception():
     """REGRESSION (audit round 3, bug #5): build_propagation_topology temporarily
     swaps reparam'd modules for plain ones to let DepGraph trace. If anything in the
