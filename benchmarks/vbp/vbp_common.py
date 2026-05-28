@@ -261,6 +261,11 @@ def load_model(args, device):
             - convnext: variant string or path containing variant name
             - cnn: ignored (architecture from --cnn_arch)
         args.checkpoint: Optional .pth file to load weights from (overrides default weights).
+
+    From-scratch / random-init: pass --checkpoint=None (or omit) AND ensure model_name
+    is not an existing file path. cnn and convnext then keep model_fn(pretrained=False)
+    random weights. vit still loads its HuggingFace pretrained config; true from-scratch
+    ViT requires a random-init HF config (out of scope here).
     """
     checkpoint = getattr(args, 'checkpoint', None)
     if checkpoint and not os.path.isfile(checkpoint):
@@ -316,7 +321,8 @@ def load_model(args, device):
                 log_info(f"Loaded pruned ConvNeXt from {ckpt} (shape mismatch, using load_state_dict_pruned)")
                 args.is_pruned_checkpoint = True
         else:
-            log_info(f"WARNING: Checkpoint not found at {ckpt}, using random weights")
+            log_info(f"Random init ConvNeXt (no checkpoint at {ckpt})")
+            args.is_pruned_checkpoint = False
         model = model.to(device)
 
     elif args.model_type == "cnn":
@@ -331,25 +337,33 @@ def load_model(args, device):
         model_fn = model_map[args.cnn_arch]
         model = model_fn(pretrained=False)
         ckpt = checkpoint or args.model_name
-        if checkpoint and getattr(args, 'fold_bn_init', False):
-            # Checkpoint was saved with BNs already folded (replaced by Identity).
-            # Must fold the base architecture first so key names match before loading.
-            from torch_pruning.utils.reparam import fold_all_conv_bn
-            n, locs = fold_all_conv_bn(model)
-            args._folded_bn_locations = locs
-            log_info(f"[fold_bn_init] Folded {n} BNs before loading checkpoint")
-            args.bn_recalibration = False
-        state = torch.load(ckpt, map_location='cpu', weights_only=True)
-        state = _merge_vnr_state_dict(state)
-        try:
-            model.load_state_dict(state, strict=True)
-            log_info(f"Loaded {args.cnn_arch} from {ckpt}")
-        except RuntimeError:
-            from torch_pruning.utils import load_state_dict_pruned
-            model, _, _ = load_state_dict_pruned(model, state)
-            log_info(f"Loaded pruned {args.cnn_arch} from {ckpt} (shape mismatch, using load_state_dict_pruned)")
-            args.is_pruned_checkpoint = True
-        model = model.to(device)
+        # From-scratch / random-init path: if no checkpoint path resolves to a real file,
+        # skip the load entirely. Keeps model_fn(pretrained=False) random init so the
+        # from-scratch runs can launch without forcing the user to fabricate a checkpoint.
+        if ckpt is None or not os.path.isfile(ckpt):
+            log_info(f"Random init {args.cnn_arch} (no checkpoint provided)")
+            args.is_pruned_checkpoint = False
+            model = model.to(device)
+        else:
+            if checkpoint and getattr(args, 'fold_bn_init', False):
+                # Checkpoint was saved with BNs already folded (replaced by Identity).
+                # Must fold the base architecture first so key names match before loading.
+                from torch_pruning.utils.reparam import fold_all_conv_bn
+                n, locs = fold_all_conv_bn(model)
+                args._folded_bn_locations = locs
+                log_info(f"[fold_bn_init] Folded {n} BNs before loading checkpoint")
+                args.bn_recalibration = False
+            state = torch.load(ckpt, map_location='cpu', weights_only=True)
+            state = _merge_vnr_state_dict(state)
+            try:
+                model.load_state_dict(state, strict=True)
+                log_info(f"Loaded {args.cnn_arch} from {ckpt}")
+            except RuntimeError:
+                from torch_pruning.utils import load_state_dict_pruned
+                model, _, _ = load_state_dict_pruned(model, state)
+                log_info(f"Loaded pruned {args.cnn_arch} from {ckpt} (shape mismatch, using load_state_dict_pruned)")
+                args.is_pruned_checkpoint = True
+            model = model.to(device)
 
     else:
         raise ValueError(f"Unsupported model_type: {args.model_type}")
