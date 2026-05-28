@@ -77,10 +77,15 @@ def build_reparam_manager(model, layer_names, device, args):
     scope for this verify run.
     """
     if args.reparam_variant == "bn":
+        log_info("DEPRECATED (M5): --reparam_variant=bn (NormalizedResidualManager) folds "
+                 "σ into the trainable v_tilde, producing the 1/σ² W-space overshoot that "
+                 "caused every v1–v6 converged-FT cliff. Use --reparam_variant=mean for "
+                 "training; keep bn only for legacy reproduction.")
         return NormalizedResidualManager(
             model, layer_names, device, lambda_reg=0.0, max_batches=args.max_batches)
     return MeanResidualManager(
-        model, layer_names, device, lambda_reg=0.0, max_batches=args.max_batches)
+        model, layer_names, device, lambda_reg=0.0, max_batches=args.max_batches,
+        ema_momentum=getattr(args, "mu_ema_momentum", 0.0))
 
 
 def get_device():
@@ -582,6 +587,12 @@ def parse_args():
                         help="Weight decay (acts ON v_tilde in the normalized arm)")
     parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd"])
     parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--mu_ema_momentum", type=float, default=0.0,
+                        help="M4: per-step EMA momentum for μ_x / σ_x / σ_out_x inside "
+                             "Mean modules. 0 (default) = frozen at calibration. "
+                             "Recommended for from-scratch / long training: 0.01 (slow). "
+                             "Faster than 0.01 risks aug-driven drift (see runs v3/v6). "
+                             "Mean variant only; bn variant uses BN's own momentum.")
     parser.add_argument("--lr_scale_by_sigma2", action="store_true", default=False,
                         help="Scale each reparam layer's SGD lr by its mean σ² (from "
                              "calibration BN running_var) → neutralizes the 1/σ² W-space "

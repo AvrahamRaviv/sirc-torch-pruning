@@ -69,24 +69,43 @@ class MeanResidualLinear(nn.Module):
     1/σ² overshoot (the deprecated bn variant).
     """
 
-    def __init__(self, in_features, out_features, v, m, mu_x, sigma_x=None, sigma_out_x=None):
+    def __init__(self, in_features, out_features, v, m, mu_x, sigma_x=None,
+                 sigma_out_x=None, ema_momentum=0.0):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.v = nn.Parameter(v)       # [out, in] — residual weights
         self.m = nn.Parameter(m)       # [out]     — channel means (frozen from WD)
-        self.register_buffer('mu_x', mu_x)  # [in] — frozen input mean
+        self.register_buffer('mu_x', mu_x)  # [in] — input mean (M4: EMA when training)
         if sigma_x is None:
             sigma_x = torch.ones(in_features, device=mu_x.device, dtype=mu_x.dtype)
-        self.register_buffer('sigma_x', sigma_x)  # [in] — frozen input std (score-only)
+        self.register_buffer('sigma_x', sigma_x)  # [in] — input std (score-only)
         if sigma_out_x is None:
             sigma_out_x = torch.ones(out_features, device=mu_x.device, dtype=mu_x.dtype)
-        # [out] — frozen output std (M3: branch weighting at residual joins)
+        # [out] — output std (M3: branch weighting at residual joins)
         self.register_buffer('sigma_out_x', sigma_out_x)
+        self.ema_momentum = float(ema_momentum)  # M4: per-step EMA on (μ, σ_in, σ_out)
+                                                  # 0 = frozen (default, M1-M3 behavior).
 
     def forward(self, x):
         eff_bias = self.m - self.v @ self.mu_x  # [out] — tiny vector
-        return F.linear(x, self.v, eff_bias)
+        out = F.linear(x, self.v, eff_bias)
+        if self.training and self.ema_momentum > 0:
+            with torch.no_grad():
+                in_dims = tuple(range(x.dim() - 1))  # all but last (channel) dim
+                batch_mean = x.mean(dim=in_dims)
+                batch_var = x.var(dim=in_dims, unbiased=False).clamp_(min=0.0)
+                out_dims = tuple(range(out.dim() - 1))
+                out_var = out.var(dim=out_dims, unbiased=False).clamp_(min=0.0)
+                mom = self.ema_momentum
+                delta_mu = batch_mean - self.mu_x
+                self.mu_x.add_(mom * delta_mu)
+                # Function-preserving m correction: forward = v(x − μ) + m, so
+                # m_new = m_old + v·(μ_new − μ_old). Here μ_new − μ_old = mom · delta_mu.
+                self.m.add_(mom * (self.v @ delta_mu))
+                self.sigma_x.add_(mom * (torch.sqrt(batch_var + 1e-5) - self.sigma_x))
+                self.sigma_out_x.add_(mom * (torch.sqrt(out_var + 1e-5) - self.sigma_out_x))
+        return out
 
     def merge_params(self):
         """Return (weight, bias) in standard nn.Linear convention."""
@@ -107,7 +126,8 @@ class MeanResidualConv2d(nn.Module):
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
-                 dilation, groups, v, m, mu_x, sigma_x=None, sigma_out_x=None):
+                 dilation, groups, v, m, mu_x, sigma_x=None, sigma_out_x=None,
+                 ema_momentum=0.0):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -118,20 +138,34 @@ class MeanResidualConv2d(nn.Module):
         self.groups = groups
         self.v = nn.Parameter(v)       # [C_out, C_in, kH, kW]
         self.m = nn.Parameter(m)       # [C_out]
-        self.register_buffer('mu_x', mu_x)  # [C_in]
+        self.register_buffer('mu_x', mu_x)  # [C_in] — input mean (M4: EMA when training)
         if sigma_x is None:
             sigma_x = torch.ones(in_channels, device=mu_x.device, dtype=mu_x.dtype)
-        self.register_buffer('sigma_x', sigma_x)  # [C_in] — frozen input std (score-only)
+        self.register_buffer('sigma_x', sigma_x)  # [C_in] — input std (score-only)
         if sigma_out_x is None:
             sigma_out_x = torch.ones(out_channels, device=mu_x.device, dtype=mu_x.dtype)
-        # [C_out] — frozen output std (M3: branch weighting at residual joins)
+        # [C_out] — output std (M3: branch weighting at residual joins)
         self.register_buffer('sigma_out_x', sigma_out_x)
+        self.ema_momentum = float(ema_momentum)  # M4: per-step EMA on (μ, σ_in, σ_out)
 
     def forward(self, x):
         # v.sum(dim=(2,3)) → [C_out, C_in], then @ mu_x → [C_out]
         eff_bias = self.m - self.v.sum(dim=(2, 3)) @ self.mu_x
-        return F.conv2d(x, self.v, eff_bias, self.stride, self.padding,
-                        self.dilation, self.groups)
+        out = F.conv2d(x, self.v, eff_bias, self.stride, self.padding,
+                       self.dilation, self.groups)
+        if self.training and self.ema_momentum > 0:
+            with torch.no_grad():
+                batch_mean = x.mean(dim=(0, 2, 3))
+                batch_var = x.var(dim=(0, 2, 3), unbiased=False).clamp_(min=0.0)
+                out_var = out.var(dim=(0, 2, 3), unbiased=False).clamp_(min=0.0)
+                mom = self.ema_momentum
+                delta_mu = batch_mean - self.mu_x
+                self.mu_x.add_(mom * delta_mu)
+                # Function-preserving m correction (conv): m_new = m_old + v.sum(2,3)·Δμ.
+                self.m.add_(mom * (self.v.sum(dim=(2, 3)) @ delta_mu))
+                self.sigma_x.add_(mom * (torch.sqrt(batch_var + 1e-5) - self.sigma_x))
+                self.sigma_out_x.add_(mom * (torch.sqrt(out_var + 1e-5) - self.sigma_out_x))
+        return out
 
     def merge_params(self):
         """Return (weight, bias) in standard nn.Conv2d convention."""
@@ -754,11 +788,17 @@ class MeanResidualManager(BaseReparamManager):
     """
 
     def __init__(self, model, target_names, device, lambda_reg=0.01, max_batches=200,
-                 normalize=False, scale_invariant=False, reparam_target="fc2"):
+                 normalize=False, scale_invariant=False, reparam_target="fc2",
+                 ema_momentum=0.0):
         super().__init__(model, target_names, device, lambda_reg=lambda_reg,
                          max_batches=max_batches,
                          scale_invariant=(normalize or scale_invariant),
                          reparam_target=reparam_target)
+        # M4: per-step EMA momentum for (μ, σ_in, σ_out) inside Mean module forward.
+        # 0 = frozen at calibration (default, original M1–M3 behavior). Recommended
+        # for from-scratch / long training: 0.01 (slow). Faster than 0.01 risks
+        # aug-driven drift (see --norm_bn_momentum investigation).
+        self.ema_momentum = float(ema_momentum)
 
     # Backward-compat alias
     def refresh_mu(self, loader):
@@ -784,7 +824,8 @@ class MeanResidualManager(BaseReparamManager):
             m = b + w @ mu_x
             reparam = MeanResidualLinear(
                 module.in_features, module.out_features,
-                v=w, m=m, mu_x=mu_x, sigma_x=sigma_x, sigma_out_x=sigma_out_x)
+                v=w, m=m, mu_x=mu_x, sigma_x=sigma_x, sigma_out_x=sigma_out_x,
+                ema_momentum=self.ema_momentum)
             return reparam.to(self.device)
 
         elif isinstance(module, nn.Conv2d):
@@ -797,7 +838,7 @@ class MeanResidualManager(BaseReparamManager):
                 kernel_size=module.kernel_size, stride=module.stride,
                 padding=module.padding, dilation=module.dilation,
                 groups=module.groups, v=w, m=m, mu_x=mu_x, sigma_x=sigma_x,
-                sigma_out_x=sigma_out_x)
+                sigma_out_x=sigma_out_x, ema_momentum=self.ema_momentum)
             return reparam.to(self.device)
 
         raise TypeError(f"Unsupported module type: {type(module)}")
@@ -820,7 +861,8 @@ class MeanResidualManager(BaseReparamManager):
         for name, reparam in self._reparam_modules.items():
             mu_old = reparam.mu_x
             mu_new, sigma_new, sigma_out_new = stats_new_dict[name]
-            delta = mu_old - mu_new
+            # Function-preserving: forward = v(x − μ) + m ⇒ m_new = m_old + v·(μ_new − μ_old).
+            delta = mu_new - mu_old
             with torch.no_grad():
                 if hasattr(reparam, 'in_features'):  # Linear
                     reparam.m.add_(reparam.v @ delta)

@@ -784,6 +784,110 @@ def test_propagation_through_residual():
         f"stem fan-out sum mismatch: max diff={(out['stem']-I_stem_ref).abs().max()}"
 
 
+# ---------------------------------------------------------------------------
+# M4: per-step μ / σ EMA on Mean modules + M5: bn deprecation warning
+# ---------------------------------------------------------------------------
+def test_ema_disabled_by_default():
+    """ema_momentum=0 (default) → mu_x / sigma_x stay frozen across forward train calls."""
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+
+    rp = mgr._reparam_modules["fc1"]
+    mu_before = rp.mu_x.clone()
+    sigma_before = rp.sigma_x.clone()
+
+    model.train()
+    for _ in range(5):
+        model(torch.randn(4, 16))
+    assert torch.equal(rp.mu_x, mu_before), "frozen mu_x must not move"
+    assert torch.equal(rp.sigma_x, sigma_before), "frozen sigma_x must not move"
+
+
+def test_ema_updates_mu_and_compensates():
+    """ema_momentum>0: μ_x tracks toward batch mean; m compensates so forward stays
+    function-preserving (eval output before training == after training when v is frozen)."""
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4,
+                              ema_momentum=0.1)  # fast EMA for test signal
+    mgr.reparameterize(_vec_loader(16))
+
+    # Freeze v + m so the only state that moves is mu_x / sigma_x via EMA + the m
+    # compensation that the module applies inside forward.
+    for rp in mgr._reparam_modules.values():
+        rp.v.requires_grad_(False)
+        rp.m.requires_grad_(False)
+
+    # Eval output BEFORE training-mode EMA passes
+    fixed_input = torch.randn(4, 16)
+    model.eval()
+    with torch.no_grad():
+        y_before = model(fixed_input).clone()
+
+    # Run several training-mode forwards on data with a deliberately SHIFTED mean
+    # so μ_x can move noticeably.
+    model.train()
+    shifted_data = torch.randn(4, 16) + 5.0
+    rp_fc1 = mgr._reparam_modules["fc1"]
+    mu_before = rp_fc1.mu_x.clone()
+    for _ in range(20):
+        model(shifted_data)
+    mu_after = rp_fc1.mu_x.clone()
+
+    # μ_x must have moved toward shifted_data's mean
+    assert (mu_after - mu_before).abs().max() > 0.1, \
+        f"μ_x should move; max delta={(mu_after-mu_before).abs().max()}"
+
+    # Eval output AFTER EMA: m compensation should keep it ~unchanged (function-preserving
+    # update on every step). Some drift OK due to non-grad compensation timing.
+    model.eval()
+    with torch.no_grad():
+        y_after = model(fixed_input).clone()
+    diff = (y_after - y_before).abs().max().item()
+    assert diff < 1e-4, \
+        f"function-preserving compensation broken: max output diff={diff}"
+
+
+def test_ema_conv_module():
+    """Conv variant: same invariants hold for MeanResidualConv2d."""
+    model = TinyCNN()
+    names = build_whole_net_reparam_layers(model, exclude_classifier=False)
+    mgr = MeanResidualManager(model, names, CPU, lambda_reg=0.0, max_batches=4,
+                              ema_momentum=0.1)
+    mgr.reparameterize(_img_loader(3, 8, n=8, bs=4))
+
+    rp_expand = mgr._reparam_modules["expand"]  # 3 → 16 conv
+    mu_before = rp_expand.mu_x.clone()
+
+    model.train()
+    shifted = torch.randn(4, 3, 8, 8) + 3.0
+    for _ in range(15):
+        model(shifted)
+    assert (rp_expand.mu_x - mu_before).abs().max() > 0.05, "conv μ_x must move under EMA"
+    # sigma_out_x must also evolve
+    assert hasattr(rp_expand, "sigma_out_x")
+    assert (rp_expand.sigma_out_x > 0).all()
+
+
+def test_bn_variant_deprecation_warning(monkeypatch):
+    """M5: --reparam_variant=bn emits a deprecation log message via log_info."""
+    import normalize_net as nn_mod
+
+    model = TinyCNN()
+    names = build_whole_net_reparam_layers(model)
+    args = _train_args(reparam_variant="bn", max_batches=4)
+
+    captured = []
+    # vbp_imagenet logger has propagate=False + no handler at test time → caplog
+    # misses it. Intercept log_info directly.
+    monkeypatch.setattr(nn_mod, "log_info", lambda msg: captured.append(msg))
+
+    mgr = nn_mod.build_reparam_manager(model, names, CPU, args)
+    assert isinstance(mgr, NormalizedResidualManager)
+    assert any("DEPRECATED (M5)" in msg for msg in captured), \
+        f"expected M5 deprecation warning when --reparam_variant=bn; got: {captured}"
+
+
 def test_propagation_vs_per_layer_score_difference():
     """Propagation has downstream info baked in → differs from per-layer ‖σ·v‖."""
     model = TinyMLP()
