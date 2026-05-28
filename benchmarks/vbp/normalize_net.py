@@ -354,6 +354,13 @@ def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
         log_info("Contribution-score regularizer disabled (--reparam_lambda 0). "
                  "Mean-variant training is plain CE/KD only.")
 
+    # DDP: with M4 per-step EMA each rank diverges μ_x / σ_x / σ_out_x from its
+    # local shard. Sync once per epoch to keep ranks coherent. Cheap (few
+    # all-reduces of small vectors) compared to per-step sync.
+    ddp_active = use_ddp and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    sync_each_epoch = (normalized and lam_train >= 0 and ddp_active and
+                       getattr(args, "mu_ema_momentum", 0.0) > 0)
+
     best_acc = 0.0
     for epoch in range(args.epochs):
         train_loss, _ = train_one_epoch(
@@ -361,6 +368,9 @@ def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
             device, epoch, args, teacher=teacher,
             step_per_batch=step_per_batch, phase=phase,
             aux_loss_fn=aux_loss_fn)
+
+        if sync_each_epoch:
+            mgr.sync_ema_buffers()
 
         if is_main():
             eval_model = train_model.module if isinstance(train_model, DDP) else train_model

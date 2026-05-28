@@ -487,19 +487,36 @@ class BaseReparamManager(ABC):
         self.log_channel_stats(verbose=False)
 
     def _sync_bn_stats(self):
-        """All-reduce BN running stats across DDP ranks (no-op if not distributed)."""
+        """All-reduce reparam-module buffers across DDP ranks (no-op if not distributed).
+
+        Covers both variants:
+          - BN variant: reparam.bn.running_mean / running_var
+          - Mean variant: reparam.mu_x / sigma_x / sigma_out_x
+        Mean buffers diverge per-rank under M4 per-step EMA (each rank updates from
+        its local DistributedSampler shard). Called at merge_back so the saved
+        canonical state is rank-consistent.
+        """
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
             return
         world_size = torch.distributed.get_world_size()
         if world_size <= 1:
             return
+        synced_count = 0
         for reparam in self._reparam_modules.values():
-            if hasattr(reparam, 'bn'):
+            if hasattr(reparam, 'bn'):  # BN variant
                 torch.distributed.all_reduce(reparam.bn.running_mean)
                 reparam.bn.running_mean.div_(world_size)
                 torch.distributed.all_reduce(reparam.bn.running_var)
                 reparam.bn.running_var.div_(world_size)
-        _log_info(f"{type(self).__name__}: synced BN running stats across {world_size} ranks")
+                synced_count += 1
+            # Mean variant has these buffers; BN variant also has m (Parameter, sync via DDP)
+            for buf_name in ('mu_x', 'sigma_x', 'sigma_out_x'):
+                if hasattr(reparam, buf_name):
+                    buf = getattr(reparam, buf_name)
+                    torch.distributed.all_reduce(buf)
+                    buf.div_(world_size)
+        _log_info(f"{type(self).__name__}: synced reparam buffers across {world_size} ranks "
+                  f"({len(self._reparam_modules)} layers, {synced_count} with BN)")
 
     def merge_back(self):
         """Restore standard nn.Linear/nn.Conv2d from reparam modules."""
@@ -833,6 +850,18 @@ class MeanResidualManager(BaseReparamManager):
     def refresh_mu(self, loader):
         """Alias for refresh_stats (backward compatibility)."""
         return self.refresh_stats(loader)
+
+    def sync_ema_buffers(self):
+        """All-reduce (μ_x, σ_x, σ_out_x) across DDP ranks; no-op on single rank.
+
+        Per-step M4 EMA updates each Mean module's buffers from the local rank's
+        DistributedSampler shard, so without explicit sync the buffers diverge over
+        training. Call this once per epoch (cheap) when --mu_ema_momentum > 0 to
+        keep ranks coherent and propagation_importance / build_propagation_topology
+        deterministic across ranks. merge_back's _sync_bn_stats also calls into the
+        same all-reduce logic, so saved checkpoints are always rank-consistent.
+        """
+        self._sync_bn_stats()
 
     def _calibrate(self, targets, loader):
         """Calibrate (μ_x, σ_x). Returns dict[name → (μ_x, σ_x)]."""

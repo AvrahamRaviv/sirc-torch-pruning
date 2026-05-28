@@ -1027,6 +1027,67 @@ def test_build_topology_restores_modules_on_exception():
     assert model.fc2 is fc2_before, "fc2 instance identity changed"
 
 
+def test_sync_ema_buffers_single_rank_noop():
+    """DDP: sync_ema_buffers must be a safe no-op when dist not initialized.
+    Buffers must remain unchanged."""
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4,
+                              ema_momentum=0.1)
+    mgr.reparameterize(_vec_loader(16))
+
+    rp = mgr._reparam_modules["fc1"]
+    mu_before = rp.mu_x.clone()
+    sigma_before = rp.sigma_x.clone()
+    sigma_out_before = rp.sigma_out_x.clone()
+
+    # No torch.distributed.init_process_group called → must be no-op.
+    mgr.sync_ema_buffers()
+
+    assert torch.equal(rp.mu_x, mu_before), "sync_ema_buffers altered mu_x on single rank"
+    assert torch.equal(rp.sigma_x, sigma_before)
+    assert torch.equal(rp.sigma_out_x, sigma_out_before)
+
+
+def test_sync_ema_buffers_method_exists_on_mean_manager():
+    """Sanity: the public API is on MeanResidualManager and callable, NOT on the
+    BN variant (whose buffers live under .bn.running_*)."""
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1"], CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+    assert callable(getattr(mgr, "sync_ema_buffers", None)), \
+        "MeanResidualManager.sync_ema_buffers missing"
+
+    bn_mgr = NormalizedResidualManager(TinyMLP(), ["fc1"], CPU,
+                                       lambda_reg=0.0, max_batches=4)
+    bn_mgr.reparameterize(_vec_loader(16))
+    # Same underlying _sync_bn_stats — bn variant gets that automatically at merge_back.
+    # No public sync_ema_buffers on bn variant (intentional; its buffers are .bn.running_*).
+    assert not hasattr(bn_mgr, "sync_ema_buffers"), \
+        "sync_ema_buffers should be MeanResidualManager-only"
+
+
+def test_sync_bn_stats_covers_mean_variant():
+    """REGRESSION: _sync_bn_stats now syncs Mean variant buffers too (mu_x, sigma_x,
+    sigma_out_x), not just BN variant. Single-rank no-op test."""
+    model = TinyCNN()
+    names = build_whole_net_reparam_layers(model, exclude_classifier=False)
+    mgr = MeanResidualManager(model, names, CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_img_loader(3, 8, n=8, bs=4))
+
+    # Snapshot buffers; _sync_bn_stats is no-op on single rank → buffers unchanged.
+    snaps = {}
+    for name, rp in mgr._reparam_modules.items():
+        snaps[name] = (rp.mu_x.clone(), rp.sigma_x.clone(), rp.sigma_out_x.clone())
+
+    mgr._sync_bn_stats()
+
+    for name, rp in mgr._reparam_modules.items():
+        mu0, sigma0, sigma_out0 = snaps[name]
+        assert torch.equal(rp.mu_x, mu0)
+        assert torch.equal(rp.sigma_x, sigma0)
+        assert torch.equal(rp.sigma_out_x, sigma_out0)
+
+
 def test_ema_momentum_validation():
     """Hardening: ema_momentum must be in [0, 1]."""
     import pytest
