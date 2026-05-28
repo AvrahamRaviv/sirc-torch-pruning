@@ -13,7 +13,11 @@ See torch_pruning/utils/reparam.py.
 
 This script only transforms and verifies — a general-training run is the next step and
 resumes from the saved 'vnr' artifact. Two checkpoints are written:
-  - <tag>_vnr.pth          : pre-merge (v_tilde / m / bn.*) — for training resume.
+  - <tag>_vnr.pth          : pre-merge state — preserves v / m / mu_x / sigma_x /
+                              sigma_out_x (Mean variant) or v_tilde / m / bn.* (BN
+                              variant). Reload via _merge_vnr_state_dict folds back to
+                              plain weight/bias. (Training-resume into a fresh Mean
+                              variant manager would need a separate helper — not wired.)
   - <tag>_merged_biased.pth: post-merge (standard weight / bias) — canonical, verified.
 Each has a .meta.json sidecar so torch.load(weights_only=True) stays usable.
 

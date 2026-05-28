@@ -18,6 +18,7 @@ import torch.nn as nn
 
 from torch_pruning.utils.reparam import (
     NormalizedResidualManager, MeanResidualManager,
+    MeanResidualLinear, MeanResidualConv2d,
 )
 from vbp_common import (
     build_whole_net_reparam_layers, attach_biases, _merge_vnr_state_dict,
@@ -941,6 +942,35 @@ def test_refresh_stats_channels_last_linear():
     assert rp1.sigma_out_x.shape == (16,)
     # And the values actually moved (data was different from calibration).
     assert (rp1.mu_x - mu_pre).abs().max() >= 0.0  # could be 0 if same data; just verifies no shape error
+
+
+def test_build_topology_restores_modules_on_exception():
+    """REGRESSION (audit round 3, bug #5): build_propagation_topology temporarily
+    swaps reparam'd modules for plain ones to let DepGraph trace. If anything in the
+    swap loop or DG.build_dependency raises, the finally block must still restore
+    the original reparam'd modules so the user's model isn't left half-swapped."""
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+
+    # Capture identities of the reparam'd modules.
+    fc1_before = mgr._reparam_modules["fc1"]
+    fc2_before = mgr._reparam_modules["fc2"]
+    assert isinstance(fc1_before, MeanResidualLinear)
+    assert isinstance(fc2_before, MeanResidualLinear)
+
+    # Force DG.build_dependency to fail by passing example_inputs with the wrong shape.
+    import pytest
+    with pytest.raises(Exception):
+        mgr.build_propagation_topology(torch.randn(2, 999))  # wrong feature dim
+
+    # After the exception, the user's model must still have the ORIGINAL reparam'd
+    # modules in place (not the temporarily-swapped plain Linears).
+    assert isinstance(model.fc1, MeanResidualLinear), \
+        f"fc1 left swapped after exception: got {type(model.fc1).__name__}"
+    assert isinstance(model.fc2, MeanResidualLinear)
+    assert model.fc1 is fc1_before, "fc1 instance identity changed"
+    assert model.fc2 is fc2_before, "fc2 instance identity changed"
 
 
 def test_ema_momentum_validation():

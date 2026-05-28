@@ -955,25 +955,28 @@ class MeanResidualManager(BaseReparamManager):
         # MeanResidual* are custom nn.Module subclasses → DG won't add nodes for them.
         # Workaround: temporarily swap each reparam'd module for a plain nn.Linear/Conv2d
         # built via merge_params (function-preserving at this point). Trace, then swap back.
+        # The swap loop is inside the try/finally too so that ANY exception (including
+        # mid-swap merge_params / .to(device) failures) still restores the original
+        # reparam'd modules — never leave the user's model half-swapped.
         saved = OrderedDict()
-        for name, rp in list(self._reparam_modules.items()):
-            weight, bias = rp.merge_params()
-            if isinstance(rp, MeanResidualLinear):
-                tmp = nn.Linear(rp.in_features, rp.out_features, bias=True)
-                tmp.weight.data.copy_(weight); tmp.bias.data.copy_(bias)
-            elif isinstance(rp, MeanResidualConv2d):
-                tmp = nn.Conv2d(rp.in_channels, rp.out_channels,
-                                kernel_size=rp.kernel_size, stride=rp.stride,
-                                padding=rp.padding, dilation=rp.dilation,
-                                groups=rp.groups, bias=True)
-                tmp.weight.data.copy_(weight); tmp.bias.data.copy_(bias)
-            else:
-                continue  # bn variant or other — skip
-            tmp = tmp.to(weight.device)
-            saved[name] = rp
-            self._replace_module(name, tmp)
-
         try:
+            for name, rp in list(self._reparam_modules.items()):
+                weight, bias = rp.merge_params()
+                if isinstance(rp, MeanResidualLinear):
+                    tmp = nn.Linear(rp.in_features, rp.out_features, bias=True)
+                    tmp.weight.data.copy_(weight); tmp.bias.data.copy_(bias)
+                elif isinstance(rp, MeanResidualConv2d):
+                    tmp = nn.Conv2d(rp.in_channels, rp.out_channels,
+                                    kernel_size=rp.kernel_size, stride=rp.stride,
+                                    padding=rp.padding, dilation=rp.dilation,
+                                    groups=rp.groups, bias=True)
+                    tmp.weight.data.copy_(weight); tmp.bias.data.copy_(bias)
+                else:
+                    continue  # bn variant or other — skip
+                tmp = tmp.to(weight.device)
+                saved[name] = rp
+                self._replace_module(name, tmp)
+
             DG = tp.DependencyGraph().build_dependency(
                 self.model, example_inputs, verbose=False)
 
