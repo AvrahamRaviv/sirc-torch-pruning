@@ -804,48 +804,32 @@ def test_ema_disabled_by_default():
     assert torch.equal(rp.sigma_x, sigma_before), "frozen sigma_x must not move"
 
 
-def test_ema_updates_mu_and_compensates():
-    """ema_momentum>0: μ_x tracks toward batch mean; m compensates so forward stays
-    function-preserving (eval output before training == after training when v is frozen)."""
+def test_ema_updates_mu():
+    """ema_momentum>0: μ_x / σ_x track toward batch stats over forward train passes.
+
+    Note: per-step EMA does NOT compensate m (would mutate a Parameter mid-graph and
+    break backward). The function output drifts smoothly as μ moves; m re-adapts via
+    its own gradient. refresh_stats() between epochs gives function-preserving refresh.
+    """
     model = TinyMLP()
     mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4,
-                              ema_momentum=0.1)  # fast EMA for test signal
+                              ema_momentum=0.1)  # fast EMA for clear test signal
     mgr.reparameterize(_vec_loader(16))
 
-    # Freeze v + m so the only state that moves is mu_x / sigma_x via EMA + the m
-    # compensation that the module applies inside forward.
-    for rp in mgr._reparam_modules.values():
-        rp.v.requires_grad_(False)
-        rp.m.requires_grad_(False)
-
-    # Eval output BEFORE training-mode EMA passes
-    fixed_input = torch.randn(4, 16)
-    model.eval()
-    with torch.no_grad():
-        y_before = model(fixed_input).clone()
-
-    # Run several training-mode forwards on data with a deliberately SHIFTED mean
-    # so μ_x can move noticeably.
-    model.train()
-    shifted_data = torch.randn(4, 16) + 5.0
     rp_fc1 = mgr._reparam_modules["fc1"]
     mu_before = rp_fc1.mu_x.clone()
+    sigma_before = rp_fc1.sigma_x.clone()
+
+    model.train()
+    shifted_data = torch.randn(4, 16) + 5.0
     for _ in range(20):
         model(shifted_data)
-    mu_after = rp_fc1.mu_x.clone()
 
-    # μ_x must have moved toward shifted_data's mean
-    assert (mu_after - mu_before).abs().max() > 0.1, \
-        f"μ_x should move; max delta={(mu_after-mu_before).abs().max()}"
-
-    # Eval output AFTER EMA: m compensation should keep it ~unchanged (function-preserving
-    # update on every step). Some drift OK due to non-grad compensation timing.
-    model.eval()
-    with torch.no_grad():
-        y_after = model(fixed_input).clone()
-    diff = (y_after - y_before).abs().max().item()
-    assert diff < 1e-4, \
-        f"function-preserving compensation broken: max output diff={diff}"
+    # μ_x must have moved toward shifted_data's mean.
+    assert (rp_fc1.mu_x - mu_before).abs().max() > 0.1, \
+        f"μ_x should move; max delta={(rp_fc1.mu_x-mu_before).abs().max()}"
+    # σ_x should also have updated (shifted_data has different scale than calibration).
+    assert (rp_fc1.sigma_x - sigma_before).abs().max() > 0.0, "σ_x should evolve"
 
 
 def test_ema_conv_module():
@@ -867,6 +851,58 @@ def test_ema_conv_module():
     # sigma_out_x must also evolve
     assert hasattr(rp_expand, "sigma_out_x")
     assert (rp_expand.sigma_out_x > 0).all()
+
+
+def test_ema_backward_and_step_does_not_crash():
+    """REGRESSION: ema_momentum>0 must not break autograd's version counter on m.
+    Earlier bug: self.m.add_(...) inside forward bumped Parameter version → backward
+    raised 'one of the variables needed for gradient computation has been modified'.
+    Fix uses self.m.data.add_(...). This test exercises the full forward → backward →
+    optimizer.step loop that the original M4 tests skipped (they froze grads)."""
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4,
+                              ema_momentum=0.1)
+    mgr.reparameterize(_vec_loader(16))
+
+    opt = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    loss_fn = torch.nn.MSELoss()
+
+    model.train()
+    # Three forward-backward-step iterations: each forward triggers the EMA m-update.
+    for _ in range(3):
+        x = torch.randn(4, 16)
+        target = torch.randn(4, 16)
+        opt.zero_grad()
+        out = model(x)
+        loss = loss_fn(out, target)
+        loss.backward()   # would raise on Parameter version conflict if bug not fixed
+        opt.step()
+
+
+def test_calibrate_channels_last_linear():
+    """REGRESSION: TinyChannelsLast has Linear acting on 4D channels-last [N,H,W,C].
+    The bug: _calibrate_stats dispatched by tensor.dim() and treated all 4D as Conv
+    (channel=dim 1), so 4D Linear calibration reduced wrong dims → garbage μ/σ.
+    Fix: dispatch by module type (Linear → channel=last dim)."""
+    model = TinyChannelsLast()
+    # pwconv1: Linear 8→16, pwconv2: Linear 16→8 (both act on [N,H,W,C]).
+    mgr = MeanResidualManager(model, ["pwconv1", "pwconv2"], CPU,
+                              lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_img_loader(8, 8, n=8, bs=4))
+
+    rp_pw1 = mgr._reparam_modules["pwconv1"]
+    rp_pw2 = mgr._reparam_modules["pwconv2"]
+    # μ_x / σ_x must have the right shape (per-input-channel of Linear).
+    assert rp_pw1.mu_x.shape == (8,), \
+        f"pwconv1 μ_x wrong shape {rp_pw1.mu_x.shape} — channels-last dispatch broken"
+    assert rp_pw1.sigma_x.shape == (8,)
+    assert rp_pw1.sigma_out_x.shape == (16,)
+    assert rp_pw2.mu_x.shape == (16,)
+    assert rp_pw2.sigma_x.shape == (16,)
+    assert rp_pw2.sigma_out_x.shape == (8,)
+    # And populated with sensible values (not all zeros / all ones from fallback).
+    assert (rp_pw1.sigma_x > 0).all()
+    assert rp_pw1.sigma_x.std().item() > 0, "σ_x is constant → likely calibration didn't run"
 
 
 def test_bn_variant_deprecation_warning(monkeypatch):

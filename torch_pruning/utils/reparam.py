@@ -88,7 +88,13 @@ class MeanResidualLinear(nn.Module):
                                                   # 0 = frozen (default, M1-M3 behavior).
 
     def forward(self, x):
-        eff_bias = self.m - self.v @ self.mu_x  # [out] — tiny vector
+        # Snapshot mu_x to a fresh storage (clone) so the EMA in-place update below
+        # (when enabled) can mutate self.mu_x without breaking the next backward.
+        # detach()+share-storage isn't enough — autograd's version check tracks the
+        # underlying storage.
+        mu_snap = self.mu_x.detach().clone() if self.training and self.ema_momentum > 0 \
+            else self.mu_x
+        eff_bias = self.m - self.v @ mu_snap  # [out] — tiny vector
         out = F.linear(x, self.v, eff_bias)
         if self.training and self.ema_momentum > 0:
             with torch.no_grad():
@@ -98,11 +104,14 @@ class MeanResidualLinear(nn.Module):
                 out_dims = tuple(range(out.dim() - 1))
                 out_var = out.var(dim=out_dims, unbiased=False).clamp_(min=0.0)
                 mom = self.ema_momentum
-                delta_mu = batch_mean - self.mu_x
-                self.mu_x.add_(mom * delta_mu)
-                # Function-preserving m correction: forward = v(x − μ) + m, so
-                # m_new = m_old + v·(μ_new − μ_old). Here μ_new − μ_old = mom · delta_mu.
-                self.m.add_(mom * (self.v @ delta_mu))
+                # μ EMA only — do NOT compensate m here. Mutating self.m (a Parameter)
+                # between forward and backward bumps autograd's version counter and
+                # breaks loss.backward(). Standard BN takes the same approach: running
+                # stats update during forward, affine params (γ/β here ≈ m) drift via
+                # their own gradient. The eff_bias = m - v @ μ_x in the next forward
+                # automatically reflects the new μ. Function-preserving m correction
+                # remains available via the manual refresh_stats() between epochs.
+                self.mu_x.add_(mom * (batch_mean - self.mu_x))
                 self.sigma_x.add_(mom * (torch.sqrt(batch_var + 1e-5) - self.sigma_x))
                 self.sigma_out_x.add_(mom * (torch.sqrt(out_var + 1e-5) - self.sigma_out_x))
         return out
@@ -149,8 +158,12 @@ class MeanResidualConv2d(nn.Module):
         self.ema_momentum = float(ema_momentum)  # M4: per-step EMA on (μ, σ_in, σ_out)
 
     def forward(self, x):
-        # v.sum(dim=(2,3)) → [C_out, C_in], then @ mu_x → [C_out]
-        eff_bias = self.m - self.v.sum(dim=(2, 3)) @ self.mu_x
+        # v.sum(dim=(2,3)) → [C_out, C_in], then @ mu_x → [C_out].
+        # Snapshot mu_x (clone) when EMA is on so in-place mutation doesn't break
+        # the saved-for-backward version check.
+        mu_snap = self.mu_x.detach().clone() if self.training and self.ema_momentum > 0 \
+            else self.mu_x
+        eff_bias = self.m - self.v.sum(dim=(2, 3)) @ mu_snap
         out = F.conv2d(x, self.v, eff_bias, self.stride, self.padding,
                        self.dilation, self.groups)
         if self.training and self.ema_momentum > 0:
@@ -159,10 +172,11 @@ class MeanResidualConv2d(nn.Module):
                 batch_var = x.var(dim=(0, 2, 3), unbiased=False).clamp_(min=0.0)
                 out_var = out.var(dim=(0, 2, 3), unbiased=False).clamp_(min=0.0)
                 mom = self.ema_momentum
-                delta_mu = batch_mean - self.mu_x
-                self.mu_x.add_(mom * delta_mu)
-                # Function-preserving m correction (conv): m_new = m_old + v.sum(2,3)·Δμ.
-                self.m.add_(mom * (self.v.sum(dim=(2, 3)) @ delta_mu))
+                # μ EMA only — m compensation would mutate a Parameter mid-graph
+                # (autograd version-counter conflict on backward). See the Linear
+                # forward for the full rationale. refresh_stats() between epochs is
+                # the function-preserving alternative.
+                self.mu_x.add_(mom * (batch_mean - self.mu_x))
                 self.sigma_x.add_(mom * (torch.sqrt(batch_var + 1e-5) - self.sigma_x))
                 self.sigma_out_x.add_(mom * (torch.sqrt(out_var + 1e-5) - self.sigma_out_x))
         return out
@@ -635,18 +649,21 @@ class BaseReparamManager(ABC):
         accumulators = {}
         hooks = []
 
-        def _per_channel_reduce(t):
-            """Return (sum, sum_sq, count) reduced to per-channel (last meaningful axis)."""
-            if t.dim() == 4:                       # [N, C, H, W]
-                n = t.shape[0] * t.shape[2] * t.shape[3]
-                return t.sum(dim=(0, 2, 3)), (t * t).sum(dim=(0, 2, 3)), n
-            if t.dim() == 3:                       # [N, T, D]
-                n = t.shape[0] * t.shape[1]
-                return t.sum(dim=(0, 1)), (t * t).sum(dim=(0, 1)), n
-            if t.dim() == 2:                       # [N, D]
-                n = t.shape[0]
-                return t.sum(dim=0), (t * t).sum(dim=0), n
-            return None
+        def _per_channel_reduce(t, channel_dim):
+            """Return (sum, sum_sq, count) reduced over all-but-channel axes.
+
+            channel_dim is the axis index of the channel/feature dim:
+              - Linear: channel = last dim (handles 2D [N,D], 3D [N,T,D], 4D
+                channels-last [N,H,W,C]).
+              - Conv2d: channel = dim 1 (4D [N,C,H,W]).
+            """
+            if t.dim() < 2:
+                return None
+            reduce_dims = tuple(i for i in range(t.dim()) if i != channel_dim)
+            n = 1
+            for i in reduce_dims:
+                n *= t.shape[i]
+            return t.sum(dim=reduce_dims), (t * t).sum(dim=reduce_dims), n
 
         for name, module in targets.items():
             acc = {
@@ -654,11 +671,18 @@ class BaseReparamManager(ABC):
                 'out_sum': None, 'out_sum_sq': None, 'out_count': 0,
             }
             accumulators[name] = acc
+            is_linear = isinstance(module, nn.Linear)
+            # Linear: channel is the last dim of input/output, regardless of rank
+            # (so ConvNeXt channels-last [N,H,W,C] reduces over (0,1,2), not (0,2,3)).
+            # Conv2d: channel = dim 1 for both input and output ([N,C,H,W] semantics).
+            ch_in = -1 if is_linear else 1
+            ch_out = -1 if is_linear else 1
 
-            def make_hook(acc_ref):
+            def make_hook(acc_ref, ch_in=ch_in, ch_out=ch_out):
                 def hook(mod, inp, out):
                     x = inp[0].detach()
-                    reduced = _per_channel_reduce(x)
+                    ch_in_eff = (x.dim() - 1) if ch_in == -1 else ch_in
+                    reduced = _per_channel_reduce(x, ch_in_eff)
                     if reduced is not None:
                         s, ss, n = reduced
                         if acc_ref['in_sum'] is None:
@@ -668,7 +692,8 @@ class BaseReparamManager(ABC):
                         acc_ref['in_count'] += n
 
                     o = out.detach()
-                    reduced_o = _per_channel_reduce(o)
+                    ch_out_eff = (o.dim() - 1) if ch_out == -1 else ch_out
+                    reduced_o = _per_channel_reduce(o, ch_out_eff)
                     if reduced_o is not None:
                         s_o, ss_o, n_o = reduced_o
                         if acc_ref['out_sum'] is None:
@@ -865,9 +890,9 @@ class MeanResidualManager(BaseReparamManager):
             delta = mu_new - mu_old
             with torch.no_grad():
                 if hasattr(reparam, 'in_features'):  # Linear
-                    reparam.m.add_(reparam.v @ delta)
+                    reparam.m.data.add_(reparam.v.detach() @ delta)
                 elif hasattr(reparam, 'in_channels'):  # Conv2d
-                    reparam.m.add_(reparam.v.sum(dim=(2, 3)) @ delta)
+                    reparam.m.data.add_(reparam.v.detach().sum(dim=(2, 3)) @ delta)
                 reparam.mu_x.copy_(mu_new)
                 reparam.sigma_x.copy_(sigma_new)
                 if hasattr(reparam, 'sigma_out_x'):
