@@ -860,6 +860,22 @@ class MeanResidualManager(BaseReparamManager):
         keep ranks coherent and propagation_importance / build_propagation_topology
         deterministic across ranks. merge_back's _sync_bn_stats also calls into the
         same all-reduce logic, so saved checkpoints are always rank-consistent.
+
+        Known interactions (document for users):
+          - Optimizer state staleness: after merge_back, the v / m Parameters are
+            no longer part of self.model (replaced by plain weight/bias). Continuing
+            optimizer.step() after merge_back updates the orphaned Parameters with
+            no effect on the model. Don't keep training after merge_back; build a
+            fresh optimizer for the merged model if needed.
+          - Gradient accumulation: M4 per-step EMA fires once per FORWARD, not per
+            optimizer step. With N micro-batches per effective step, the EMA
+            absorbs N batches' worth of drift in one effective step — divide
+            --mu_ema_momentum by N if you want comparable behavior to non-
+            accumulating runs.
+          - Mixed precision (autocast): not exercised. Forward inside autocast
+            casts v to fp16/bf16; mu_snap.clone() preserves dtype; batch_var
+            computed in fp16 risks catastrophic cancellation. Recommended: keep
+            buffers in fp32 (default) and only autocast the matmul ops.
         """
         self._sync_bn_stats()
 

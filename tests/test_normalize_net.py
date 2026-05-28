@@ -1126,6 +1126,20 @@ def test_calibrate_channels_last_linear():
     assert rp_pw1.sigma_x.std().item() > 0, "σ_x is constant → likely calibration didn't run"
 
 
+def test_warn_reparam_lambda_dropped_under_bn_variant(monkeypatch):
+    """R7 UX: --mu_ema_momentum > 0 + --reparam_variant=bn → warn that EMA flag
+    is ignored (BN variant uses --norm_bn_momentum instead)."""
+    import normalize_net as nn_mod
+    model = TinyCNN()
+    names = build_whole_net_reparam_layers(model)
+    args = _train_args(reparam_variant="bn", max_batches=4, mu_ema_momentum=0.01)
+    captured = []
+    monkeypatch.setattr(nn_mod, "log_info", lambda msg: captured.append(msg))
+    nn_mod.build_reparam_manager(model, names, CPU, args)
+    assert any("mu_ema_momentum" in m and "ignored" in m for m in captured), \
+        f"missing mu_ema_momentum ignored warning; got {captured}"
+
+
 def test_bn_variant_deprecation_warning(monkeypatch):
     """M5: --reparam_variant=bn emits a deprecation log message via log_info."""
     import normalize_net as nn_mod

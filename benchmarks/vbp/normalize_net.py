@@ -81,16 +81,21 @@ def build_reparam_manager(model, layer_names, device, args):
     scope for this verify run.
     """
     lam = float(getattr(args, "reparam_lambda", 0.0))
+    mu_ema = float(getattr(args, "mu_ema_momentum", 0.0))
     if args.reparam_variant == "bn":
         log_info("DEPRECATED (M5): --reparam_variant=bn (NormalizedResidualManager) folds "
                  "σ into the trainable v_tilde, producing the 1/σ² W-space overshoot that "
                  "caused every v1–v6 converged-FT cliff. Use --reparam_variant=mean for "
                  "training; keep bn only for legacy reproduction.")
+        if mu_ema > 0:
+            log_info(f"WARNING: --mu_ema_momentum={mu_ema} ignored under --reparam_variant=bn. "
+                     f"The BN variant uses its own running-stats momentum; pass "
+                     f"--norm_bn_momentum to control it.")
         return NormalizedResidualManager(
             model, layer_names, device, lambda_reg=lam, max_batches=args.max_batches)
     return MeanResidualManager(
         model, layer_names, device, lambda_reg=lam, max_batches=args.max_batches,
-        ema_momentum=getattr(args, "mu_ema_momentum", 0.0))
+        ema_momentum=mu_ema)
 
 
 def get_device():
@@ -474,11 +479,24 @@ def main(argv):
         log_info(f"KD enabled: teacher = frozen pretrained (alpha={args.kd_alpha}, T={args.kd_T})")
 
     mgr = None
-    if not args.no_reparam:
+    if args.no_reparam:
+        log_info("Baseline arm: plain training, no normalization")
+        # R7 UX: warn on silently-dropped reparam-only flags so misconfigs surface.
+        if float(getattr(args, "reparam_lambda", 0.0)) > 0:
+            log_info(f"WARNING: --reparam_lambda={args.reparam_lambda} ignored under "
+                     f"--no_reparam (no reparam manager → no contribution-score regularizer).")
+        if float(getattr(args, "mu_ema_momentum", 0.0)) > 0:
+            log_info(f"WARNING: --mu_ema_momentum={args.mu_ema_momentum} ignored under "
+                     f"--no_reparam (no Mean modules to EMA).")
+    else:
         layer_names = build_whole_net_reparam_layers(
             model, exclude=args.exclude_layers,
             exclude_classifier=args.exclude_classifier, exclude_stem=args.exclude_stem)
         log_info(f"Whole-net selector: {len(layer_names)} candidate layers")
+        if not layer_names:
+            log_info("WARNING: build_whole_net_reparam_layers returned EMPTY list "
+                     "(check --exclude_layers / --exclude_classifier / --exclude_stem). "
+                     "No layers will be reparameterized.")
         mgr = build_reparam_manager(model, layer_names, device, args)
         mgr.reparameterize(train_loader)
         if args.norm_bn_momentum is not None:
@@ -529,8 +547,6 @@ def main(argv):
                 "val_loss": None, "best_val_acc": round(acc_init, 6),
                 "lr": None, "stage": "post_reparam_init",
             })
-    else:
-        log_info("Baseline arm: plain training, no normalization")
 
     best = train_normalized(model, mgr, train_loader, val_loader, train_sampler,
                             args, device, use_ddp, teacher=teacher)
