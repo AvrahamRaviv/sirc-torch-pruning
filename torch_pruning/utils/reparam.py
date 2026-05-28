@@ -69,7 +69,7 @@ class MeanResidualLinear(nn.Module):
     1/σ² overshoot (the deprecated bn variant).
     """
 
-    def __init__(self, in_features, out_features, v, m, mu_x, sigma_x=None):
+    def __init__(self, in_features, out_features, v, m, mu_x, sigma_x=None, sigma_out_x=None):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -79,6 +79,10 @@ class MeanResidualLinear(nn.Module):
         if sigma_x is None:
             sigma_x = torch.ones(in_features, device=mu_x.device, dtype=mu_x.dtype)
         self.register_buffer('sigma_x', sigma_x)  # [in] — frozen input std (score-only)
+        if sigma_out_x is None:
+            sigma_out_x = torch.ones(out_features, device=mu_x.device, dtype=mu_x.dtype)
+        # [out] — frozen output std (M3: branch weighting at residual joins)
+        self.register_buffer('sigma_out_x', sigma_out_x)
 
     def forward(self, x):
         eff_bias = self.m - self.v @ self.mu_x  # [out] — tiny vector
@@ -103,7 +107,7 @@ class MeanResidualConv2d(nn.Module):
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
-                 dilation, groups, v, m, mu_x, sigma_x=None):
+                 dilation, groups, v, m, mu_x, sigma_x=None, sigma_out_x=None):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -118,6 +122,10 @@ class MeanResidualConv2d(nn.Module):
         if sigma_x is None:
             sigma_x = torch.ones(in_channels, device=mu_x.device, dtype=mu_x.dtype)
         self.register_buffer('sigma_x', sigma_x)  # [C_in] — frozen input std (score-only)
+        if sigma_out_x is None:
+            sigma_out_x = torch.ones(out_channels, device=mu_x.device, dtype=mu_x.dtype)
+        # [C_out] — frozen output std (M3: branch weighting at residual joins)
+        self.register_buffer('sigma_out_x', sigma_out_x)
 
     def forward(self, x):
         # v.sum(dim=(2,3)) → [C_out, C_in], then @ mu_x → [C_out]
@@ -575,52 +583,65 @@ class BaseReparamManager(ABC):
     def _calibrate_mu(self, targets, loader):
         """Back-compat shim: returns dict[name → μ_x tensor] only.
 
-        Prefer _calibrate_stats for new code (returns (μ, σ) tuples).
+        Prefer _calibrate_stats for new code (returns (μ, σ_in, σ_out) tuples).
         """
         stats = self._calibrate_stats(targets, loader)
-        return OrderedDict((name, mu) for name, (mu, _sigma) in stats.items())
+        return OrderedDict((name, mu) for name, (mu, _si, _so) in stats.items())
 
     def _calibrate_stats(self, targets, loader, eps=1e-5):
-        """Estimate (μ_x, σ_x) for each target module via forward hooks (one pass).
+        """Estimate (μ_x, σ_x, σ_out_x) for each target module via forward hooks (one pass).
 
-        Returns dict[name → (μ_x, σ_x)]. Both tensors are per-input-channel, pooled over
-        batch + spatial dims to match nn.BatchNorm{1d,2d} conventions. σ is the std with
-        the same eps as the bn variant — never trained; consumers must use σ.detach().
+        Returns dict[name → (μ_x, σ_x, σ_out_x)]. Input stats per-input-channel; output std
+        per-output-channel. All pooled over batch + spatial to match BatchNorm conventions.
+        σ uses the same eps as the bn variant. Never trained; consumers must .detach().
+
+        σ_out_x added in M3 for branch weighting at residual joins
+        (σ_branch / Σ σ_branches).
         """
         accumulators = {}
         hooks = []
 
+        def _per_channel_reduce(t):
+            """Return (sum, sum_sq, count) reduced to per-channel (last meaningful axis)."""
+            if t.dim() == 4:                       # [N, C, H, W]
+                n = t.shape[0] * t.shape[2] * t.shape[3]
+                return t.sum(dim=(0, 2, 3)), (t * t).sum(dim=(0, 2, 3)), n
+            if t.dim() == 3:                       # [N, T, D]
+                n = t.shape[0] * t.shape[1]
+                return t.sum(dim=(0, 1)), (t * t).sum(dim=(0, 1)), n
+            if t.dim() == 2:                       # [N, D]
+                n = t.shape[0]
+                return t.sum(dim=0), (t * t).sum(dim=0), n
+            return None
+
         for name, module in targets.items():
-            acc = {'sum': None, 'sum_sq': None, 'count': 0}
+            acc = {
+                'in_sum': None, 'in_sum_sq': None, 'in_count': 0,
+                'out_sum': None, 'out_sum_sq': None, 'out_count': 0,
+            }
             accumulators[name] = acc
 
             def make_hook(acc_ref):
                 def hook(mod, inp, out):
                     x = inp[0].detach()
-                    if x.dim() == 4:
-                        # Conv2d input [N,C,H,W]: per-channel mean over batch+spatial
-                        n = x.shape[0] * x.shape[2] * x.shape[3]
-                        batch_sum = x.sum(dim=(0, 2, 3))
-                        batch_sum_sq = (x * x).sum(dim=(0, 2, 3))
-                    elif x.dim() == 3:
-                        # [N,T,D] (ViT/transformer): per-feature over batch+tokens
-                        n = x.shape[0] * x.shape[1]
-                        batch_sum = x.sum(dim=(0, 1))
-                        batch_sum_sq = (x * x).sum(dim=(0, 1))
-                    elif x.dim() == 2:
-                        # Linear [N,D]
-                        n = x.shape[0]
-                        batch_sum = x.sum(dim=0)
-                        batch_sum_sq = (x * x).sum(dim=0)
-                    else:
-                        return
-                    if acc_ref['sum'] is None:
-                        acc_ref['sum'] = batch_sum
-                        acc_ref['sum_sq'] = batch_sum_sq
-                    else:
-                        acc_ref['sum'] += batch_sum
-                        acc_ref['sum_sq'] += batch_sum_sq
-                    acc_ref['count'] += n
+                    reduced = _per_channel_reduce(x)
+                    if reduced is not None:
+                        s, ss, n = reduced
+                        if acc_ref['in_sum'] is None:
+                            acc_ref['in_sum'] = s; acc_ref['in_sum_sq'] = ss
+                        else:
+                            acc_ref['in_sum'] += s; acc_ref['in_sum_sq'] += ss
+                        acc_ref['in_count'] += n
+
+                    o = out.detach()
+                    reduced_o = _per_channel_reduce(o)
+                    if reduced_o is not None:
+                        s_o, ss_o, n_o = reduced_o
+                        if acc_ref['out_sum'] is None:
+                            acc_ref['out_sum'] = s_o; acc_ref['out_sum_sq'] = ss_o
+                        else:
+                            acc_ref['out_sum'] += s_o; acc_ref['out_sum_sq'] += ss_o
+                        acc_ref['out_count'] += n_o
                 return hook
 
             hooks.append(module.register_forward_hook(make_hook(acc)))
@@ -641,31 +662,38 @@ class BaseReparamManager(ABC):
             for h in hooks:
                 h.remove()
 
+        def _finalize(s, ss, n, fallback_dim):
+            if s is not None and n > 0:
+                mu = s / n
+                var = (ss / n) - mu * mu
+                sigma = torch.sqrt(var.clamp_(min=0.0) + eps)
+                return mu, sigma
+            return (torch.zeros(fallback_dim, device=self.device),
+                    torch.ones(fallback_dim, device=self.device))
+
         stats_dict = OrderedDict()
         for name, acc in accumulators.items():
-            if acc['sum'] is not None and acc['count'] > 0:
-                mu = acc['sum'] / acc['count']
-                var = (acc['sum_sq'] / acc['count']) - mu * mu
-                sigma = torch.sqrt(var.clamp_(min=0.0) + eps)
-                stats_dict[name] = (mu, sigma)
+            module = targets[name]
+            if isinstance(module, nn.Linear):
+                in_dim, out_dim = module.in_features, module.out_features
+            elif isinstance(module, nn.Conv2d):
+                in_dim, out_dim = module.in_channels, module.out_channels
+            elif hasattr(module, 'mu_x'):
+                in_dim = module.mu_x.numel()
+                out_dim = module.sigma_out_x.numel() if hasattr(module, 'sigma_out_x') else in_dim
             else:
-                module = targets[name]
-                if isinstance(module, nn.Linear):
-                    in_dim = module.in_features
-                elif isinstance(module, nn.Conv2d):
-                    in_dim = module.in_channels
-                elif hasattr(module, 'mu_x'):
-                    in_dim = module.mu_x.numel()
-                else:
-                    in_dim = 0
-                mu = torch.zeros(in_dim, device=self.device)
-                sigma = torch.ones(in_dim, device=self.device)
-                stats_dict[name] = (mu, sigma)
-                _log_warning(f"{type(self).__name__}: no data for '{name}', using μ=0 σ=1")
+                in_dim = out_dim = 0
 
-        avg = sum(a['count'] for a in accumulators.values()) // max(len(accumulators), 1)
-        _log_info(f"{type(self).__name__}: calibrated (μ,σ) for {len(stats_dict)} modules "
-                     f"({avg} samples/positions avg)")
+            mu_in, sigma_in = _finalize(acc['in_sum'], acc['in_sum_sq'], acc['in_count'], in_dim)
+            _mu_out, sigma_out = _finalize(acc['out_sum'], acc['out_sum_sq'], acc['out_count'], out_dim)
+
+            if acc['in_count'] == 0:
+                _log_warning(f"{type(self).__name__}: no data for '{name}', using μ=0 σ=1")
+            stats_dict[name] = (mu_in, sigma_in, sigma_out)
+
+        avg = sum(a['in_count'] for a in accumulators.values()) // max(len(accumulators), 1)
+        _log_info(f"{type(self).__name__}: calibrated (μ,σ_in,σ_out) for {len(stats_dict)} "
+                     f"modules ({avg} samples/positions avg)")
         return stats_dict
 
     def _make_standard(self, reparam, weight, bias):
@@ -744,10 +772,11 @@ class MeanResidualManager(BaseReparamManager):
     def _make_reparam(self, module, stats):
         """Create MeanResidual* module from standard nn.Linear/Conv2d.
 
-        stats: (mu_x, sigma_x) tuple from _calibrate_stats. sigma_x is stored as a frozen
-        buffer for ‖σ·v‖ scoring/regularization; it does NOT enter the forward.
+        stats: (mu_x, sigma_x, sigma_out_x) tuple from _calibrate_stats. Both sigmas are
+        stored as frozen buffers — sigma_x for ‖σ·v‖ scoring/regularization (M1),
+        sigma_out_x for residual branch weighting (M3). Neither enters the forward.
         """
-        mu_x, sigma_x = stats
+        mu_x, sigma_x, sigma_out_x = stats
         if isinstance(module, nn.Linear):
             w = module.weight.data.clone()
             b = module.bias.data.clone() if module.bias is not None else torch.zeros(
@@ -755,7 +784,7 @@ class MeanResidualManager(BaseReparamManager):
             m = b + w @ mu_x
             reparam = MeanResidualLinear(
                 module.in_features, module.out_features,
-                v=w, m=m, mu_x=mu_x, sigma_x=sigma_x)
+                v=w, m=m, mu_x=mu_x, sigma_x=sigma_x, sigma_out_x=sigma_out_x)
             return reparam.to(self.device)
 
         elif isinstance(module, nn.Conv2d):
@@ -767,7 +796,8 @@ class MeanResidualManager(BaseReparamManager):
                 module.in_channels, module.out_channels,
                 kernel_size=module.kernel_size, stride=module.stride,
                 padding=module.padding, dilation=module.dilation,
-                groups=module.groups, v=w, m=m, mu_x=mu_x, sigma_x=sigma_x)
+                groups=module.groups, v=w, m=m, mu_x=mu_x, sigma_x=sigma_x,
+                sigma_out_x=sigma_out_x)
             return reparam.to(self.device)
 
         raise TypeError(f"Unsupported module type: {type(module)}")
@@ -789,7 +819,7 @@ class MeanResidualManager(BaseReparamManager):
 
         for name, reparam in self._reparam_modules.items():
             mu_old = reparam.mu_x
-            mu_new, sigma_new = stats_new_dict[name]
+            mu_new, sigma_new, sigma_out_new = stats_new_dict[name]
             delta = mu_old - mu_new
             with torch.no_grad():
                 if hasattr(reparam, 'in_features'):  # Linear
@@ -798,8 +828,10 @@ class MeanResidualManager(BaseReparamManager):
                     reparam.m.add_(reparam.v.sum(dim=(2, 3)) @ delta)
                 reparam.mu_x.copy_(mu_new)
                 reparam.sigma_x.copy_(sigma_new)
+                if hasattr(reparam, 'sigma_out_x'):
+                    reparam.sigma_out_x.copy_(sigma_out_new)
 
-        _log_info("MeanResidualManager: refreshed (μ_x, σ_x) — μ function-preserving, σ score-only")
+        _log_info("MeanResidualManager: refreshed (μ_x, σ_x, σ_out_x) — μ function-preserving, σ score-only")
 
     def regularization_loss(self):
         """L_{2,1} regularization on ‖σ_x·v‖ along self.norm_dim — the paper's
@@ -825,9 +857,138 @@ class MeanResidualManager(BaseReparamManager):
                 loss = loss + norms.sum()
         return self.lambda_reg * loss
 
+    def build_propagation_topology(self, example_inputs):
+        """Build the per-layer downstream + branch-weight topology via tp.DependencyGraph.
+
+        Returns OrderedDict[name → list of (downstream_name, weight)]:
+          - sequential: single downstream, weight 1.0;
+          - residual join: each branch's single downstream is the merged consumer,
+            with weight σ_out_branch / Σ σ_out_branches (boss's σ_branch/(σ_a+σ_b));
+          - fan-out (no add, layer feeds multiple consumers): each downstream weight = 1.0
+            (importance accumulates additively across consumers);
+          - terminal (no reparam'd consumer downstream): empty list — uses I_out seed.
+
+        σ_out_branch is the per-branch mean of `sigma_out_x` (scalar). Per-channel
+        branch weights are out of M3 scope.
+
+        Args:
+            example_inputs: torch.Tensor (or list/dict) suitable for one forward pass —
+                used by DepGraph to trace the computational graph on `self.model`.
+        """
+        try:
+            import torch_pruning as tp
+        except ImportError as e:
+            raise RuntimeError("tp.DependencyGraph required for build_propagation_topology") from e
+
+        # tp.DependencyGraph traces autograd-recognizable types (nn.Linear, nn.Conv2d, ...);
+        # MeanResidual* are custom nn.Module subclasses → DG won't add nodes for them.
+        # Workaround: temporarily swap each reparam'd module for a plain nn.Linear/Conv2d
+        # built via merge_params (function-preserving at this point). Trace, then swap back.
+        saved = OrderedDict()
+        for name, rp in list(self._reparam_modules.items()):
+            weight, bias = rp.merge_params()
+            if isinstance(rp, MeanResidualLinear):
+                tmp = nn.Linear(rp.in_features, rp.out_features, bias=True)
+                tmp.weight.data.copy_(weight); tmp.bias.data.copy_(bias)
+            elif isinstance(rp, MeanResidualConv2d):
+                tmp = nn.Conv2d(rp.in_channels, rp.out_channels,
+                                kernel_size=rp.kernel_size, stride=rp.stride,
+                                padding=rp.padding, dilation=rp.dilation,
+                                groups=rp.groups, bias=True)
+                tmp.weight.data.copy_(weight); tmp.bias.data.copy_(bias)
+            else:
+                continue  # bn variant or other — skip
+            tmp = tmp.to(weight.device)
+            saved[name] = rp
+            self._replace_module(name, tmp)
+
+        try:
+            DG = tp.DependencyGraph().build_dependency(
+                self.model, example_inputs, verbose=False)
+
+            # After swap, look up plain modules by dotted name to map back to topology names.
+            def _get_by_dotted(model, dotted_name):
+                cur = model
+                for p in dotted_name.split('.'):
+                    cur = getattr(cur, p)
+                return cur
+
+            plain_by_name = {n: _get_by_dotted(self.model, n) for n in saved.keys()}
+            name_by_module = {plain_by_name[n]: n for n in saved.keys()}
+
+            return self._build_topology_from_dg(DG, name_by_module, saved)
+        finally:
+            # Swap reparam'd modules back regardless of outcome.
+            for name, original_rp in saved.items():
+                self._replace_module(name, original_rp)
+
+    def _build_topology_from_dg(self, DG, name_by_module, saved):
+        """Walk the DepGraph forward to assemble the (downstream_name, weight) topology.
+        Branch weights at residual ADDs come from σ_out (mean per branch)."""
+
+        def _walk_downstream(node, visited):
+            """Forward BFS from node.outputs; collect reparam'd modules reached."""
+            found = []
+            for out_node in node.outputs:
+                key = id(out_node)
+                if key in visited:
+                    continue
+                visited.add(key)
+                mod = out_node.module
+                if mod in name_by_module:
+                    found.append(name_by_module[mod])
+                else:
+                    found.extend(_walk_downstream(out_node, visited))
+            return found
+
+        # Look up plain (post-swap) module by name to query DepGraph.
+        plain_by_name = {n: m for m, n in name_by_module.items()}
+
+        # Forward sweep: src → list of downstream names (unweighted, may repeat)
+        raw_topology = OrderedDict()
+        for name in self._reparam_modules.keys():
+            plain_mod = plain_by_name.get(name)
+            node = DG.module2node.get(plain_mod) if plain_mod is not None else None
+            if node is None:
+                _log_warning(f"build_propagation_topology: '{name}' not in DepGraph; "
+                             f"empty downstream list")
+                raw_topology[name] = []
+            else:
+                raw_topology[name] = _walk_downstream(node, visited=set())
+
+        # Reverse: dst_name → list of upstream src_names (the "branches" entering dst)
+        upstream_map = {}
+        for src, dsts in raw_topology.items():
+            for d in dsts:
+                upstream_map.setdefault(d, []).append(src)
+
+        # Branch weights via σ_out (scalar per branch = mean over channels)
+        weights = {}  # (src, dst) → float
+        for dst, branches in upstream_map.items():
+            unique_branches = list(dict.fromkeys(branches))  # de-dup, preserve order
+            if len(unique_branches) == 1:
+                weights[(unique_branches[0], dst)] = 1.0
+            else:
+                sigma_per_branch = {}
+                for b in unique_branches:
+                    rp_b = self._reparam_modules[b]
+                    sigma_per_branch[b] = float(rp_b.sigma_out_x.detach().mean().item())
+                total = sum(sigma_per_branch.values()) + 1e-8
+                for b in unique_branches:
+                    weights[(b, dst)] = sigma_per_branch[b] / total
+
+        # Assemble final topology with weights
+        topology = OrderedDict()
+        for src, dsts in raw_topology.items():
+            unique_dsts = list(dict.fromkeys(dsts))  # de-dup per src
+            topology[src] = [(d, weights[(src, d)]) for d in unique_dsts]
+
+        return topology
+
     def propagation_importance(self, I_out=None, *,
                                conv_reduction="frobenius",
-                               on_mismatch="warn"):
+                               on_mismatch="warn",
+                               topology=None):
         """Per-input-channel global importance via reverse-walk recursion.
 
         Implements the paper's "criterion (3)" (boss's Summary §4 — the best one):
@@ -850,8 +1011,9 @@ class MeanResidualManager(BaseReparamManager):
                 fallback.
 
         Notes:
-            - Sequential nets only. Residuals deferred to M3 (DepGraph topology +
-              σ_branch/(σ_a+σ_b) factor).
+            - topology=None → sequential walk (M2 behavior). For residual / branched
+              nets, pass `topology=self.build_propagation_topology(example_inputs)` —
+              M3 DepGraph-based DAG traversal with σ_out branch weighting.
             - σ stop-grad (buffer; .detach() for safety).
             - M is taken absolute so column sums are non-negative (variance-propagation
               semantics — boss's matrix form assumes magnitude).
@@ -884,12 +1046,18 @@ class MeanResidualManager(BaseReparamManager):
             return w_red.t().abs()                                 # [in, out]
 
         layers = list(self._reparam_modules.items())  # forward order
-        Ms = [_layer_M(rp) for _, rp in layers]
+        Ms = {name: _layer_M(rp) for name, rp in layers}
 
+        # ---- DAG walk path (M3): topology provided ----
+        if topology is not None:
+            return self._propagate_dag(layers, Ms, topology, I_out, eps)
+
+        # ---- Sequential path (M2): no topology ----
         # Seed I_out at last layer's output
         last_out_dim = _out_dim(layers[-1][1])
-        last_device = Ms[-1].device
-        last_dtype = Ms[-1].dtype
+        last_M = Ms[layers[-1][0]]
+        last_device = last_M.device
+        last_dtype = last_M.dtype
         if I_out is None:
             I_next = torch.full((last_out_dim,), 1.0 / last_out_dim,
                                 device=last_device, dtype=last_dtype)
@@ -902,13 +1070,13 @@ class MeanResidualManager(BaseReparamManager):
         results = []  # reverse-collected, flipped at end
         for idx in range(len(layers) - 1, -1, -1):
             name, rp = layers[idx]
-            M = Ms[idx]
+            M = Ms[name]
             out_l = _out_dim(rp)
 
             if I_next.numel() != out_l:
                 msg = (f"propagation chain mismatch at '{name}': out_dim={out_l} but "
                        f"I^{{l+1}} has {I_next.numel()} entries — likely residual / "
-                       f"non-sequential boundary. Full topology lands in M3.")
+                       f"non-sequential boundary. Pass topology= for M3 DAG walk.")
                 if on_mismatch == "raise":
                     raise RuntimeError(msg)
                 if on_mismatch == "warn":
@@ -924,6 +1092,75 @@ class MeanResidualManager(BaseReparamManager):
             I_next = I_l  # chains to layer l-1 (whose out_dim should equal in_l = I_next.numel())
 
         return OrderedDict(reversed(results))
+
+    def _propagate_dag(self, layers, Ms, topology, I_out, eps):
+        """DAG reverse-walk using a downstream+weight topology (M3).
+
+        For each layer L (visited in reverse forward order — assumes named_modules order
+        is a topological sort of the forward DAG, which holds for ResNet/VGG/MobileNet
+        and other standard architectures), gather:
+            I_next = Σ_{(d, w) in topology[L]} w · I[d]
+        with I[d] already computed. Terminal layers (empty downstream list) seed from I_out.
+        Then I[L] = W̄^L · I_next.
+        """
+        def _out_dim(rp):
+            return rp.out_features if hasattr(rp, "out_features") else rp.out_channels
+
+        # Identify terminal layers (no downstream reparam'd consumers)
+        terminals = [name for name, dsts in topology.items() if not dsts]
+        if not terminals:
+            raise RuntimeError("propagation topology has no terminal layer "
+                               "(every layer has downstreams) — cyclic or malformed graph")
+        if I_out is not None and len(terminals) > 1:
+            raise ValueError(f"I_out supplied as a single tensor, but the topology has "
+                             f"{len(terminals)} terminal layers: {terminals}. Pass I_out "
+                             f"as dict[name → tensor] when there are multiple terminals.")
+
+        # Seed map: terminal_name → I_out vector for that terminal
+        rp_by_name = dict(layers)
+        device, dtype = next(iter(Ms.values())).device, next(iter(Ms.values())).dtype
+
+        def _seed_for(name):
+            rp = rp_by_name[name]
+            out_dim = _out_dim(rp)
+            if I_out is None:
+                return torch.full((out_dim,), 1.0 / out_dim, device=device, dtype=dtype)
+            if isinstance(I_out, dict):
+                if name not in I_out:
+                    raise ValueError(f"I_out dict missing entry for terminal '{name}'")
+                t = torch.as_tensor(I_out[name], device=device, dtype=dtype).flatten()
+            else:
+                t = torch.as_tensor(I_out, device=device, dtype=dtype).flatten()
+            if t.numel() != out_dim:
+                raise ValueError(f"I_out[{name!r}] has {t.numel()} entries, expected {out_dim}")
+            return t
+
+        seeds = {name: _seed_for(name) for name in terminals}
+
+        I_by_name = {}  # name → I^l (per-input-channel)
+        # Reverse forward order (named_modules order = topological sort assumption).
+        for name, rp in reversed(layers):
+            M = Ms[name]
+            out_l = _out_dim(rp)
+            dsts = topology.get(name, [])
+
+            if not dsts:
+                I_next = seeds[name]
+            else:
+                I_next = torch.zeros(out_l, device=device, dtype=dtype)
+                for d, w in dsts:
+                    if d not in I_by_name:
+                        raise RuntimeError(f"propagation order violation: '{name}' "
+                                           f"downstream '{d}' not yet computed (DAG topology "
+                                           f"may not match named_modules order)")
+                    I_next = I_next + float(w) * I_by_name[d]
+
+            col_sums = M.sum(dim=0).clamp(min=eps)
+            Wbar = M / col_sums[None, :]
+            I_by_name[name] = Wbar @ I_next
+
+        # Return in forward order
+        return OrderedDict((name, I_by_name[name]) for name, _ in layers)
 
     def channel_stats(self):
         """Per-layer ‖σ_x·v‖ statistics along self.norm_dim, plus σ distribution."""

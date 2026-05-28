@@ -678,6 +678,112 @@ def test_propagation_mismatch_fallback():
         mgr.propagation_importance(on_mismatch="raise")
 
 
+# ---------------------------------------------------------------------------
+# M3: residual / DAG propagation (σ_out branch weighting via DepGraph)
+# ---------------------------------------------------------------------------
+class _ResidualBlock(nn.Module):
+    """Tiny residual: stem fans out to main + shortcut; main+shortcut merge via add
+    feeding tail. All convs groups==1, 1×1 for simplicity."""
+    def __init__(self):
+        super().__init__()
+        self.stem = nn.Conv2d(3, 8, 1)
+        self.bn_main = nn.BatchNorm2d(8)
+        self.main = nn.Conv2d(8, 8, 1)
+        self.shortcut = nn.Conv2d(8, 8, 1)
+        self.bn_tail = nn.BatchNorm2d(8)
+        self.tail = nn.Conv2d(8, 4, 1)
+
+    def forward(self, x):
+        x = self.stem(x)
+        a = self.main(self.bn_main(x))
+        b = self.shortcut(x)
+        y = a + b                  # residual add
+        return self.tail(self.bn_tail(y))
+
+
+def test_output_sigma_calibrated():
+    """sigma_out_x is populated, positive, correct shape."""
+    model = TinyCNN()
+    names = build_whole_net_reparam_layers(model, exclude_classifier=False)
+    mgr = MeanResidualManager(model, names, CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_img_loader(3, 8, n=8, bs=4))
+    for name, rp in mgr._reparam_modules.items():
+        assert hasattr(rp, "sigma_out_x"), f"{name} missing sigma_out_x"
+        s = rp.sigma_out_x
+        out_dim = rp.out_features if hasattr(rp, "out_features") else rp.out_channels
+        assert s.shape == (out_dim,)
+        assert (s > 0).all(), f"{name} sigma_out_x has non-positive entries"
+
+
+def test_build_topology_sequential():
+    """Sequential TinyMLP: fc1 → fc2 with weight 1.0; fc2 terminal."""
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+    topo = mgr.build_propagation_topology(torch.randn(2, 16))
+    assert topo["fc1"] == [("fc2", 1.0)]
+    assert topo["fc2"] == []
+
+
+def test_build_topology_residual():
+    """ResidualBlock: stem fans out (both weight 1.0); main+shortcut share tail with
+    σ_out branch weights summing to 1."""
+    model = _ResidualBlock()
+    names = ["stem", "main", "shortcut", "tail"]
+    mgr = MeanResidualManager(model, names, CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_img_loader(3, 8, n=8, bs=4))
+    topo = mgr.build_propagation_topology(torch.randn(2, 3, 8, 8))
+
+    # stem fans out to both branches (separate downstreams, no add → both weight 1.0)
+    stem_dsts = {d for d, _ in topo["stem"]}
+    assert stem_dsts == {"main", "shortcut"}
+    for _, w in topo["stem"]:
+        assert w == 1.0, "fan-out (no residual add) → weight should be 1.0 per branch"
+
+    # main + shortcut both feed tail through the add → σ_out-weighted branch factors
+    assert len(topo["main"]) == 1 and topo["main"][0][0] == "tail"
+    assert len(topo["shortcut"]) == 1 and topo["shortcut"][0][0] == "tail"
+    w_main = topo["main"][0][1]
+    w_short = topo["shortcut"][0][1]
+    assert abs((w_main + w_short) - 1.0) < 1e-5, "branch weights at join must sum to 1"
+
+    sigma_main = mgr._reparam_modules["main"].sigma_out_x.mean().item()
+    sigma_short = mgr._reparam_modules["shortcut"].sigma_out_x.mean().item()
+    expected_w_main = sigma_main / (sigma_main + sigma_short + 1e-8)
+    assert abs(w_main - expected_w_main) < 1e-4, \
+        f"w_main={w_main}, expected ~{expected_w_main}"
+
+    # tail terminal
+    assert topo["tail"] == []
+
+
+def test_propagation_through_residual():
+    """End-to-end DAG walk: shapes + verify fan-out sum invariant at stem."""
+    model = _ResidualBlock()
+    names = ["stem", "main", "shortcut", "tail"]
+    mgr = MeanResidualManager(model, names, CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_img_loader(3, 8, n=8, bs=4))
+    topo = mgr.build_propagation_topology(torch.randn(2, 3, 8, 8))
+    out = mgr.propagation_importance(topology=topo)
+
+    # All 4 layers in output, correct per-input shapes
+    assert set(out.keys()) == set(names)
+    assert out["stem"].shape == (3,)
+    assert out["main"].shape == (8,)
+    assert out["shortcut"].shape == (8,)
+    assert out["tail"].shape == (8,)
+
+    # Stem fan-out: I_stem should = W̄_stem · (1.0·I_main + 1.0·I_shortcut)
+    rp_stem = mgr._reparam_modules["stem"]
+    M_stem = _layer_M_reference(rp_stem)  # [in=3, out=8]
+    col_sums = M_stem.sum(dim=0).clamp(min=1e-8)
+    Wbar_stem = M_stem / col_sums[None, :]
+    I_next_stem = out["main"] + out["shortcut"]  # both weight=1.0
+    I_stem_ref = Wbar_stem @ I_next_stem
+    assert torch.allclose(out["stem"], I_stem_ref, atol=1e-6), \
+        f"stem fan-out sum mismatch: max diff={(out['stem']-I_stem_ref).abs().max()}"
+
+
 def test_propagation_vs_per_layer_score_difference():
     """Propagation has downstream info baked in → differs from per-layer ‖σ·v‖."""
     model = TinyMLP()
