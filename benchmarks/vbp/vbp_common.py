@@ -208,33 +208,41 @@ def build_dataloaders(args, use_ddp=True):
 # Model loading
 # ---------------------------------------------------------------------------
 def _merge_vnr_state_dict(state, eps=1e-5):
-    """Convert VNR checkpoint (v_tilde, m, bn.*) to standard (weight, bias).
+    """Convert reparam'd checkpoint to standard (weight, bias).
 
-    If no VNR keys found, returns state unchanged.
+    Handles both reparam variants:
+      - BN variant (NormalizedResidualManager): keys .v_tilde / .m / .bn.running_*
+        → weight = v_tilde / σ, bias = m − weight·μ.
+      - Mean variant (MeanResidualManager): keys .v / .m / .mu_x (+ .sigma_x and
+        .sigma_out_x score buffers, which are discarded)
+        → weight = v, bias = m − v·μ_x.
+
+    Detection is per-prefix: a layer with .v_tilde is BN; a layer with .v + .mu_x
+    (and no .v_tilde) is Mean. Mixed variants in one state_dict are allowed (e.g.
+    legacy reload paths). Returns state unchanged if no reparam keys are found.
     """
-    # Find VNR layer prefixes: keys ending in .v_tilde
-    prefixes = [k.rsplit(".v_tilde", 1)[0] for k in state if k.endswith(".v_tilde")]
-    if not prefixes:
+    bn_prefixes = [k.rsplit(".v_tilde", 1)[0] for k in state if k.endswith(".v_tilde")]
+    mean_prefixes = [k.rsplit(".v", 1)[0] for k in state
+                     if k.endswith(".v") and (k.rsplit(".v", 1)[0] + ".mu_x") in state
+                     and (k.rsplit(".v", 1)[0] + ".v_tilde") not in state]
+    if not bn_prefixes and not mean_prefixes:
         return state
 
     new_state = {}
     consumed = set()
-    for prefix in prefixes:
+
+    for prefix in bn_prefixes:
         vt = state[prefix + ".v_tilde"]
         m = state[prefix + ".m"]
         var = state[prefix + ".bn.running_var"]
         mu = state[prefix + ".bn.running_mean"]
         sigma = torch.sqrt(var + eps)
-
         if vt.dim() == 2:
-            # Linear: v_tilde [out, in], sigma [in]
             w_eff = vt / sigma[None, :]
             b_eff = m - w_eff @ mu
         else:
-            # Conv2d: v_tilde [C_out, C_in, kH, kW], sigma [C_in]
             w_eff = vt / sigma[None, :, None, None]
             b_eff = m - (w_eff.sum(dim=(2, 3)) @ mu)
-
         new_state[prefix + ".weight"] = w_eff
         new_state[prefix + ".bias"] = b_eff
         consumed.update([
@@ -243,12 +251,29 @@ def _merge_vnr_state_dict(state, eps=1e-5):
             prefix + ".bn.num_batches_tracked",
         ])
 
-    # Copy non-VNR keys as-is
-    for k, v in state.items():
-        if k not in consumed:
-            new_state[k] = v
+    for prefix in mean_prefixes:
+        v = state[prefix + ".v"]
+        m = state[prefix + ".m"]
+        mu = state[prefix + ".mu_x"]
+        if v.dim() == 2:
+            b_eff = m - v @ mu
+        else:                                 # conv [C_out, C_in, kH, kW]
+            b_eff = m - (v.sum(dim=(2, 3)) @ mu)
+        new_state[prefix + ".weight"] = v
+        new_state[prefix + ".bias"] = b_eff
+        consumed.update([
+            prefix + ".v", prefix + ".m", prefix + ".mu_x",
+            prefix + ".sigma_x", prefix + ".sigma_out_x",  # score-only buffers, drop
+        ])
 
-    log_info(f"Converted {len(prefixes)} VNR layers to standard weight/bias")
+    # Copy any non-reparam keys as-is.
+    for k, val in state.items():
+        if k not in consumed:
+            new_state[k] = val
+
+    n_bn = len(bn_prefixes); n_mean = len(mean_prefixes)
+    log_info(f"Converted reparam state_dict: {n_bn} BN-variant + {n_mean} Mean-variant "
+             f"layers → standard weight/bias")
     return new_state
 
 

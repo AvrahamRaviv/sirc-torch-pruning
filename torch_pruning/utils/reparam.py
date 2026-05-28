@@ -671,10 +671,12 @@ class BaseReparamManager(ABC):
                 'out_sum': None, 'out_sum_sq': None, 'out_count': 0,
             }
             accumulators[name] = acc
-            is_linear = isinstance(module, nn.Linear)
-            # Linear: channel is the last dim of input/output, regardless of rank
-            # (so ConvNeXt channels-last [N,H,W,C] reduces over (0,1,2), not (0,2,3)).
-            # Conv2d: channel = dim 1 for both input and output ([N,C,H,W] semantics).
+            # Linear-like (channel = last dim, all ranks): nn.Linear, MeanResidualLinear,
+            #   BNResidualLinear — covers initial calibration (plain modules) AND
+            #   refresh_stats (reparam'd modules) for ViT/ConvNeXt 3D/4D inputs.
+            # Conv-like (channel = dim 1, 4D NCHW): nn.Conv2d, MeanResidualConv2d,
+            #   BNResidualConv2d.
+            is_linear = isinstance(module, (nn.Linear, MeanResidualLinear, BNResidualLinear))
             ch_in = -1 if is_linear else 1
             ch_out = -1 if is_linear else 1
 
@@ -823,6 +825,8 @@ class MeanResidualManager(BaseReparamManager):
         # 0 = frozen at calibration (default, original M1–M3 behavior). Recommended
         # for from-scratch / long training: 0.01 (slow). Faster than 0.01 risks
         # aug-driven drift (see --norm_bn_momentum investigation).
+        if not 0.0 <= float(ema_momentum) <= 1.0:
+            raise ValueError(f"ema_momentum must be in [0, 1], got {ema_momentum}")
         self.ema_momentum = float(ema_momentum)
 
     # Backward-compat alias
@@ -1220,7 +1224,15 @@ class MeanResidualManager(BaseReparamManager):
                         raise RuntimeError(f"propagation order violation: '{name}' "
                                            f"downstream '{d}' not yet computed (DAG topology "
                                            f"may not match named_modules order)")
-                    I_next = I_next + float(w) * I_by_name[d]
+                    I_d = I_by_name[d]
+                    if I_d.numel() != out_l:
+                        raise RuntimeError(f"propagation shape mismatch at '{name}' → '{d}': "
+                                           f"out_dim({name})={out_l} but I[{d!r}] has "
+                                           f"{I_d.numel()} entries. Topology says these "
+                                           f"layers chain but their channel counts disagree "
+                                           f"— check for asymmetric fan-out / channel reshape "
+                                           f"between them.")
+                    I_next = I_next + float(w) * I_d
 
             col_sums = M.sum(dim=0).clamp(min=eps)
             Wbar = M / col_sums[None, :]

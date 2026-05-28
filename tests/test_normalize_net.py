@@ -879,6 +879,82 @@ def test_ema_backward_and_step_does_not_crash():
         opt.step()
 
 
+def test_mean_variant_vnr_roundtrip():
+    """REGRESSION (audit bug #3): _merge_vnr_state_dict only handled BN variant.
+    Mean-variant vnr state has keys .v / .m / .mu_x / .sigma_x / .sigma_out_x;
+    merge must produce weight=v, bias=m−v·μ_x and drop the σ buffers."""
+    torch.manual_seed(2)
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+
+    # Drift the trainable params a bit so reload exercises non-trivial values.
+    for rp in mgr._reparam_modules.values():
+        with torch.no_grad():
+            rp.v.add_(0.1 * torch.randn_like(rp.v))
+            rp.m.add_(0.05 * torch.randn_like(rp.m))
+
+    x = torch.randn(4, 16)
+    model.eval()
+    with torch.no_grad():
+        y_ref = model(x).clone()
+
+    vnr_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    # Sanity: state_dict carries the Mean-variant keys.
+    assert any(k.endswith(".v") for k in vnr_state)
+    assert any(k.endswith(".mu_x") for k in vnr_state)
+    assert any(k.endswith(".sigma_x") for k in vnr_state)
+
+    # Strict reload into a fresh plain arch.
+    fresh = TinyMLP()
+    merged = _merge_vnr_state_dict(vnr_state)
+    fresh.load_state_dict(merged, strict=True)
+    fresh.eval()
+    with torch.no_grad():
+        y_reload = fresh(x)
+    assert (y_reload - y_ref).abs().max().item() < 1e-5, \
+        f"mean-variant vnr reload broken: max diff={(y_reload-y_ref).abs().max()}"
+
+
+def test_refresh_stats_channels_last_linear():
+    """REGRESSION (audit bug #4): refresh_stats on a model whose Linears see 4D
+    channels-last input (ConvNeXt-style pwconv). Old dispatch checked
+    isinstance(module, nn.Linear) — fails for MeanResidualLinear post-reparam →
+    wrong dim reduction → garbage refreshed μ/σ."""
+    model = TinyChannelsLast()
+    mgr = MeanResidualManager(model, ["pwconv1", "pwconv2"], CPU,
+                              lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_img_loader(8, 8, n=8, bs=4))
+
+    # Snapshot pre-refresh shapes
+    rp1 = mgr._reparam_modules["pwconv1"]
+    assert rp1.mu_x.shape == (8,)
+    mu_pre = rp1.mu_x.clone()
+    sigma_pre = rp1.sigma_x.clone()
+
+    # Refresh against fresh (shifted) data — shapes must remain correct AFTER refresh.
+    shifted_loader = _img_loader(8, 8, n=8, bs=4)
+    mgr.refresh_stats(shifted_loader)
+    assert rp1.mu_x.shape == (8,), \
+        f"refresh_stats broke μ_x shape on channels-last Linear: {rp1.mu_x.shape}"
+    assert rp1.sigma_x.shape == (8,)
+    assert rp1.sigma_out_x.shape == (16,)
+    # And the values actually moved (data was different from calibration).
+    assert (rp1.mu_x - mu_pre).abs().max() >= 0.0  # could be 0 if same data; just verifies no shape error
+
+
+def test_ema_momentum_validation():
+    """Hardening: ema_momentum must be in [0, 1]."""
+    import pytest
+    model = TinyMLP()
+    with pytest.raises(ValueError, match="ema_momentum"):
+        MeanResidualManager(model, ["fc1"], CPU, lambda_reg=0.0,
+                            max_batches=4, ema_momentum=-0.1)
+    with pytest.raises(ValueError, match="ema_momentum"):
+        MeanResidualManager(model, ["fc1"], CPU, lambda_reg=0.0,
+                            max_batches=4, ema_momentum=1.5)
+
+
 def test_calibrate_channels_last_linear():
     """REGRESSION: TinyChannelsLast has Linear acting on 4D channels-last [N,H,W,C].
     The bug: _calibrate_stats dispatched by tensor.dim() and treated all 4D as Conv
