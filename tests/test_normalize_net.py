@@ -540,3 +540,160 @@ def test_load_model_random_init_cnn(tmp_path):
     out = model(torch.randn(1, 3, 64, 64))
     assert out.shape == (1, 1000)
     assert getattr(args, "is_pruned_checkpoint", None) is False
+
+
+# ---------------------------------------------------------------------------
+# M2: propagation_importance — global importance via reverse-walk recursion
+# ---------------------------------------------------------------------------
+def _layer_M_reference(rp, conv_reduction="frobenius"):
+    """Test-side reference for M[in, out] = |σ_i · reduce(v[j,i,*])|."""
+    v = rp.v.detach()
+    sigma = rp.sigma_x.detach()
+    if v.dim() == 4:
+        if conv_reduction == "frobenius":
+            v_red = v.flatten(2).norm(p=2, dim=2)
+        else:
+            v_red = v.abs().flatten(2).sum(dim=2)
+    else:
+        v_red = v
+    return (v_red.t() * sigma[:, None]).abs()
+
+
+def test_propagation_two_layer_mlp():
+    """Hand-derive on TinyMLP (fc1 16→32, fc2 32→16): I^fc2 = W̄^fc2 · I_out;
+    I^fc1 = W̄^fc1 · I^fc2. Lock the recursion math (atol 1e-6)."""
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+
+    # Known seed
+    I_out = torch.tensor([1.0 if i == 0 else 0.0 for i in range(16)])  # spike on output 0
+    out = mgr.propagation_importance(I_out=I_out)
+
+    assert list(out.keys()) == ["fc1", "fc2"], "results in forward order"
+    rp_fc1 = mgr._reparam_modules["fc1"]
+    rp_fc2 = mgr._reparam_modules["fc2"]
+
+    # Expected fc2: W̄_fc2 · I_out
+    M_fc2 = _layer_M_reference(rp_fc2)
+    Wbar_fc2 = M_fc2 / M_fc2.sum(dim=0).clamp(min=1e-8)[None, :]
+    I_fc2_ref = Wbar_fc2 @ I_out
+    assert torch.allclose(out["fc2"], I_fc2_ref, atol=1e-6), \
+        f"I^fc2 mismatch: max diff={(out['fc2']-I_fc2_ref).abs().max()}"
+    # Expected fc1: W̄_fc1 · I^fc2
+    M_fc1 = _layer_M_reference(rp_fc1)
+    Wbar_fc1 = M_fc1 / M_fc1.sum(dim=0).clamp(min=1e-8)[None, :]
+    I_fc1_ref = Wbar_fc1 @ I_fc2_ref
+    assert torch.allclose(out["fc1"], I_fc1_ref, atol=1e-6), \
+        f"I^fc1 mismatch: max diff={(out['fc1']-I_fc1_ref).abs().max()}"
+
+    # Shape sanity
+    assert out["fc1"].shape == (16,)   # in_features of fc1
+    assert out["fc2"].shape == (32,)   # in_features of fc2
+
+
+def test_propagation_uniform_default_seed():
+    """No I_out → uniform 1/out_dim seed; chain executes; shapes match in_dims."""
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+
+    out = mgr.propagation_importance()  # I_out=None
+    assert out["fc1"].shape == (16,)
+    assert out["fc2"].shape == (32,)
+
+    # Compare against explicit uniform I_out
+    rp_fc2 = mgr._reparam_modules["fc2"]
+    last_out = rp_fc2.out_features
+    I_out_ref = torch.full((last_out,), 1.0 / last_out)
+    out_explicit = mgr.propagation_importance(I_out=I_out_ref)
+    for k in out:
+        assert torch.allclose(out[k], out_explicit[k], atol=1e-6)
+
+
+def test_propagation_conv_kernel_reduction():
+    """TinyCNN (1×1 convs): frobenius and abs_sum reductions both run; 1×1 case the
+    two reductions match up to sign (Frobenius of one element = |element|)."""
+    model = TinyCNN()
+    names = build_whole_net_reparam_layers(model, exclude_classifier=False)
+    mgr = MeanResidualManager(model, names, CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_img_loader(3, 8, n=8, bs=4))
+
+    out_frob = mgr.propagation_importance(conv_reduction="frobenius")
+    out_abs = mgr.propagation_importance(conv_reduction="abs_sum")
+
+    # Both run end-to-end, same key set.
+    assert set(out_frob.keys()) == set(out_abs.keys())
+    for k in out_frob:
+        assert out_frob[k].shape == out_abs[k].shape
+        # 1×1 convs in TinyCNN: kernel reduction is identity → both equal (up to abs).
+        # Frobenius of 1 element = |element|; abs_sum of 1 element = |element|.
+        # So results should match exactly.
+        assert torch.allclose(out_frob[k], out_abs[k], atol=1e-6), \
+            f"{k}: 1×1 kernel reductions should agree; max diff={(out_frob[k]-out_abs[k]).abs().max()}"
+
+
+def test_propagation_mismatch_fallback():
+    """Mismatched consecutive layers (simulate residual): warn → per-layer fallback;
+    raise → RuntimeError."""
+    # TinyMLP: out(fc1)=32, in(fc2)=32 — matches. Fake a mismatch by registering only
+    # layers whose channels DON'T chain: pick fc1 (16→32) and reshape via a third hand-
+    # built scenario. Easier: construct a 3-layer net with deliberately mismatched dims.
+    class MismatchNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = nn.Linear(8, 16)
+            self.relu1 = nn.ReLU()
+            self.b = nn.Linear(16, 4)     # a→b matches: 16==16
+            self.relu2 = nn.ReLU()
+            self.c = nn.Linear(8, 2)      # b→c MISMATCH: out(b)=4 ≠ in(c)=8
+            # (an upstream non-reparam'd op would normally bridge; here we reparam a/b/c
+            # directly so the chain breaks at b→c.)
+
+        def forward(self, x):
+            x = self.relu1(self.a(x))
+            x = self.relu2(self.b(x))
+            # forward doesn't matter for this test (uses calibration only)
+            return x
+
+    model = MismatchNet()
+    # Register all three so the manager sees the mismatch.
+    mgr = MeanResidualManager(model, ["a", "b", "c"], CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(8))
+
+    # warn path → returns results for all layers (mismatch layer uses fallback)
+    out = mgr.propagation_importance(on_mismatch="warn")
+    assert set(out.keys()) == {"a", "b", "c"}
+    # The mismatch layer 'b' (whose out=4 ≠ in(c)=8) gets a fallback per-layer score for c.
+    # Specifically, at the c step out_dim=2 == I_out seed (2), so c is fine. At b step,
+    # I^c has 8 entries but out(b)=4 → mismatch → b uses fallback.
+    rp_b = mgr._reparam_modules["b"]
+    M_b = _layer_M_reference(rp_b)
+    expected_fallback = M_b.norm(p=2, dim=1)  # [in=16]
+    assert torch.allclose(out["b"], expected_fallback, atol=1e-6)
+
+    # raise path → RuntimeError
+    import pytest
+    with pytest.raises(RuntimeError, match="propagation chain mismatch"):
+        mgr.propagation_importance(on_mismatch="raise")
+
+
+def test_propagation_vs_per_layer_score_difference():
+    """Propagation has downstream info baked in → differs from per-layer ‖σ·v‖."""
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+
+    # Force noticeable variation in fc2 so its downstream contribution biases fc1.
+    rp_fc2 = mgr._reparam_modules["fc2"]
+    with torch.no_grad():
+        rp_fc2.v[0, :] *= 100.0  # output 0 of fc2 receives much stronger weights
+
+    prop = mgr.propagation_importance()
+    # Per-layer score for fc1 = column norms of (σ·v) on fc1 (M1 score).
+    rp_fc1 = mgr._reparam_modules["fc1"]
+    M_fc1 = _layer_M_reference(rp_fc1)
+    per_layer_fc1 = M_fc1.norm(p=2, dim=1)
+    # Propagation factors in fc2's downstream weights → different ranking/magnitudes.
+    assert not torch.allclose(prop["fc1"], per_layer_fc1, atol=1e-3), \
+        "propagation should differ from per-layer score once downstream layer has bias"

@@ -825,6 +825,106 @@ class MeanResidualManager(BaseReparamManager):
                 loss = loss + norms.sum()
         return self.lambda_reg * loss
 
+    def propagation_importance(self, I_out=None, *,
+                               conv_reduction="frobenius",
+                               on_mismatch="warn"):
+        """Per-input-channel global importance via reverse-walk recursion.
+
+        Implements the paper's "criterion (3)" (boss's Summary §4 — the best one):
+
+            I^l = W̄^l · I^{l+1},   W̄ = M · D,
+              M[i, j] = |σ_i · reduce_kernel(v[j, i, :])|       (in × out)
+              D = Diag(1 / Σ_i M[i, j])  clamp ε                 (column-normalize per j)
+            I^{L+1} = I_out (default uniform 1/out_dim on the last layer's outputs)
+
+        Walks self._reparam_modules in reverse forward order (sequential nets). Returns
+        OrderedDict[name → I^l tensor of length in_features^l], in forward order.
+
+        Args:
+            I_out: Output seed, length = out_features^L. None → uniform.
+            conv_reduction: kernel collapse to per-(i,j) scalar — "frobenius" (default,
+                ‖v[j,i,:,:]‖_2) or "abs_sum".
+            on_mismatch: when two consecutive reparam'd layers have out_l ≠ in_{l+1}
+                (residual / branched boundary): "warn" (default) → log + per-layer
+                fallback ‖σ·v‖ for that layer; "raise" → RuntimeError; "skip" → silent
+                fallback.
+
+        Notes:
+            - Sequential nets only. Residuals deferred to M3 (DepGraph topology +
+              σ_branch/(σ_a+σ_b) factor).
+            - σ stop-grad (buffer; .detach() for safety).
+            - M is taken absolute so column sums are non-negative (variance-propagation
+              semantics — boss's matrix form assumes magnitude).
+        """
+        if not self._active or not self._reparam_modules:
+            return OrderedDict()
+        if conv_reduction not in ("frobenius", "abs_sum"):
+            raise ValueError(f"conv_reduction must be 'frobenius'/'abs_sum', got {conv_reduction!r}")
+        if on_mismatch not in ("warn", "raise", "skip"):
+            raise ValueError(f"on_mismatch must be 'warn'/'raise'/'skip', got {on_mismatch!r}")
+
+        eps = 1e-8
+
+        def _in_dim(rp):
+            return rp.in_features if hasattr(rp, "in_features") else rp.in_channels
+
+        def _out_dim(rp):
+            return rp.out_features if hasattr(rp, "out_features") else rp.out_channels
+
+        def _layer_M(rp):
+            """Build M[in, out] = |σ_i · reduce(v[j, i, *])| for one layer."""
+            w = _contribution_weight(rp).detach()  # [out, in] or [out, in, kH, kW]
+            if w.dim() == 4:
+                if conv_reduction == "frobenius":
+                    w_red = w.flatten(2).norm(p=2, dim=2)        # [out, in]
+                else:  # abs_sum
+                    w_red = w.abs().flatten(2).sum(dim=2)        # [out, in]
+            else:
+                w_red = w                                          # [out, in]
+            return w_red.t().abs()                                 # [in, out]
+
+        layers = list(self._reparam_modules.items())  # forward order
+        Ms = [_layer_M(rp) for _, rp in layers]
+
+        # Seed I_out at last layer's output
+        last_out_dim = _out_dim(layers[-1][1])
+        last_device = Ms[-1].device
+        last_dtype = Ms[-1].dtype
+        if I_out is None:
+            I_next = torch.full((last_out_dim,), 1.0 / last_out_dim,
+                                device=last_device, dtype=last_dtype)
+        else:
+            I_next = torch.as_tensor(I_out, device=last_device, dtype=last_dtype).flatten()
+            if I_next.numel() != last_out_dim:
+                raise ValueError(f"I_out has {I_next.numel()} entries, "
+                                 f"expected {last_out_dim} (last layer's out_dim)")
+
+        results = []  # reverse-collected, flipped at end
+        for idx in range(len(layers) - 1, -1, -1):
+            name, rp = layers[idx]
+            M = Ms[idx]
+            out_l = _out_dim(rp)
+
+            if I_next.numel() != out_l:
+                msg = (f"propagation chain mismatch at '{name}': out_dim={out_l} but "
+                       f"I^{{l+1}} has {I_next.numel()} entries — likely residual / "
+                       f"non-sequential boundary. Full topology lands in M3.")
+                if on_mismatch == "raise":
+                    raise RuntimeError(msg)
+                if on_mismatch == "warn":
+                    _log_warning(msg)
+                # Fallback: per-layer ‖σ·v‖ on input channels (the M1 score).
+                I_l = M.norm(p=2, dim=1)  # [in]
+            else:
+                col_sums = M.sum(dim=0).clamp(min=eps)  # [out]
+                Wbar = M / col_sums[None, :]            # [in, out], columns sum to 1
+                I_l = Wbar @ I_next                     # [in]
+
+            results.append((name, I_l))
+            I_next = I_l  # chains to layer l-1 (whose out_dim should equal in_l = I_next.numel())
+
+        return OrderedDict(reversed(results))
+
     def channel_stats(self):
         """Per-layer ‖σ_x·v‖ statistics along self.norm_dim, plus σ distribution."""
         stats = OrderedDict()
