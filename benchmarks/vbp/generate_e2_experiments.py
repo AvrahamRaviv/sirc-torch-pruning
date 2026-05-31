@@ -33,13 +33,23 @@ SCORERS = ["magnitude", "per_layer", "propagation"]
 RATIOS = [0.75]                # pruning_ratio; 0.75 is where ranking separates
 GLOBALS = [False, True]        # local (uniform per-layer) vs cross-layer global (criterion-4)
 
-# --- shared FT recipe (mirror the λ-sweep: sgd 5e-4 cosine, KD, 10ep) ---
+# --- sparse pre-prune phase (E4 folded in). 0 = cold one-shot prune. ---
+# Set >0 to zero low-utility channels before pruning (cheap recovery, strong abs acc).
+SPARSE_EPOCHS = int(os.environ.get("E2_SPARSE_EPOCHS", "0"))
+SPARSE_LAMBDA = os.environ.get("E2_SPARSE_LAMBDA", "1e-3")
+SPARSE_LR = os.environ.get("E2_SPARSE_LR", "1e-2")
+
+# --- shared FT recipe (sgd cosine, KD). Bigger lr than the dense-FT sweep: prune
+# recovery needs it (5e-4 crawled). ---
 COMMON = (
     f"--model_type cnn --cnn_arch resnet50 --checkpoint {CKPT} --data_path {DATA} "
-    f"--epochs_ft 10 --opt sgd --lr 5e-4 --wd 1e-4 --momentum 0.9 --ft_eta_min 1e-6 "
-    f"--use_kd --kd_alpha 0.25 --kd_T 4.0 --train_batch_size 256 --val_resize 232 "
-    f"--calib_batches 50"
+    f"--epochs_ft 10 --opt sgd --lr 2e-2 --wd 1e-4 --momentum 0.9 --ft_eta_min 1e-6 "
+    f"--ft_warmup_epochs 1 --use_kd --kd_alpha 0.5 --kd_T 2.0 "
+    f"--train_batch_size 256 --val_resize 232 --calib_batches 50"
 )
+if SPARSE_EPOCHS > 0:
+    COMMON += (f" --epochs_sparse {SPARSE_EPOCHS} --sparse_lambda {SPARSE_LAMBDA} "
+               f"--sparse_lr {SPARSE_LR}")
 
 SH_TEMPLATE = (
     "#!/bin/bash\n"
@@ -57,7 +67,8 @@ def main():
             for is_global in GLOBALS:
                 r = int(round(ratio * 100))
                 glob_flag = " --global_pruning" if is_global else ""
-                tag = f"E2_{scorer}_r{r}" + ("_glob" if is_global else "_loc")
+                sp = f"_sp{SPARSE_EPOCHS}" if SPARSE_EPOCHS > 0 else ""
+                tag = f"E2_{scorer}_r{r}" + ("_glob" if is_global else "_loc") + sp
                 out_dir = os.path.join(BASE_OUT, tag)
                 os.makedirs(out_dir, exist_ok=True)
                 sh_path = os.path.join(out_dir, "run_ddp.sh")

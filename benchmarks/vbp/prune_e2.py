@@ -3,7 +3,12 @@ E2 — prune a trained net by ‖σ·v‖ / propagation vs ‖v‖ magnitude, th
 
 Tests paper §2 (‖σ·v‖ > ‖v‖) and §3-4 (propagation > per-layer) empirically:
 
-    dense ckpt → [calibrate σ] → score channels → prune @ ratio → short FT → eval
+    dense ckpt → [sparse λ‖σ·v‖ phase] → [calibrate σ] → score → prune @ ratio → FT → eval
+
+The optional sparse phase (--epochs_sparse) trains with the contribution-score
+regularizer first, zeroing low-utility channels so the prune cuts dead weight (cheap
+recovery, mirrors the old vbp_imagenet_pat sparse-pretrain). Off by default = cold
+one-shot prune.
 
 Three scorers (--scorer), all share the SAME pruner / reduction / normalizer so only the
 per-channel base score differs:
@@ -40,6 +45,7 @@ from vbp_common import (
 )
 from normalize_net import (
     load_normnet_checkpoint, log_info, get_device, append_metrics, write_run,
+    build_reparam_manager, train_normalized,
 )
 from torch_pruning.utils.reparam import MeanResidualManager
 from torch_pruning.pruner.importance import GroupMagnitudeImportance
@@ -78,19 +84,58 @@ def log_prune_distribution(pre, post):
              f"({100.0*tot_post/max(tot_pre,1):.1f}% kept)")
 
 
-def build_scorer(scorer, model, calib_loader, device, args, ex):
-    """Return a tp.Importance for the chosen scorer. For per_layer / propagation this
-    calibrates σ on a fresh MeanResidualManager, extracts scores, then merges back so
-    the pruner sees plain Conv/Linear."""
-    if scorer == "magnitude":
-        return GroupMagnitudeImportance(p=2, group_reduction="mean", normalizer="mean")
+def run_sparse_phase(model, train_loader, val_loader, device, args, teacher=None):
+    """Pre-prune sparsification (E4 folded into E2). Reparameterize the dense net, then
+    train it for args.epochs_sparse epochs with the contribution-score regularizer
+    λ‖σ·v‖ active. The reg shrinks low-utility channels' ‖σ·v‖ toward zero, so the
+    following prune cuts (near-)dead channels and recovery is cheap — mirroring the old
+    sparse-pretrain stage that gave vbp_imagenet_pat its strong post-prune numbers.
 
+    Returns the STILL-ACTIVE manager so build_scorer can read post-sparse σ / scores
+    directly (no cold recalibration). KD teacher = the frozen dense net.
+    """
     names = build_whole_net_reparam_layers(
         model, exclude_classifier=True, exclude_stem=args.exclude_stem)
-    log_info(f"σ calibration: {len(names)} reparam layers")
-    mgr = MeanResidualManager(model, names, device, lambda_reg=0.0,
-                              max_batches=args.calib_batches)
-    mgr.reparameterize(calib_loader)
+    log_info(f"SPARSE phase: {len(names)} reparam layers, {args.epochs_sparse} epochs, "
+             f"λ={args.sparse_lambda}, lr={args.sparse_lr}, "
+             f"mu_ema={args.mu_ema_momentum}")
+    mgr = build_reparam_manager(model, names, device, args)
+    mgr.reparameterize(train_loader)
+    # train_normalized reads args.epochs / .lr / .reparam_lambda — swap in the sparse
+    # values, restore after so the later FT phase keeps its own lr / epochs_ft.
+    saved = (args.epochs, args.lr, getattr(args, "reparam_lambda", 0.0))
+    args.epochs = args.epochs_sparse
+    args.lr = args.sparse_lr
+    args.reparam_lambda = args.sparse_lambda
+    train_normalized(model, mgr, train_loader, val_loader, None, args, device,
+                     use_ddp=False, teacher=teacher)
+    args.epochs, args.lr, args.reparam_lambda = saved
+    summ = mgr.vnorm_summary()
+    if summ:
+        log_info(f"post-sparse ‖σ·v‖: mean={summ['mean']:.4f} min={summ['min']:.4f} "
+                 f"frac<0.1={summ['frac_below_0.1']:.3f} frac<0.01={summ['frac_below_0.01']:.3f}")
+    return mgr
+
+
+def build_scorer(scorer, model, calib_loader, device, args, ex, mgr=None):
+    """Return a tp.Importance for the chosen scorer. For per_layer / propagation this
+    needs σ: either reuse a manager from the sparse phase (mgr given, post-sparse σ) or
+    calibrate a fresh one. Either way it extracts scores then merges back so the pruner
+    sees plain Conv/Linear."""
+    if scorer == "magnitude":
+        if mgr is not None and mgr.is_active:
+            mgr.merge_back()   # collapse the sparse-trained v back into plain weights
+        return GroupMagnitudeImportance(p=2, group_reduction="mean", normalizer="mean")
+
+    if mgr is None:
+        names = build_whole_net_reparam_layers(
+            model, exclude_classifier=True, exclude_stem=args.exclude_stem)
+        log_info(f"σ calibration: {len(names)} reparam layers")
+        mgr = MeanResidualManager(model, names, device, lambda_reg=0.0,
+                                  max_batches=args.calib_batches)
+        mgr.reparameterize(calib_loader)
+    else:
+        log_info("σ from sparse phase (no cold recalibration)")
     mode = "per_layer" if scorer == "per_layer" else "propagation"
     scores = extract_input_channel_scores(
         mgr, mode=mode, example_inputs=(ex if mode == "propagation" else None), p=2)
@@ -121,6 +166,19 @@ def main(argv):
     ap.add_argument("--exclude_stem", action="store_true",
                     help="don't reparam/score the stem conv")
     ap.add_argument("--calib_batches", type=int, default=50)
+    # Sparse pre-prune phase (E4 folded in): train with λ‖σ·v‖ to zero low-utility
+    # channels before pruning. epochs_sparse=0 → off (cold one-shot prune).
+    ap.add_argument("--epochs_sparse", type=int, default=0,
+                    help="reparam+λ‖σ·v‖ sparsification epochs before pruning (0=off)")
+    ap.add_argument("--sparse_lambda", type=float, default=1e-3,
+                    help="λ for the ‖σ·v‖ regularizer during the sparse phase")
+    ap.add_argument("--sparse_lr", type=float, default=1e-2,
+                    help="lr for the sparse phase (bigger than FT lr)")
+    ap.add_argument("--mu_ema_momentum", type=float, default=0.0,
+                    help="M4 per-step μ/σ EMA momentum during sparse training (0=frozen)")
+    ap.add_argument("--reparam_variant", default="mean", choices=["mean", "bn"])
+    ap.add_argument("--max_batches", type=int, default=50,
+                    help="calibration batches for reparameterize() (sparse phase)")
     # FT
     ap.add_argument("--epochs_ft", type=int, default=10)
     ap.add_argument("--opt", default="sgd")
@@ -203,8 +261,19 @@ def main(argv):
                      "config": vars(args), "dense_val_acc": dense_acc,
                      "dense_macs_g": dense_macs, "dense_params_m": dense_params})
 
-    # Build scorer (calibrates σ for per_layer/propagation), then prune.
-    importance = build_scorer(args.scorer, model, train_loader, device, args, ex)
+    # Optional sparse pre-prune phase: train with λ‖σ·v‖ so the prune cuts dead
+    # channels (cheap recovery). Keeps the manager active for scoring.
+    sparse_mgr = None
+    if args.epochs_sparse > 0:
+        sparse_mgr = run_sparse_phase(model, train_loader, val_loader, device, args, teacher)
+        model.to(device)
+        sp_acc, _ = validate(model, val_loader, device, args.model_type)
+        log_info(f"POST-SPARSE: acc={sp_acc:.4f} (dense was {dense_acc:.4f})")
+        append_metrics(args, {"arm": f"prune_{args.scorer}", "stage": "post_sparse",
+                              "val_acc": round(sp_acc, 6), "epochs_sparse": args.epochs_sparse})
+
+    # Build scorer (reuses sparse mgr if present, else calibrates σ), then prune.
+    importance = build_scorer(args.scorer, model, train_loader, device, args, ex, mgr=sparse_mgr)
     ignored = [model.fc] if hasattr(model, "fc") else []
     pre_widths = _layer_widths(model)
     pruner = tp.pruner.MagnitudePruner(
