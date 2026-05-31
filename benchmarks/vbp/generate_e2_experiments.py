@@ -30,14 +30,14 @@ CKPT = f"{BASE_OUT}/RN_mean_l1e-4/RN_mean_l1e-4_vnr.pth"
 
 # --- experiment matrix ---
 SCORERS = ["magnitude", "per_layer", "propagation"]
-RATIOS = [0.50, 0.75]          # pruning_ratio; 0.75 is where ranking separates
-GLOBAL = False                 # True → cross-layer global ranking (criterion-4 setting)
+RATIOS = [0.75]                # pruning_ratio; 0.75 is where ranking separates
+GLOBALS = [False, True]        # local (uniform per-layer) vs cross-layer global (criterion-4)
 
 # --- shared FT recipe (mirror the λ-sweep: sgd 5e-4 cosine, KD, 10ep) ---
 COMMON = (
     f"--model_type cnn --cnn_arch resnet50 --checkpoint {CKPT} --data_path {DATA} "
     f"--epochs_ft 10 --opt sgd --lr 5e-4 --wd 1e-4 --momentum 0.9 --ft_eta_min 1e-6 "
-    f"--use_kd --kd_alpha 0.25 --kd_T 4.0 --train_batch_size 128 --val_resize 232 "
+    f"--use_kd --kd_alpha 0.25 --kd_T 4.0 --train_batch_size 256 --val_resize 232 "
     f"--calib_batches 50"
 )
 
@@ -51,25 +51,26 @@ SH_TEMPLATE = (
 
 
 def main():
-    glob_flag = " --global_pruning" if GLOBAL else ""
     made = []
     for scorer in SCORERS:
         for ratio in RATIOS:
-            r = int(round(ratio * 100))
-            tag = f"E2_{scorer}_r{r}" + ("_glob" if GLOBAL else "")
-            out_dir = os.path.join(BASE_OUT, tag)
-            os.makedirs(out_dir, exist_ok=True)
-            sh_path = os.path.join(out_dir, "run_ddp.sh")
-            # out_dir written here is a placeholder; run_ddp.py re-patches --save_dir
-            # to the resolved path at submit time (kept last for the regex).
-            text = SH_TEMPLATE.format(
-                script=SCRIPT, common=COMMON, scorer=scorer, ratio=ratio,
-                glob=glob_flag, tag=tag, out_dir=out_dir)
-            with open(sh_path, "w") as f:
-                f.write(text)
-            os.chmod(sh_path, os.stat(sh_path).st_mode | stat.S_IEXEC)
-            made.append(tag)
-            print(f"wrote {sh_path}")
+            for is_global in GLOBALS:
+                r = int(round(ratio * 100))
+                glob_flag = " --global_pruning" if is_global else ""
+                tag = f"E2_{scorer}_r{r}" + ("_glob" if is_global else "_loc")
+                out_dir = os.path.join(BASE_OUT, tag)
+                os.makedirs(out_dir, exist_ok=True)
+                sh_path = os.path.join(out_dir, "run_ddp.sh")
+                # out_dir is a placeholder; run_ddp.py re-patches --save_dir to the
+                # resolved path at submit time (kept last for the regex).
+                text = SH_TEMPLATE.format(
+                    script=SCRIPT, common=COMMON, scorer=scorer, ratio=ratio,
+                    glob=glob_flag, tag=tag, out_dir=out_dir)
+                with open(sh_path, "w") as f:
+                    f.write(text)
+                os.chmod(sh_path, os.stat(sh_path).st_mode | stat.S_IEXEC)
+                made.append(tag)
+                print(f"wrote {sh_path}")
     print(f"\n{len(made)} experiments. Submit each:")
     for tag in made:
         print(f"  python run_ddp.py --out_dir_name {tag}")
