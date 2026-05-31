@@ -67,35 +67,37 @@ from torch_pruning.utils.reparam import (
 def build_reparam_manager(model, layer_names, device, args):
     """Construct the reparam manager for the chosen --reparam_variant.
 
-    mean (default, CORRECT): trainable v = W, forward v·(x−μ) + m. Gradient ∝ (x−μ)
-        — mean-centered, uniform W-space lr. Matches plain FT; this is the doc's w̃
-        parametrization (σ cancels in the forward).
-    bn  (legacy): trainable v_tilde = W·σ, forward divides back by σ → effective
-        W-space lr = lr/σ², the per-channel overshoot behind every v1–v6 converged-FT
-        cliff. Kept only to reproduce the old behavior.
+    CANONICAL — bn (the "BN trick", boss spec): normalize input by the LIVE EMA σ
+        (BN(affine=False), running stats), trainable v_tilde = σ_cal·W (σ-scaling applied
+        ONCE at init, frozen into v_tilde), fold μ into the bias. ‖v_tilde‖ = the
+        contribution score, so plain weight-decay on v_tilde = the pruning regularizer.
+        Gradient w.r.t v_tilde is on unit-variance normalized input → well-scaled (no
+        1/σ² overshoot; that earlier diagnosis assumed a W-trainable / σ-divide impl,
+        not this v_tilde-trainable one). bn_momentum controls the σ EMA.
 
-    NOTE (pruning, deferred): σ is needed for the NCI contribution-variance score
-    ‖v·σ‖, which currently lives only in the bn variant. For mean-variant pruning,
-    carry a fixed σ buffer (BN-EMA) and score ‖v·σ‖ — see the TODO in reparam.py
-    (MeanResidualManager). Base training is fixed here regardless; pruning is out of
-    scope for this verify run.
+    ABLATION — mean: trainable v = W, forward v·(x−μ) + m. σ is ABSENT from the forward
+        (input not normalized); σ only a detached factor in the ‖σ·v‖ score / aux reg.
+        Use to ablate the input-normalization; not the boss spec.
     """
     lam = float(getattr(args, "reparam_lambda", 0.0))
-    mu_ema = float(getattr(args, "mu_ema_momentum", 0.0))
-    if args.reparam_variant == "bn":
-        log_info("DEPRECATED (M5): --reparam_variant=bn (NormalizedResidualManager) folds "
-                 "σ into the trainable v_tilde, producing the 1/σ² W-space overshoot that "
-                 "caused every v1–v6 converged-FT cliff. Use --reparam_variant=mean for "
-                 "training; keep bn only for legacy reproduction.")
-        if mu_ema > 0:
-            log_info(f"WARNING: --mu_ema_momentum={mu_ema} ignored under --reparam_variant=bn. "
-                     f"The BN variant uses its own running-stats momentum; pass "
-                     f"--norm_bn_momentum to control it.")
-        return NormalizedResidualManager(
-            model, layer_names, device, lambda_reg=lam, max_batches=args.max_batches)
-    return MeanResidualManager(
+    variant = getattr(args, "reparam_variant", "bn")
+    if variant == "mean":
+        mu_ema = float(getattr(args, "mu_ema_momentum", 0.0))
+        log_info("--reparam_variant=mean (ABLATION): σ NOT in the forward, input not "
+                 "normalized — σ is only a detached score factor. Boss spec is the BN "
+                 "trick (--reparam_variant=bn): normalize input by live-EMA σ + trainable "
+                 "v_tilde=σW. Use mean only to ablate input-normalization.")
+        return MeanResidualManager(
+            model, layer_names, device, lambda_reg=lam, max_batches=args.max_batches,
+            ema_momentum=mu_ema)
+    bn_mom = getattr(args, "norm_bn_momentum", None)
+    bn_mom = 0.1 if bn_mom is None else float(bn_mom)
+    log_info(f"--reparam_variant=bn (CANONICAL, BN trick): input normalized by live-EMA "
+             f"σ (momentum={bn_mom}), trainable v_tilde=σ·W, μ folded to bias. "
+             f"WD on v_tilde = contribution-score regularizer.")
+    return NormalizedResidualManager(
         model, layer_names, device, lambda_reg=lam, max_batches=args.max_batches,
-        ema_momentum=mu_ema)
+        bn_momentum=bn_mom)
 
 
 def get_device():
@@ -636,13 +638,14 @@ def parse_args():
                         help="Training epochs (0 = transform+verify only)")
     parser.add_argument("--no_reparam", action="store_true", default=False,
                         help="Baseline arm: plain training, skip normalization")
-    parser.add_argument("--reparam_variant", default="mean", choices=["mean", "bn"],
-                        help="Reparam parametrization (normalized arm). 'mean' (default, "
-                             "CORRECT): trainable v=W, forward v·(x−μ)+m → uniform W-space "
-                             "lr, matches plain FT. 'bn' (legacy): trainable v_tilde=W·σ → "
-                             "1/σ² W-space overshoot (the v1–v6 converged-FT cliff). "
-                             "NCI pruning score ‖v·σ‖ currently needs the bn variant; "
-                             "mean-variant pruning is deferred (see reparam.py TODO).")
+    parser.add_argument("--reparam_variant", default="bn", choices=["mean", "bn"],
+                        help="Reparam parametrization (normalized arm). 'bn' (default, "
+                             "CANONICAL = boss's BN trick): normalize input by live-EMA σ, "
+                             "trainable v_tilde=σ·W (σ frozen-in at init), μ folded to bias; "
+                             "‖v_tilde‖ = contribution score, WD on it = pruning reg. "
+                             "'mean' (ABLATION): trainable v=W, forward v·(x−μ)+m, σ absent "
+                             "from forward (input NOT normalized) — σ only a detached score "
+                             "factor. Use mean to ablate input-normalization.")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--wd", type=float, default=0.05,
                         help="Weight decay (acts ON v_tilde in the normalized arm)")

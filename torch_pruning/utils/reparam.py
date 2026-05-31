@@ -2,23 +2,26 @@
 
 Two variants, both sharing the BaseReparamManager ABC:
 
-1. **MeanResidualManager** (original):
-   Decomposes z = W^T x + b into z = m + V^T(x - μ_x), regularizes V → 0.
-   Drives activation variance → 0 while preserving learned means m.
+1. **NormalizedResidualManager** (VNR, BN-based) — CANONICAL ("the BN trick"):
+   Inserts BN(affine=False) before the target layer: input normalized by the LIVE
+   EMA σ (running stats), trainable v_tilde = σ_cal·W (σ-scaling applied once at
+   init, then frozen into v_tilde), μ folded into the bias. ‖v_tilde[:,k]‖ is the
+   contribution score, so plain weight-decay on v_tilde = the pruning regularizer
+   (magnitude pruning on the normalized net). Gradient w.r.t v_tilde is on unit-
+   variance input → well-scaled. σ's two roles per the spec: (1) normalize input,
+   kept updated by EMA; (2) seed v_tilde=σW at init, not updated thereafter.
 
-2. **NormalizedResidualManager** (VNR, BN-based):
-   Inserts BN(affine=False) before the target layer. The trainable weight
-   v_tilde = W·σ_cal operates on normalized input → ‖v_tilde[:,k]‖ directly
-   measures importance. BN auto-updates stats during training (no frozen σ,
-   no refresh needed). Compensation blocked: inflating σ upstream increases
-   ‖Ṽ‖ → more penalty.
+2. **MeanResidualManager** — ABLATION (input-normalization removed):
+   Decomposes z = W^T x + b into z = m + V^T(x - μ_x). σ is ABSENT from the forward
+   (input not normalized); σ is only a detached factor in the ‖σ·v‖ score / aux reg.
+   Carries the propagation / σ_out machinery (M2–M4). Use to ablate normalization.
 
 Training-time only — merge_back() restores standard nn.Linear/nn.Conv2d before
 pruning so the TP dependency graph, pruner, and compensation code stay untouched.
 
-Efficiency:
-    MeanResidual:     z = F.linear(x, V, m - V @ μ_x)  (effective-bias trick)
-    BNResidual:       z = F.linear(BN(x), v_tilde, m)   (actual BN normalization)
+Efficiency (both use the effective-bias trick, no actual BN reshape on the hot path):
+    BNResidual:   z = F.linear(x, v_tilde/σ_run, m − (v_tilde/σ_run)@μ_run)
+    MeanResidual: z = F.linear(x, V, m − V @ μ_x)
 """
 
 import logging
@@ -196,29 +199,36 @@ class MeanResidualConv2d(nn.Module):
 class BNResidualLinear(nn.Module):
     """BN(affine=False) + Linear with mean-residual decomposition.
 
-    Forward: x_bn = BN(x), z = F.linear(x_bn, v_tilde, m)
-    BN normalizes input to ~unit variance → ‖v_tilde[:,k]‖ directly measures importance.
+    Boss spec: normalize input by the LIVE EMA σ (running stat, not batch), trainable
+    v_tilde = σ_cal·W (σ-scaling applied once at init, then frozen into v_tilde). Forward
+    uses the effective-bias trick z = linear(x, v_tilde/σ_run, m − (v_tilde/σ_run)@μ_run)
+    = v_tilde·(x−μ)/σ — equals BN-normalize-then-linear but with RUNNING (EMA) stats so it
+    matches the Conv variant and "keep σ updated with EMA". ‖v_tilde[:,k]‖ = contribution.
     """
 
-    def __init__(self, in_features, out_features, v_tilde, m, bn_running_mean, bn_running_var):
+    def __init__(self, in_features, out_features, v_tilde, m, bn_running_mean,
+                 bn_running_var, bn_momentum=0.1):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.bn = nn.BatchNorm1d(in_features, affine=False)
+        self.bn = nn.BatchNorm1d(in_features, affine=False, momentum=bn_momentum)
         self.bn.running_mean.copy_(bn_running_mean)
         self.bn.running_var.copy_(bn_running_var)
         self.v_tilde = nn.Parameter(v_tilde)  # [out, in] — operates on normalized input
         self.m = nn.Parameter(m)              # [out] — channel means
 
     def forward(self, x):
-        # Channel dim is last; flatten all leading dims for BatchNorm1d.
-        # Covers 3D [B, T, D] (ViT) and 4D [N, H, W, C] (channels-last pointwise conv).
-        if x.dim() >= 3:
-            D = x.shape[-1]
-            x_bn = self.bn(x.reshape(-1, D)).reshape(x.shape)
-        else:
-            x_bn = self.bn(x)
-        return F.linear(x_bn, self.v_tilde, self.m)
+        # Update EMA running stats in train mode (no grad), then normalize by RUNNING
+        # stats via the effective-bias trick — not batch stats (boss: normalize by EMA σ).
+        if self.training:
+            with torch.no_grad():
+                D = x.shape[-1]
+                self.bn(x.reshape(-1, D)) if x.dim() >= 3 else self.bn(x)
+        sigma = torch.sqrt(self.bn.running_var + self.bn.eps)
+        mu = self.bn.running_mean
+        w_eff = self.v_tilde / sigma[None, :]
+        eff_bias = self.m - w_eff @ mu
+        return F.linear(x, w_eff, eff_bias)
 
     def merge_params(self):
         """Recover standard (weight, bias) using BN running stats."""
@@ -241,7 +251,8 @@ class BNResidualConv2d(nn.Module):
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
-                 dilation, groups, v_tilde, m, bn_running_mean, bn_running_var):
+                 dilation, groups, v_tilde, m, bn_running_mean, bn_running_var,
+                 bn_momentum=0.1):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -250,7 +261,7 @@ class BNResidualConv2d(nn.Module):
         self.padding = padding
         self.dilation = dilation
         self.groups = groups
-        self.bn = nn.BatchNorm2d(in_channels, affine=False)
+        self.bn = nn.BatchNorm2d(in_channels, affine=False, momentum=bn_momentum)
         self.bn.running_mean.copy_(bn_running_mean)
         self.bn.running_var.copy_(bn_running_var)
         self.v_tilde = nn.Parameter(v_tilde)  # [C_out, C_in, kH, kW]
@@ -634,6 +645,24 @@ class BaseReparamManager(ABC):
             "frac_below_0.1": (all_norms < 0.1).sum().item() / n_total,
             "frac_below_1.0": (all_norms < 1.0).sum().item() / n_total,
         }
+
+    def input_channel_scores(self):
+        """Per-INPUT-channel contribution norm ‖σ·v‖ per layer (variant-agnostic).
+
+        Returns OrderedDict[name → tensor of length in_channels^l]. norm_dim is forced
+        to 0 (reduce output + kernel → one score per input channel) regardless of
+        self.norm_dim, because channel pruning always ranks input channels. Reads
+        _contribution_weight: σ·v for the mean variant, v_tilde (= σ·W on normalized
+        input) for the BN variant — both equal the contribution score. This is the
+        "per_layer" criterion the E0 adapter (NormalizedNetImportance) consumes.
+
+        Call while ACTIVE (before merge_back).
+        """
+        out = OrderedDict()
+        for name, reparam in self._reparam_modules.items():
+            w = _contribution_weight(reparam).detach()
+            out[name] = _channel_group_norm(w, 0)  # 0 → per input channel
+        return out
 
     # ------------------------------------------------------------------
     # Abstract interface for subclasses
@@ -1346,25 +1375,6 @@ class MeanResidualManager(BaseReparamManager):
         # Return in forward order
         return OrderedDict((name, I_by_name[name]) for name, _ in layers)
 
-    def input_channel_scores(self):
-        """Per-INPUT-channel ‖σ·v‖ (L2, variance-consistent) per layer.
-
-        Returns OrderedDict[name → tensor of length in_channels^l]. norm_dim is forced
-        to 0 (reduce output + kernel → one score per input channel) regardless of
-        self.norm_dim, because channel pruning always ranks input channels (the same
-        convention as propagation_importance). This is the "per_layer" criterion the
-        E0 pruning adapter (NormalizedNetImportance) consumes; the "propagation"
-        criterion comes from propagation_importance() instead.
-
-        Call while the manager is ACTIVE (before merge_back) — reads the reparam
-        modules' v / sigma_x.
-        """
-        out = OrderedDict()
-        for name, reparam in self._reparam_modules.items():
-            w = _contribution_weight(reparam).detach()
-            out[name] = _channel_group_norm(w, 0)  # 0 → per input channel
-        return out
-
     def channel_stats(self):
         """Per-layer ‖σ_x·v‖ statistics along self.norm_dim, plus σ distribution."""
         stats = OrderedDict()
@@ -1415,11 +1425,17 @@ class NormalizedResidualManager(BaseReparamManager):
     """
 
     def __init__(self, model, target_names, device, lambda_reg=0.01, max_batches=200,
-                 scale_invariant=False, entropy_lambda=0.0, reparam_target="fc2"):
+                 scale_invariant=False, entropy_lambda=0.0, reparam_target="fc2",
+                 bn_momentum=0.1):
         super().__init__(model, target_names, device, lambda_reg=lambda_reg,
                          max_batches=max_batches, scale_invariant=scale_invariant,
                          reparam_target=reparam_target)
         self._entropy_lambda = entropy_lambda
+        # σ EMA momentum for the input-normalizing BN (boss: "keep σ updated with EMA").
+        # 0.1 = torch BN default; slower (e.g. 0.01) for long from-scratch training.
+        if not 0.0 <= float(bn_momentum) <= 1.0:
+            raise ValueError(f"bn_momentum must be in [0, 1], got {bn_momentum}")
+        self.bn_momentum = float(bn_momentum)
 
     def _calibrate(self, targets, loader):
         """Calibrate μ_x and σ_x. Returns dict[name → (μ_x, σ_x)]."""
@@ -1519,7 +1535,8 @@ class NormalizedResidualManager(BaseReparamManager):
             reparam = BNResidualLinear(
                 module.in_features, module.out_features,
                 v_tilde=v_tilde, m=m,
-                bn_running_mean=mu_x, bn_running_var=bn_running_var)
+                bn_running_mean=mu_x, bn_running_var=bn_running_var,
+                bn_momentum=self.bn_momentum)
             return reparam.to(self.device)
 
         elif isinstance(module, nn.Conv2d):
@@ -1535,7 +1552,8 @@ class NormalizedResidualManager(BaseReparamManager):
                 kernel_size=module.kernel_size, stride=module.stride,
                 padding=module.padding, dilation=module.dilation,
                 groups=module.groups, v_tilde=v_tilde, m=m,
-                bn_running_mean=mu_x, bn_running_var=bn_running_var)
+                bn_running_mean=mu_x, bn_running_var=bn_running_var,
+                bn_momentum=self.bn_momentum)
             return reparam.to(self.device)
 
         raise TypeError(f"Unsupported module type: {type(module)}")
@@ -1547,11 +1565,12 @@ class NormalizedResidualManager(BaseReparamManager):
         _log_info("NormalizedResidualManager: BN running stats auto-updated (no manual refresh needed)")
 
     def regularization_loss(self):
-        """L_{2,1} on Ṽ along self.norm_dim."""
+        """L_{2,1} on Ṽ along self.norm_dim. Ṽ=σW operates on unit-variance normalized
+        input, so ‖Ṽ‖ IS the contribution score — this is plain magnitude pruning on the
+        normalized net (boss recap #6), no separate σ factor needed."""
         loss = torch.tensor(0.0, device=self.device)
         for reparam in self._reparam_modules.values():
-            v = reparam.v_tilde
-            norms = v.flatten(1).norm(p=2, dim=self.norm_dim)
+            norms = _channel_group_norm(reparam.v_tilde, self.norm_dim)
             if self.scale_invariant and hasattr(reparam, 'v_init_norms'):
                 loss = loss + (norms / reparam.v_init_norms).sum()
             else:
@@ -1570,8 +1589,7 @@ class NormalizedResidualManager(BaseReparamManager):
 
         loss = torch.tensor(0.0, device=self.device)
         for reparam in self._reparam_modules.values():
-            v = reparam.v_tilde
-            norms_sq = v.flatten(1).norm(p=2, dim=self.norm_dim) ** 2
+            norms_sq = _channel_group_norm(reparam.v_tilde, self.norm_dim) ** 2
             p = norms_sq / (norms_sq.sum() + EPSILON)
             loss = loss - (p * (p + EPSILON).log()).sum()
         return self._entropy_lambda * loss
@@ -1581,7 +1599,7 @@ class NormalizedResidualManager(BaseReparamManager):
         stats = OrderedDict()
         for name, reparam in self._reparam_modules.items():
             vt = reparam.v_tilde.detach()
-            vt_col_norms = vt.flatten(1).norm(p=2, dim=self.norm_dim)
+            vt_col_norms = _channel_group_norm(vt, self.norm_dim)
 
             # w_eff from BN running stats
             sigma = torch.sqrt(reparam.bn.running_var + reparam.bn.eps)
@@ -1589,7 +1607,7 @@ class NormalizedResidualManager(BaseReparamManager):
                 w_eff = vt / sigma[None, :]
             else:  # Conv2d
                 w_eff = vt / sigma[None, :, None, None]
-            weff_col_norms = w_eff.flatten(1).norm(p=2, dim=self.norm_dim)
+            weff_col_norms = _channel_group_norm(w_eff, self.norm_dim)
 
             m = reparam.m.detach()
             stats[name] = {

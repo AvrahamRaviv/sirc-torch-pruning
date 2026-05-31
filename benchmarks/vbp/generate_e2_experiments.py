@@ -55,9 +55,13 @@ SH_TEMPLATE = (
     "#!/bin/bash\n"
     "set -e\n"
     "cd /home/avrahamra/PycharmProjects/sirc-torch-pruning\n"
-    "python {script} {common} --scorer {scorer} --pruning_ratio {ratio}{glob} "
+    "python {script} {common}{variant} --scorer {scorer} --pruning_ratio {ratio}{glob} "
     "--save_tag {tag} --save_dir {out_dir}\n"
 )
+
+# Default reparam variant = bn (canonical BN trick). propagation needs σ_out branch
+# weighting, which only the mean variant tracks → force mean for that scorer.
+VARIANT_FOR = {"propagation": " --reparam_variant mean"}
 
 
 def main():
@@ -76,7 +80,8 @@ def main():
                 # resolved path at submit time (kept last for the regex).
                 text = SH_TEMPLATE.format(
                     script=SCRIPT, common=COMMON, scorer=scorer, ratio=ratio,
-                    glob=glob_flag, tag=tag, out_dir=out_dir)
+                    glob=glob_flag, tag=tag, out_dir=out_dir,
+                    variant=VARIANT_FOR.get(scorer, ""))
                 with open(sh_path, "w") as f:
                     f.write(text)
                 os.chmod(sh_path, os.stat(sh_path).st_mode | stat.S_IEXEC)

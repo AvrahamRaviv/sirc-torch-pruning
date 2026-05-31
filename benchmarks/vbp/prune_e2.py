@@ -47,7 +47,6 @@ from normalize_net import (
     load_normnet_checkpoint, log_info, get_device, append_metrics, write_run,
     build_reparam_manager, train_normalized,
 )
-from torch_pruning.utils.reparam import MeanResidualManager
 from torch_pruning.pruner.importance import GroupMagnitudeImportance
 from normalized_net_importance import (
     NormalizedNetImportance, extract_input_channel_scores,
@@ -130,13 +129,18 @@ def build_scorer(scorer, model, calib_loader, device, args, ex, mgr=None):
     if mgr is None:
         names = build_whole_net_reparam_layers(
             model, exclude_classifier=True, exclude_stem=args.exclude_stem)
-        log_info(f"σ calibration: {len(names)} reparam layers")
-        mgr = MeanResidualManager(model, names, device, lambda_reg=0.0,
-                                  max_batches=args.calib_batches)
+        log_info(f"σ calibration: {len(names)} reparam layers (variant={args.reparam_variant})")
+        args.max_batches = args.calib_batches
+        mgr = build_reparam_manager(model, names, device, args)
         mgr.reparameterize(calib_loader)
     else:
         log_info("σ from sparse phase (no cold recalibration)")
     mode = "per_layer" if scorer == "per_layer" else "propagation"
+    if mode == "propagation" and not hasattr(mgr, "propagation_importance"):
+        raise SystemExit(
+            "propagation scorer needs the mean variant (σ_out tracking for branch "
+            "weighting); the bn variant has no propagation_importance yet. Re-run with "
+            "--scorer per_layer, or --reparam_variant mean for the propagation arm.")
     scores = extract_input_channel_scores(
         mgr, mode=mode, example_inputs=(ex if mode == "propagation" else None), p=2)
     mgr.merge_back()
@@ -176,7 +180,9 @@ def main(argv):
                     help="lr for the sparse phase (bigger than FT lr)")
     ap.add_argument("--mu_ema_momentum", type=float, default=0.0,
                     help="M4 per-step μ/σ EMA momentum during sparse training (0=frozen)")
-    ap.add_argument("--reparam_variant", default="mean", choices=["mean", "bn"])
+    ap.add_argument("--reparam_variant", default="bn", choices=["mean", "bn"],
+                    help="bn (default, canonical BN trick) for per_layer; mean required "
+                         "for the propagation scorer (σ_out branch weighting)")
     ap.add_argument("--max_batches", type=int, default=50,
                     help="calibration batches for reparameterize() (sparse phase)")
     # FT

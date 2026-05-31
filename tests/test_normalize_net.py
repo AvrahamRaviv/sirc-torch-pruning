@@ -911,6 +911,10 @@ def test_e2_build_scorer_and_prune_resnet18():
     class _Args:
         exclude_stem = False
         calib_batches = 2
+        max_batches = 2
+        reparam_lambda = 0.0
+        # bn (canonical) for magnitude/per_layer; propagation needs σ_out → mean.
+        reparam_variant = "bn"
 
     def calib():
         return torch.utils.data.DataLoader(
@@ -922,7 +926,9 @@ def test_e2_build_scorer_and_prune_resnet18():
         model = tv.resnet18(weights=None).eval()
         ex = torch.randn(1, 3, 64, 64)
         p0 = sum(p.numel() for p in model.parameters())
-        imp = build_scorer(scorer, model, calib(), CPU, _Args(), ex)
+        args = _Args()
+        args.reparam_variant = "mean" if scorer == "propagation" else "bn"
+        imp = build_scorer(scorer, model, calib(), CPU, args, ex)
         tp.pruner.MagnitudePruner(model, ex, importance=imp, pruning_ratio=0.5,
                                   ignored_layers=[model.fc]).step()
         p1 = sum(p.numel() for p in model.parameters())
@@ -1286,27 +1292,30 @@ def test_calibrate_channels_last_linear():
     assert rp_pw1.sigma_x.std().item() > 0, "σ_x is constant → likely calibration didn't run"
 
 
-def test_warn_reparam_lambda_dropped_under_bn_variant(monkeypatch):
-    """R7 UX: --mu_ema_momentum > 0 + --reparam_variant=bn → warn that EMA flag
-    is ignored (BN variant uses --norm_bn_momentum instead)."""
+def test_mean_variant_ablation_warning(monkeypatch):
+    """Post-reversal: --reparam_variant=mean is the ABLATION (σ absent from forward) →
+    build_reparam_manager logs an ABLATION note + returns a MeanResidualManager."""
     import normalize_net as nn_mod
     model = TinyCNN()
     names = build_whole_net_reparam_layers(model)
-    args = _train_args(reparam_variant="bn", max_batches=4, mu_ema_momentum=0.01)
+    args = _train_args(reparam_variant="mean", max_batches=4, mu_ema_momentum=0.01)
     captured = []
     monkeypatch.setattr(nn_mod, "log_info", lambda msg: captured.append(msg))
-    nn_mod.build_reparam_manager(model, names, CPU, args)
-    assert any("mu_ema_momentum" in m and "ignored" in m for m in captured), \
-        f"missing mu_ema_momentum ignored warning; got {captured}"
+    mgr = nn_mod.build_reparam_manager(model, names, CPU, args)
+    assert isinstance(mgr, MeanResidualManager)
+    assert any("ABLATION" in m for m in captured), \
+        f"expected ABLATION note for --reparam_variant=mean; got {captured}"
 
 
-def test_bn_variant_deprecation_warning(monkeypatch):
-    """M5: --reparam_variant=bn emits a deprecation log message via log_info."""
+def test_bn_variant_is_canonical(monkeypatch):
+    """Post-reversal: --reparam_variant=bn is CANONICAL (boss's BN trick) → returns a
+    NormalizedResidualManager, logs CANONICAL, and threads --norm_bn_momentum into the
+    σ-EMA momentum."""
     import normalize_net as nn_mod
 
     model = TinyCNN()
     names = build_whole_net_reparam_layers(model)
-    args = _train_args(reparam_variant="bn", max_batches=4)
+    args = _train_args(reparam_variant="bn", max_batches=4, norm_bn_momentum=0.02)
 
     captured = []
     # vbp_imagenet logger has propagate=False + no handler at test time → caplog
@@ -1315,8 +1324,9 @@ def test_bn_variant_deprecation_warning(monkeypatch):
 
     mgr = nn_mod.build_reparam_manager(model, names, CPU, args)
     assert isinstance(mgr, NormalizedResidualManager)
-    assert any("DEPRECATED (M5)" in msg for msg in captured), \
-        f"expected M5 deprecation warning when --reparam_variant=bn; got: {captured}"
+    assert mgr.bn_momentum == 0.02, f"bn_momentum should follow --norm_bn_momentum; got {mgr.bn_momentum}"
+    assert any("CANONICAL" in msg for msg in captured), \
+        f"expected CANONICAL note when --reparam_variant=bn; got: {captured}"
 
 
 def test_propagation_vs_per_layer_score_difference():
