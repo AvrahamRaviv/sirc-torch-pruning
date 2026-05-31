@@ -15,9 +15,13 @@ Criteria:
   var   : --criterion variance --importance_mode variance        → activation σ² (VBP)
           --norm_per_layer
 
-Run:
-    python benchmarks/vbp/generate_experiments.py     # writes 6 folders + run.sh
-    # then launch each printed bash (each grabs 4 GPUs via torch.distributed.launch)
+Run (same run_ddp.py fashion as generate_e2_experiments.py):
+    python benchmarks/vbp/generate_experiments.py     # writes 6 folders + run_ddp.sh
+    python run_ddp.py --out_dir_name E_tpvar_kr50      # submit one (repeat per folder)
+
+Each run_ddp.sh's last token is `--save_dir <out_dir>` so run_ddp.py patches it in
+place at submit time. The .sh keeps the torch.distributed.launch line itself (run_ddp.py
+schedules the bash onto a node; it does not add the DDP wrapper).
 """
 import os
 import stat
@@ -68,17 +72,19 @@ def main():
             tag = f"E_{arm_tag}_kr{int(round(kr * 100))}"
             out_dir = os.path.join(RUN_ROOT, tag)
             os.makedirs(out_dir, exist_ok=True)
-            sh_path = os.path.join(out_dir, "run.sh")
+            sh_path = os.path.join(out_dir, "run_ddp.sh")
+            # out_dir is a placeholder; run_ddp.py re-patches --save_dir to the
+            # resolved path at submit time (kept last for the regex).
             text = SH_TEMPLATE.format(
                 script=SCRIPT, common=COMMON, arm=arm_flags, kr=kr, out_dir=out_dir)
             with open(sh_path, "w") as f:
                 f.write(text)
             os.chmod(sh_path, os.stat(sh_path).st_mode | stat.S_IEXEC)
-            made.append(sh_path)
+            made.append(tag)
             print(f"wrote {sh_path}")
-    print(f"\n{len(made)} experiments. Launch each (each grabs {NPROC} GPUs):")
-    for sh in made:
-        print(f"  bash {sh}")
+    print(f"\n{len(made)} experiments. Submit each ({NPROC} GPUs):")
+    for tag in made:
+        print(f"  python run_ddp.py --out_dir_name {tag}")
 
 
 if __name__ == "__main__":
