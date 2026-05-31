@@ -53,6 +53,31 @@ def _count(model, ex):
     return macs / 1e9, params / 1e6
 
 
+def _layer_widths(model):
+    """name → output width (out_channels / out_features) for every Conv2d / Linear."""
+    import torch.nn as nn
+    w = {}
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d):
+            w[name] = m.out_channels
+        elif isinstance(m, nn.Linear):
+            w[name] = m.out_features
+    return w
+
+
+def log_prune_distribution(pre, post):
+    """Log per-layer kept/removed channels + the global summary."""
+    log_info("per-layer pruning (out width pre → post, kept%):")
+    tot_pre = tot_post = 0
+    for name in pre:
+        a, b = pre[name], post.get(name, pre[name])
+        tot_pre += a; tot_post += b
+        if b != a:
+            log_info(f"  {name}: {a} → {b}  ({100.0*b/a:.0f}% kept, -{a-b})")
+    log_info(f"channels total: {tot_pre} → {tot_post} "
+             f"({100.0*tot_post/max(tot_pre,1):.1f}% kept)")
+
+
 def build_scorer(scorer, model, calib_loader, device, args, ex):
     """Return a tp.Importance for the chosen scorer. For per_layer / propagation this
     calibrates σ on a fresh MeanResidualManager, extracts scores, then merges back so
@@ -120,6 +145,12 @@ def main(argv):
     ap.add_argument("--save_dir", required=True)
     ap.add_argument("--save_tag", required=True)
     ap.add_argument("--disable_ddp", action="store_true", default=True)
+    # diagnostics / safety
+    ap.add_argument("--check_dense_only", action="store_true",
+                    help="load ckpt, eval dense, dump load diagnostics, exit (no prune)")
+    ap.add_argument("--min_dense_acc", type=float, default=0.5,
+                    help="abort if dense acc below this (catches a broken checkpoint "
+                         "load = random ~0.001). Set 0 to disable.")
     args = ap.parse_args(argv[1:])
 
     # single-process only (pruning = structural edit)
@@ -144,7 +175,22 @@ def main(argv):
     ex = torch.randn(1, 3, 224, 224).to(device)
     dense_macs, dense_params = _count(model, ex)
     dense_acc, _ = validate(model, val_loader, device, args.model_type)
+    # Sanity on the load: a trained net at ~0.001 = random ⇒ the checkpoint/eval is
+    # broken, not the pruning. Dump diagnostics so we can localize ckpt vs pipeline.
+    w0 = next((p for p in model.parameters() if p.dim() > 1), None)
     log_info(f"DENSE: acc={dense_acc:.4f}  {dense_macs:.2f}G MACs  {dense_params:.2f}M params")
+    log_info(f"  load check: ckpt={ckpt_path}  first weight ‖·‖={w0.norm().item():.3f} "
+             f"mean={w0.mean().item():.4g} (random init ≈ N(0,small); trained ≫)")
+    if args.check_dense_only:
+        log_info("check_dense_only: stopping before pruning.")
+        return 0
+    if dense_acc < args.min_dense_acc:
+        log_info(f"ABORT: dense acc {dense_acc:.4f} < --min_dense_acc {args.min_dense_acc}. "
+                 f"The checkpoint did not load a trained model (random ≈ 0.001). "
+                 f"Fix the load before pruning. Override with --min_dense_acc 0.")
+        write_run(args, {"arm": f"prune_{args.scorer}", "status": "aborted_bad_dense",
+                         "config": vars(args), "dense_val_acc": dense_acc})
+        return 1
 
     # KD teacher = frozen dense snapshot (before pruning).
     teacher = None
@@ -160,11 +206,13 @@ def main(argv):
     # Build scorer (calibrates σ for per_layer/propagation), then prune.
     importance = build_scorer(args.scorer, model, train_loader, device, args, ex)
     ignored = [model.fc] if hasattr(model, "fc") else []
+    pre_widths = _layer_widths(model)
     pruner = tp.pruner.MagnitudePruner(
         model, ex, importance=importance, global_pruning=args.global_pruning,
         pruning_ratio=args.pruning_ratio, ignored_layers=ignored)
     pruner.step()
     model.to(device)
+    log_prune_distribution(pre_widths, _layer_widths(model))
 
     pr_macs, pr_params = _count(model, ex)
     acc_pruned, _ = validate(model, val_loader, device, args.model_type)
