@@ -1,59 +1,64 @@
 """
-Generate the 6 overnight RN50 ImageNet-1k prune+FT experiments on the PROVEN
-vbp_imagenet_pat.py harness (DDP, 4 GPUs) — the recipe that reaches ~0.76 Best.
+Generate the 6 overnight RN50 ImageNet-1k experiments on the NEW normalize_net.py
+script (the canonical BN-trick training), output under NORMNET — same run_ddp.py
+fashion as generate_e2_experiments.py.
 
-Tests paper §2 (σ-weighted importance > plain magnitude) and §4 (gap grows with
-sparsity): 3 criteria × 2 MAC keep-ratios. Everything else is held IDENTICAL to the
-known-good command (sparse_mode vnr + reparam_lambda 1e-3 + bn_recalibration + lr 0.08
-+ 10ep warmup + 90ep FT + KD α0.5 T2.0 + global mac_target), so the only moving part is
-the pruning criterion → the comparison is clean and anchored to the 0.76 baseline.
+normalize_net.py TRAINS only (reparameterize → train under the BN trick → merge_back →
+save vnr + merged ckpts). No pruning here; prune the resulting vnr ckpt later via
+prune_e2 / generate_e2_experiments. So this set tests the TRAINING-side theory:
 
-Criteria:
-  mag   : --criterion magnitude                                  → ‖v‖ baseline (§2 null)
-  tpvar : --criterion variance --importance_mode tp_variance     → group-mag × σ (NCI, the
-          --norm_per_layer                                          proven arm, §2 hero)
-  var   : --criterion variance --importance_mode variance        → activation σ² (VBP)
-          --norm_per_layer
+  §7 / E1 (BN trick trains clean, no cliff):  RN_bn_l0  vs  RN_baseline (--no_reparam).
+  §6 / E4 (λ‖v_tilde‖ induces channel sparsity at ~no acc cost): λ sweep. Watch
+        vnorm_summary.frac_below_0.1 grow in <tag>_metrics.jsonl as λ rises.
 
-Run (same run_ddp.py fashion as generate_e2_experiments.py):
-    python benchmarks/vbp/generate_experiments.py     # writes 6 folders + run_ddp.sh
-    python run_ddp.py --out_dir_name E_tpvar_kr50      # submit one (repeat per folder)
+KD teacher = the frozen pretrained net (built inside normalize_net, no --teacher flag).
+σ EMA kept slow via --norm_bn_momentum (boss: "keep σ updated with EMA").
 
-Each run_ddp.sh's last token is `--save_dir <out_dir>` so run_ddp.py patches it in
-place at submit time. The .sh keeps the torch.distributed.launch line itself (run_ddp.py
-schedules the bash onto a node; it does not add the DDP wrapper).
+>>> ASSUMPTIONS to eyeball before submit (top constants): EPOCHS, LR, WARMUP. <<<
+This is a FT of a converged net (not prune-recovery), so moderate lr + short cosine.
+
+Run (run_ddp.py fashion):
+    python benchmarks/vbp/generate_experiments.py        # writes 6 run_ddp.sh
+    python run_ddp.py --out_dir_name RN_bn_l1e-3          # submit one (repeat per folder)
+
+Each run_ddp.sh's last token is `--save_dir <out_dir>` so run_ddp.py patches it at
+submit time. The .sh keeps the torch.distributed.launch line (DDP); run_ddp.py just
+schedules the bash onto a node.
 """
 import os
 import stat
 
-# --- cluster paths (override via env for dry-runs) ---
-BASE_OUT = os.environ.get("EXP_BASE_OUT", "/algo/NetOptimization/outputs/VBP/ResNet50_TP")
+# --- paths (override via env for dry-runs) ---
+BASE_OUT = os.environ.get("EXP_BASE_OUT", "/algo/NetOptimization/outputs/NORMNET/ResNet50")
 REPO = os.environ.get("EXP_REPO", "/home/avrahamra/PycharmProjects/sirc-torch-pruning")
-SCRIPT = f"{REPO}/benchmarks/vbp/vbp_imagenet_pat.py"
-CKPT = f"{BASE_OUT}/resnet50_imagenet1k_v1.pth"
-TEACHER = f"{BASE_OUT}/resnet50_imagenet1k_mag_sparse.pth"
+SCRIPT = f"{REPO}/benchmarks/vbp/normalize_net.py"
+# Pretrained dense RN50 to fine-tune under the BN trick.
+CKPT = "/algo/NetOptimization/outputs/VBP/ResNet50_TP/resnet50_imagenet1k_v1.pth"
 DATA = "/algo/NetOptimization/outputs/VBP/"
-RUN_ROOT = os.path.join(BASE_OUT, "repro_norm_overnight")
 NPROC = int(os.environ.get("EXP_NPROC", "4"))
 
-# --- experiment matrix ---
-# (tag, criterion-flags) — held identical otherwise.
-ARMS = [
-    ("mag",   "--criterion magnitude"),
-    ("tpvar", "--criterion variance --importance_mode tp_variance --norm_per_layer"),
-    ("var",   "--criterion variance --importance_mode variance --norm_per_layer"),
-]
-KEEP_RATIOS = [0.5, 0.3]   # MAC keep target; 0.5 = proven working point, 0.3 = harder
+# --- assumed FT knobs (tweak before submit) ---
+EPOCHS = int(os.environ.get("EXP_EPOCHS", "30"))
+LR = os.environ.get("EXP_LR", "0.01")
+WARMUP = int(os.environ.get("EXP_WARMUP", "3"))
 
-# --- shared recipe (EXACT proven command, minus criterion / keep_ratio / save_dir) ---
+# --- experiment matrix (6) ---
+# baseline (plain) + BN-trick λ sweep. tag → arm-specific flags.
+ARMS = [
+    ("RN_baseline", "--no_reparam"),
+    ("RN_bn_l0",    "--reparam_variant bn --reparam_lambda 0"),
+    ("RN_bn_l1e-4", "--reparam_variant bn --reparam_lambda 1e-4"),
+    ("RN_bn_l1e-3", "--reparam_variant bn --reparam_lambda 1e-3"),
+    ("RN_bn_l3e-3", "--reparam_variant bn --reparam_lambda 3e-3"),
+    ("RN_bn_l1e-2", "--reparam_variant bn --reparam_lambda 1e-2"),
+]
+
+# --- shared recipe (proven hyperparams; KD α0.5 T2.0, slow σ-EMA) ---
 COMMON = (
-    f"--model_type cnn --cnn_arch resnet50 "
-    f"--checkpoint {CKPT} --teacher_checkpoint {TEACHER} --data_path {DATA} "
-    f"--global_pruning --mac_target --bn_recalibration "
-    f"--sparse_mode vnr --reparam_lambda 1e-3 --epochs_sparse 0 "
-    f"--epochs_ft 90 --opt sgd --lr 0.08 --ft_lr 0.08 --ft_eta_min 1e-6 "
-    f"--ft_warmup_epochs 10 --wd 1e-4 --train_batch_size 256 "
-    f"--pat_steps 1 --pat_epochs_per_step 0 --use_kd --kd_alpha 0.5 --kd_T 2.0"
+    f"--model_type cnn --cnn_arch resnet50 --checkpoint {CKPT} --data_path {DATA} "
+    f"--epochs {EPOCHS} --opt sgd --lr {LR} --wd 1e-4 --ft_eta_min 1e-6 "
+    f"--ft_warmup_epochs {WARMUP} --train_batch_size 256 --val_resize 232 "
+    f"--use_kd --kd_alpha 0.5 --kd_T 2.0 --norm_bn_momentum 0.01"
 )
 
 SH_TEMPLATE = (
@@ -61,28 +66,27 @@ SH_TEMPLATE = (
     "set -e\n"
     f"cd {REPO}\n"
     f"python3 -m torch.distributed.launch --nproc_per_node={NPROC} {{script}} "
-    "{common} {arm} --keep_ratio {kr} --save_dir {out_dir}\n"
+    "{common} {arm} --save_tag {tag} --save_dir {out_dir}\n"
 )
 
 
 def main():
     made = []
-    for arm_tag, arm_flags in ARMS:
-        for kr in KEEP_RATIOS:
-            tag = f"E_{arm_tag}_kr{int(round(kr * 100))}"
-            out_dir = os.path.join(RUN_ROOT, tag)
-            os.makedirs(out_dir, exist_ok=True)
-            sh_path = os.path.join(out_dir, "run_ddp.sh")
-            # out_dir is a placeholder; run_ddp.py re-patches --save_dir to the
-            # resolved path at submit time (kept last for the regex).
-            text = SH_TEMPLATE.format(
-                script=SCRIPT, common=COMMON, arm=arm_flags, kr=kr, out_dir=out_dir)
-            with open(sh_path, "w") as f:
-                f.write(text)
-            os.chmod(sh_path, os.stat(sh_path).st_mode | stat.S_IEXEC)
-            made.append(tag)
-            print(f"wrote {sh_path}")
-    print(f"\n{len(made)} experiments. Submit each ({NPROC} GPUs):")
+    for tag, arm_flags in ARMS:
+        out_dir = os.path.join(BASE_OUT, tag)
+        os.makedirs(out_dir, exist_ok=True)
+        sh_path = os.path.join(out_dir, "run_ddp.sh")
+        # out_dir is a placeholder; run_ddp.py re-patches --save_dir to the resolved
+        # path at submit time (kept last for the regex).
+        text = SH_TEMPLATE.format(
+            script=SCRIPT, common=COMMON, arm=arm_flags, tag=tag, out_dir=out_dir)
+        with open(sh_path, "w") as f:
+            f.write(text)
+        os.chmod(sh_path, os.stat(sh_path).st_mode | stat.S_IEXEC)
+        made.append(tag)
+        print(f"wrote {sh_path}")
+    print(f"\n{len(made)} experiments (epochs={EPOCHS} lr={LR} warmup={WARMUP}). "
+          f"Submit each ({NPROC} GPUs):")
     for tag in made:
         print(f"  python run_ddp.py --out_dir_name {tag}")
 
