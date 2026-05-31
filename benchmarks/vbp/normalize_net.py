@@ -60,7 +60,7 @@ except ImportError:
     )
 
 from torch_pruning.utils.reparam import (
-    NormalizedResidualManager, MeanResidualManager,
+    NormalizedResidualManager, MeanResidualManager, _channel_group_norm,
 )
 
 
@@ -368,7 +368,7 @@ def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
 
     best_acc = 0.0
     for epoch in range(args.epochs):
-        train_loss, _ = train_one_epoch(
+        train_loss, aux = train_one_epoch(
             train_model, train_loader, train_sampler, optimizer, scheduler,
             device, epoch, args, teacher=teacher,
             step_per_batch=step_per_batch, phase=phase,
@@ -382,17 +382,31 @@ def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
             acc, val_loss = validate(eval_model, val_loader, device, args.model_type)
             best_acc = max(best_acc, acc)
             cur_lr = optimizer.param_groups[0]["lr"]
+            # reg_loss = the λ‖σ·v‖ aux term (avg per step); CE/KD = train_loss − reg.
+            reg_loss = float(aux.get("aux", 0.0)) if aux else 0.0
             # Human line (capital "Epoch", comma-separated → parse_logs-compatible style)
             log_info(f"[{phase}] Epoch {epoch+1}/{args.epochs}: "
                      f"train_loss={train_loss:.4f}, val_acc={acc:.4f}, "
                      f"val_loss={val_loss:.4f}, best={best_acc:.4f}, lr={cur_lr:.2e}")
-            # Machine line (one JSON object per epoch)
-            append_metrics(args, {
+            # Machine line (one JSON object per epoch). reg_loss + the ‖σ·v‖ sparsity
+            # summary let parse_normnet plot the λ-sweep natural-sparsity surface.
+            rec = {
                 "arm": arm, "epoch": epoch + 1, "epochs": args.epochs,
                 "train_loss": round(train_loss, 6), "val_acc": round(acc, 6),
                 "val_loss": round(val_loss, 6), "best_val_acc": round(best_acc, 6),
                 "lr": cur_lr,
-            })
+                "reg_loss": round(reg_loss, 8),
+                "ce_kd_loss": round(train_loss - reg_loss, 6),
+            }
+            if normalized:
+                summ = mgr.vnorm_summary()
+                if summ:
+                    rec["vnorm_mean"] = round(summ["mean"], 6)
+                    rec["vnorm_min"] = round(summ["min"], 6)
+                    rec["vnorm_max"] = round(summ["max"], 6)
+                    rec["frac_below_0.01"] = round(summ["frac_below_0.01"], 6)
+                    rec["frac_below_0.1"] = round(summ["frac_below_0.1"], 6)
+            append_metrics(args, rec)
             if normalized:
                 mgr.log_channel_stats(verbose=False)
         if use_ddp:
@@ -526,7 +540,7 @@ def main(argv):
                 else:
                     w_eff = v * s[None, :]
                 sigmas.append(s.flatten())
-                contrib_norms.append(w_eff.flatten(1).norm(p=2, dim=mgr.norm_dim))
+                contrib_norms.append(_channel_group_norm(w_eff, mgr.norm_dim))
             import torch as _torch
             s_all = _torch.cat(sigmas)
             n_all = _torch.cat(contrib_norms)

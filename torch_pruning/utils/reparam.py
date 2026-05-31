@@ -424,6 +424,22 @@ def _contribution_weight(reparam):
     return w * sigma[None, :]
 
 
+def _channel_group_norm(w, norm_dim):
+    """Per-channel L2 norm grouping weight `w` like a 2D [out, in] `norm(dim=norm_dim)`.
+
+    norm_dim=0 → per-input-channel (reduce output dim); norm_dim=1 → per-output-channel.
+    For conv (4D [out, in, kH, kW]) the kernel dims are reduced INTO the group, not
+    merged into the channel axis. The old `w.flatten(1).norm(dim=0)` gave a
+    [in·kH·kW] vector for k>1 convs (per kernel tap, not per channel) — wrong grouping
+    for channel pruning / the §2 per-input-channel contribution score.
+    """
+    if w.dim() == 4:
+        keep = 1 if norm_dim == 0 else 0
+        reduce_dims = tuple(d for d in range(w.dim()) if d != keep)
+        return w.pow(2).sum(dim=reduce_dims).sqrt()
+    return w.norm(p=2, dim=norm_dim)
+
+
 class BaseReparamManager(ABC):
     """Abstract lifecycle orchestrator for reparameterization managers.
 
@@ -473,7 +489,7 @@ class BaseReparamManager(ABC):
             # weight σ·v so the scale-invariance baseline matches the new ‖σ·v‖ score.
             if self.scale_invariant:
                 w = _contribution_weight(reparam)
-                init_norms = w.detach().flatten(1).norm(p=2, dim=self.norm_dim).clamp(min=EPSILON)
+                init_norms = _channel_group_norm(w.detach(), self.norm_dim).clamp(min=EPSILON)
                 reparam.register_buffer('v_init_norms', init_norms)
             self._replace_module(name, reparam)
             self._reparam_modules[name] = reparam
@@ -548,7 +564,7 @@ class BaseReparamManager(ABC):
         vnorms = OrderedDict()
         for name, reparam in self._reparam_modules.items():
             w = _contribution_weight(reparam).detach()
-            vnorms[name] = w.flatten(1).norm(p=2, dim=self.norm_dim).cpu()
+            vnorms[name] = _channel_group_norm(w, self.norm_dim).cpu()
         self._last_vnorms = vnorms
 
         os.makedirs(save_dir, exist_ok=True)
@@ -578,22 +594,46 @@ class BaseReparamManager(ABC):
                 )
 
         # Aggregate summary across all layers (uses σ·v contribution norms)
-        if stats:
-            all_norms = []
-            for name, reparam in self._reparam_modules.items():
-                v = _contribution_weight(reparam).detach()
-                norms = v.flatten(1).norm(p=2, dim=self.norm_dim)
-                all_norms.append(norms)
-            all_norms = torch.cat(all_norms)
-            n_total = len(all_norms)
+        summ = self.vnorm_summary()
+        if summ:
             _log_info(
-                f"V-norm aggregate ({target_desc}, {len(stats)} layers, {n_total} channels): "
-                f"mean={all_norms.mean():.4f} median={all_norms.median():.4f} "
-                f"std={all_norms.std():.4f} "
-                f"<0.01={((all_norms < 0.01).sum().item() / n_total):.1%} "
-                f"<0.1={((all_norms < 0.1).sum().item() / n_total):.1%} "
-                f"<1.0={((all_norms < 1.0).sum().item() / n_total):.1%}"
+                f"V-norm aggregate ({target_desc}, {summ['n_layers']} layers, "
+                f"{summ['n_channels']} channels): "
+                f"mean={summ['mean']:.4f} median={summ['median']:.4f} "
+                f"std={summ['std']:.4f} "
+                f"<0.01={summ['frac_below_0.01']:.1%} "
+                f"<0.1={summ['frac_below_0.1']:.1%} "
+                f"<1.0={summ['frac_below_1.0']:.1%}"
             )
+
+    def vnorm_summary(self):
+        """Global ‖σ·v‖ distribution across all reparam'd layers (one flat vector).
+
+        Returns dict (or {} if inactive) with mean/median/std/min/max and the
+        natural-sparsity fractions frac_below_{0.01,0.1,1.0} — the headline signal
+        for the λ regularization sweep (E4): a growing left tail = induced channel
+        sparsity. Machine-friendly (all python floats/ints) for metrics.jsonl.
+        """
+        if not self._reparam_modules:
+            return {}
+        all_norms = []
+        for reparam in self._reparam_modules.values():
+            v = _contribution_weight(reparam).detach()
+            all_norms.append(_channel_group_norm(v, self.norm_dim))
+        all_norms = torch.cat(all_norms)
+        n_total = int(all_norms.numel())
+        return {
+            "n_layers": len(self._reparam_modules),
+            "n_channels": n_total,
+            "mean": all_norms.mean().item(),
+            "median": all_norms.median().item(),
+            "std": all_norms.std().item(),
+            "min": all_norms.min().item(),
+            "max": all_norms.max().item(),
+            "frac_below_0.01": (all_norms < 0.01).sum().item() / n_total,
+            "frac_below_0.1": (all_norms < 0.1).sum().item() / n_total,
+            "frac_below_1.0": (all_norms < 1.0).sum().item() / n_total,
+        }
 
     # ------------------------------------------------------------------
     # Abstract interface for subclasses
@@ -966,7 +1006,7 @@ class MeanResidualManager(BaseReparamManager):
                 w_eff = v * sigma[None, :, None, None]
             else:                                 # linear: [out, in]
                 w_eff = v * sigma[None, :]
-            norms = w_eff.flatten(1).norm(p=2, dim=self.norm_dim)
+            norms = _channel_group_norm(w_eff, self.norm_dim)
             if self.scale_invariant and hasattr(reparam, 'v_init_norms'):
                 loss = loss + (norms / reparam.v_init_norms).sum()
             else:
@@ -1299,7 +1339,7 @@ class MeanResidualManager(BaseReparamManager):
                 w_eff = v * sigma[None, :, None, None]
             else:
                 w_eff = v * sigma[None, :]
-            col_norms = w_eff.flatten(1).norm(p=2, dim=self.norm_dim)
+            col_norms = _channel_group_norm(w_eff, self.norm_dim)
             m = reparam.m.detach()
             stats[name] = {
                 'v_col_norm_mean': col_norms.mean().item(),

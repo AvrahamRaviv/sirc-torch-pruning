@@ -480,6 +480,45 @@ def test_sigma_buffer_present():
         assert (sigma > 0).all(), f"{name} sigma_x has non-positive entries"
 
 
+def test_conv3x3_channel_grouping():
+    """channel_stats / regularization on a 3x3 groups==1 conv must group per INPUT
+    channel (length C_in), reducing the kernel taps — not per (in·kH·kW) tap.
+
+    Regression: the old `w.flatten(1).norm(dim=0)` returned a C_in·kH·kW vector for
+    k>1 convs (kernel taps merged into the channel axis), the wrong grouping for the
+    §2 per-input-channel contribution score and for channel pruning.
+    """
+    class _Conv3x3Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(4, 6, 3, padding=1)  # groups==1, 3x3
+            self.pool = nn.AdaptiveAvgPool2d(1)
+            self.head = nn.Linear(6, 5)
+
+        def forward(self, x):
+            x = self.conv(x)
+            x = self.pool(x).flatten(1)
+            return self.head(x)
+
+    model = _Conv3x3Net()
+    mgr = MeanResidualManager(model, ["conv"], CPU, lambda_reg=1.0, max_batches=4)
+    mgr.reparameterize(_img_loader(4, 8, n=8, bs=4))
+
+    rp = mgr._reparam_modules["conv"]
+    assert rp.v.dim() == 4 and rp.v.shape[2:] == (3, 3)  # genuinely a 3x3 kernel
+
+    # channel_stats aggregates internally; assert the per-channel norm vector length
+    # equals C_in (4), not C_in·kH·kW (36).
+    from torch_pruning.utils.reparam import _channel_group_norm
+    w_eff = rp.v.detach() * rp.sigma_x.detach()[None, :, None, None]
+    norms = _channel_group_norm(w_eff, mgr.norm_dim)
+    assert norms.shape == (4,), f"expected per-input-channel (4,), got {tuple(norms.shape)}"
+
+    # regularization_loss must run on the conv and produce a finite positive scalar.
+    loss = mgr.regularization_loss()
+    assert torch.isfinite(loss) and loss.item() > 0
+
+
 def test_score_uses_sigma():
     """Two output channels with identical v rows but different sigma_x scaling must
     rank differently in channel_stats — the score is ‖σ·v‖, not ‖v‖."""
