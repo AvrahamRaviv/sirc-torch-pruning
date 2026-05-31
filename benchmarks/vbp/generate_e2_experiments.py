@@ -22,8 +22,11 @@ import stat
 BASE_OUT = os.environ.get("E2_BASE_OUT", "/algo/NetOptimization/outputs/NORMNET/ResNet50")
 SCRIPT = "/home/avrahamra/PycharmProjects/sirc-torch-pruning/benchmarks/vbp/prune_e2.py"
 DATA = "/algo/NetOptimization/outputs/VBP/"
-# Dense checkpoint to prune = the λ=1e-4 winner's merged_biased net.
-CKPT = f"{BASE_OUT}/RN_mean_l1e-4/RN_mean_l1e-4_merged_biased.pth"
+# Dense checkpoint to prune = the λ=1e-4 winner. Use the VNR file: it reloads to
+# 0.808 (verified), whereas the merged_biased file reloads to ~0.001 (broken save on
+# the cluster — load_normnet_checkpoint auto-detects the vnr format from the sidecar
+# and reconstructs weight=v, bias=m−v·μ_x correctly).
+CKPT = f"{BASE_OUT}/RN_mean_l1e-4/RN_mean_l1e-4_vnr.pth"
 
 # --- experiment matrix ---
 SCORERS = ["magnitude", "per_layer", "propagation"]
