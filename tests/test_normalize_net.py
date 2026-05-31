@@ -901,6 +901,35 @@ def test_e0_propagation_mode_and_prune_step():
     assert out.shape == (2, 2)
 
 
+def test_e2_build_scorer_and_prune_resnet18():
+    """E2 driver's build_scorer produces working importances for all 3 scorers on a
+    real residual net; each prunes resnet18 ~50% and stays runnable."""
+    import torchvision.models as tv
+    import torch_pruning as tp
+    from prune_e2 import build_scorer
+
+    class _Args:
+        exclude_stem = False
+        calib_batches = 2
+
+    def calib():
+        return torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(torch.randn(16, 3, 64, 64),
+                                           torch.zeros(16, dtype=torch.long)),
+            batch_size=8)
+
+    for scorer in ("magnitude", "per_layer", "propagation"):
+        model = tv.resnet18(weights=None).eval()
+        ex = torch.randn(1, 3, 64, 64)
+        p0 = sum(p.numel() for p in model.parameters())
+        imp = build_scorer(scorer, model, calib(), CPU, _Args(), ex)
+        tp.pruner.MagnitudePruner(model, ex, importance=imp, pruning_ratio=0.5,
+                                  ignored_layers=[model.fc]).step()
+        p1 = sum(p.numel() for p in model.parameters())
+        assert p1 < p0 * 0.5, f"{scorer}: expected ~50% params, got {p1/p0:.2f}"
+        assert model(torch.randn(2, 3, 64, 64)).shape == (2, 1000)
+
+
 def test_e0_fallback_to_magnitude_when_no_reparam_member():
     """A group with no reparam'd consumer in scores → magnitude fallback, not a crash."""
     import torch_pruning as tp
