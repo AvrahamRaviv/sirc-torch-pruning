@@ -1013,21 +1013,23 @@ class MeanResidualManager(BaseReparamManager):
                 loss = loss + norms.sum()
         return self.lambda_reg * loss
 
-    def build_propagation_topology(self, example_inputs):
+    def build_propagation_topology(self, example_inputs, p=2):
         """Build the per-layer downstream + branch-weight topology via tp.DependencyGraph.
 
         Returns OrderedDict[name → list of (downstream_name, weight)]:
           - sequential: single downstream, weight 1.0;
           - residual join: each branch's single downstream is the merged consumer,
-            with weight σ_out_branch / Σ σ_out_branches (boss's σ_branch/(σ_a+σ_b));
+            with weight σ_branch^p / Σ σ_branches^p (paper's σ_c^p/(σ_a^p+σ_b^p));
           - fan-out (no add, layer feeds multiple consumers): each downstream weight = 1.0
             (importance accumulates additively across consumers);
           - terminal (no reparam'd consumer downstream): empty list — uses I_out seed.
 
-        σ_out_branch is the per-branch mean of `sigma_out_x` (scalar). Per-channel
-        branch weights are out of M3 scope.
+        σ_branch is the per-branch mean of `sigma_out_x` (scalar). Per-channel branch
+        weights are out of M3 scope.
 
         Args:
+            p: skip-connection exponent — MUST match the `p` passed to
+                propagation_importance (default 2 = variance / VBP-consistent; 1 = std).
             example_inputs: torch.Tensor (or list/dict) suitable for one forward pass —
                 used by DepGraph to trace the computational graph on `self.model`.
         """
@@ -1075,15 +1077,15 @@ class MeanResidualManager(BaseReparamManager):
             plain_by_name = {n: _get_by_dotted(self.model, n) for n in saved.keys()}
             name_by_module = {plain_by_name[n]: n for n in saved.keys()}
 
-            return self._build_topology_from_dg(DG, name_by_module, saved)
+            return self._build_topology_from_dg(DG, name_by_module, saved, p=p)
         finally:
             # Swap reparam'd modules back regardless of outcome.
             for name, original_rp in saved.items():
                 self._replace_module(name, original_rp)
 
-    def _build_topology_from_dg(self, DG, name_by_module, saved):
+    def _build_topology_from_dg(self, DG, name_by_module, saved, p=2):
         """Walk the DepGraph forward to assemble the (downstream_name, weight) topology.
-        Branch weights at residual ADDs come from σ_out (mean per branch)."""
+        Branch weights at residual ADDs come from σ_out^p (mean per branch)."""
 
         def _walk_downstream(node, visited):
             """Forward BFS from node.outputs; collect reparam'd modules reached."""
@@ -1121,7 +1123,8 @@ class MeanResidualManager(BaseReparamManager):
             for d in dsts:
                 upstream_map.setdefault(d, []).append(src)
 
-        # Branch weights via σ_out (scalar per branch = mean over channels)
+        # Branch weights via σ_out^p (scalar per branch = mean over channels).
+        # p=2 → σ_c²/(σ_a²+σ_b²) variance split; p=1 → σ_c/(σ_a+σ_b) std split.
         weights = {}  # (src, dst) → float
         for dst, branches in upstream_map.items():
             unique_branches = list(dict.fromkeys(branches))  # de-dup, preserve order
@@ -1131,7 +1134,7 @@ class MeanResidualManager(BaseReparamManager):
                 sigma_per_branch = {}
                 for b in unique_branches:
                     rp_b = self._reparam_modules[b]
-                    sigma_per_branch[b] = float(rp_b.sigma_out_x.detach().mean().item())
+                    sigma_per_branch[b] = float(rp_b.sigma_out_x.detach().mean().item()) ** p
                 total = sum(sigma_per_branch.values()) + 1e-8
                 for b in unique_branches:
                     weights[(b, dst)] = sigma_per_branch[b] / total
@@ -1147,15 +1150,22 @@ class MeanResidualManager(BaseReparamManager):
     def propagation_importance(self, I_out=None, *,
                                conv_reduction="frobenius",
                                on_mismatch="warn",
-                               topology=None):
+                               topology=None,
+                               p=2):
         """Per-input-channel global importance via reverse-walk recursion.
 
-        Implements the paper's "criterion (3)" (boss's Summary §4 — the best one):
+        Implements the paper's propagation criterion (Recap §3 — the best one):
 
-            I^l = W̄^l · I^{l+1},   W̄ = M · D,
+            I^l = W̄^l · I^{l+1},   W̄ = (M)^p · D,
               M[i, j] = |σ_i · reduce_kernel(v[j, i, :])|       (in × out)
-              D = Diag(1 / Σ_i M[i, j])  clamp ε                 (column-normalize per j)
+              D = Diag(1 / Σ_i M[i, j]^p)  clamp ε               (column-normalize per j)
             I^{L+1} = I_out (default uniform 1/out_dim on the last layer's outputs)
+
+        The exponent `p` selects the paper's two relative-contribution flavors
+        (relative-contribution section): p=2 = variance `σ²w²/Σσ²w²` (DEFAULT,
+        VBP-consistent, matches the L2 per-layer score), p=1 = std `σw/Σσw`. Both
+        normalize each column to sum 1. (The paper notes `σw/√Σσw` "cannot" be used —
+        it does not sum to 1 — so only p∈{1,2} are offered.)
 
         Walks self._reparam_modules in reverse forward order (sequential nets). Returns
         OrderedDict[name → I^l tensor of length in_features^l], in forward order.
@@ -1168,14 +1178,16 @@ class MeanResidualManager(BaseReparamManager):
                 (residual / branched boundary): "warn" (default) → log + per-layer
                 fallback ‖σ·v‖ for that layer; "raise" → RuntimeError; "skip" → silent
                 fallback.
+            p: relative-contribution exponent (2 variance / 1 std). For residual nets
+                build the topology with the SAME p (build_propagation_topology(p=...)).
 
         Notes:
             - topology=None → sequential walk (M2 behavior). For residual / branched
-              nets, pass `topology=self.build_propagation_topology(example_inputs)` —
-              M3 DepGraph-based DAG traversal with σ_out branch weighting.
+              nets, pass `topology=self.build_propagation_topology(example_inputs, p=p)`
+              — M3 DepGraph-based DAG traversal with σ_out^p branch weighting.
             - σ stop-grad (buffer; .detach() for safety).
-            - M is taken absolute so column sums are non-negative (variance-propagation
-              semantics — boss's matrix form assumes magnitude).
+            - M is taken absolute so column sums are non-negative (the paper takes
+              |w_ij| in §1; for p=2 the sign is irrelevant anyway).
         """
         if not self._active or not self._reparam_modules:
             return OrderedDict()
@@ -1183,6 +1195,8 @@ class MeanResidualManager(BaseReparamManager):
             raise ValueError(f"conv_reduction must be 'frobenius'/'abs_sum', got {conv_reduction!r}")
         if on_mismatch not in ("warn", "raise", "skip"):
             raise ValueError(f"on_mismatch must be 'warn'/'raise'/'skip', got {on_mismatch!r}")
+        if p not in (1, 2):
+            raise ValueError(f"p must be 1 (std) or 2 (variance), got {p!r}")
 
         eps = 1e-8
 
@@ -1209,7 +1223,7 @@ class MeanResidualManager(BaseReparamManager):
 
         # ---- DAG walk path (M3): topology provided ----
         if topology is not None:
-            return self._propagate_dag(layers, Ms, topology, I_out, eps)
+            return self._propagate_dag(layers, Ms, topology, I_out, eps, p)
 
         # ---- Sequential path (M2): no topology ----
         # Seed I_out at last layer's output
@@ -1240,11 +1254,13 @@ class MeanResidualManager(BaseReparamManager):
                     raise RuntimeError(msg)
                 if on_mismatch == "warn":
                     _log_warning(msg)
-                # Fallback: per-layer ‖σ·v‖ on input channels (the M1 score).
+                # Fallback: per-layer ‖σ·v‖ on input channels (the M1 / L2 score —
+                # variance-consistent, independent of p).
                 I_l = M.norm(p=2, dim=1)  # [in]
             else:
-                col_sums = M.sum(dim=0).clamp(min=eps)  # [out]
-                Wbar = M / col_sums[None, :]            # [in, out], columns sum to 1
+                Mp = M.pow(p)                           # variance (p=2) or std (p=1)
+                col_sums = Mp.sum(dim=0).clamp(min=eps)  # [out]
+                Wbar = Mp / col_sums[None, :]           # [in, out], columns sum to 1
                 I_l = Wbar @ I_next                     # [in]
 
             results.append((name, I_l))
@@ -1252,7 +1268,7 @@ class MeanResidualManager(BaseReparamManager):
 
         return OrderedDict(reversed(results))
 
-    def _propagate_dag(self, layers, Ms, topology, I_out, eps):
+    def _propagate_dag(self, layers, Ms, topology, I_out, eps, p=2):
         """DAG reverse-walk using a downstream+weight topology (M3).
 
         For each layer L (visited in reverse forward order — assumes named_modules order
@@ -1322,8 +1338,9 @@ class MeanResidualManager(BaseReparamManager):
                                            f"between them.")
                     I_next = I_next + float(w) * I_d
 
-            col_sums = M.sum(dim=0).clamp(min=eps)
-            Wbar = M / col_sums[None, :]
+            Mp = M.pow(p)
+            col_sums = Mp.sum(dim=0).clamp(min=eps)
+            Wbar = Mp / col_sums[None, :]
             I_by_name[name] = Wbar @ I_next
 
         # Return in forward order

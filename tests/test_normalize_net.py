@@ -599,37 +599,51 @@ def _layer_M_reference(rp, conv_reduction="frobenius"):
     return (v_red.t() * sigma[:, None]).abs()
 
 
+def _wbar_reference(M, p):
+    """Column-normalized W̄ = M^p / Σ_i M^p (matches propagation_importance)."""
+    Mp = M.pow(p)
+    return Mp / Mp.sum(dim=0).clamp(min=1e-8)[None, :]
+
+
 def test_propagation_two_layer_mlp():
     """Hand-derive on TinyMLP (fc1 16→32, fc2 32→16): I^fc2 = W̄^fc2 · I_out;
-    I^fc1 = W̄^fc1 · I^fc2. Lock the recursion math (atol 1e-6)."""
+    I^fc1 = W̄^fc1 · I^fc2. Lock the recursion math for both p (atol 1e-6).
+    Default p=2 (variance, VBP-consistent); p=1 (std) also checked."""
     model = TinyMLP()
     mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4)
     mgr.reparameterize(_vec_loader(16))
 
-    # Known seed
     I_out = torch.tensor([1.0 if i == 0 else 0.0 for i in range(16)])  # spike on output 0
-    out = mgr.propagation_importance(I_out=I_out)
-
-    assert list(out.keys()) == ["fc1", "fc2"], "results in forward order"
     rp_fc1 = mgr._reparam_modules["fc1"]
     rp_fc2 = mgr._reparam_modules["fc2"]
-
-    # Expected fc2: W̄_fc2 · I_out
-    M_fc2 = _layer_M_reference(rp_fc2)
-    Wbar_fc2 = M_fc2 / M_fc2.sum(dim=0).clamp(min=1e-8)[None, :]
-    I_fc2_ref = Wbar_fc2 @ I_out
-    assert torch.allclose(out["fc2"], I_fc2_ref, atol=1e-6), \
-        f"I^fc2 mismatch: max diff={(out['fc2']-I_fc2_ref).abs().max()}"
-    # Expected fc1: W̄_fc1 · I^fc2
     M_fc1 = _layer_M_reference(rp_fc1)
-    Wbar_fc1 = M_fc1 / M_fc1.sum(dim=0).clamp(min=1e-8)[None, :]
-    I_fc1_ref = Wbar_fc1 @ I_fc2_ref
-    assert torch.allclose(out["fc1"], I_fc1_ref, atol=1e-6), \
-        f"I^fc1 mismatch: max diff={(out['fc1']-I_fc1_ref).abs().max()}"
+    M_fc2 = _layer_M_reference(rp_fc2)
+
+    for p in (2, 1):  # 2 = default variance, 1 = std
+        out = mgr.propagation_importance(I_out=I_out, p=p)
+        assert list(out.keys()) == ["fc1", "fc2"], "results in forward order"
+        I_fc2_ref = _wbar_reference(M_fc2, p) @ I_out
+        assert torch.allclose(out["fc2"], I_fc2_ref, atol=1e-6), \
+            f"p={p} I^fc2 mismatch: max diff={(out['fc2']-I_fc2_ref).abs().max()}"
+        I_fc1_ref = _wbar_reference(M_fc1, p) @ I_fc2_ref
+        assert torch.allclose(out["fc1"], I_fc1_ref, atol=1e-6), \
+            f"p={p} I^fc1 mismatch: max diff={(out['fc1']-I_fc1_ref).abs().max()}"
+
+    # Default call uses p=2 (variance); must differ from p=1 unless σ·v is trivial.
+    out_default = mgr.propagation_importance(I_out=I_out)
+    out_p1 = mgr.propagation_importance(I_out=I_out, p=1)
+    assert torch.allclose(out_default["fc2"], _wbar_reference(M_fc2, 2) @ I_out, atol=1e-6)
+    assert not torch.allclose(out_default["fc1"], out_p1["fc1"], atol=1e-4), \
+        "p=2 and p=1 should give different propagated importance"
 
     # Shape sanity
-    assert out["fc1"].shape == (16,)   # in_features of fc1
-    assert out["fc2"].shape == (32,)   # in_features of fc2
+    assert out_default["fc1"].shape == (16,)   # in_features of fc1
+    assert out_default["fc2"].shape == (32,)   # in_features of fc2
+
+    # Invalid p rejected
+    import pytest
+    with pytest.raises(ValueError, match="p must be"):
+        mgr.propagation_importance(I_out=I_out, p=3)
 
 
 def test_propagation_uniform_default_seed():
@@ -787,8 +801,9 @@ def test_build_topology_residual():
     w_short = topo["shortcut"][0][1]
     assert abs((w_main + w_short) - 1.0) < 1e-5, "branch weights at join must sum to 1"
 
-    sigma_main = mgr._reparam_modules["main"].sigma_out_x.mean().item()
-    sigma_short = mgr._reparam_modules["shortcut"].sigma_out_x.mean().item()
+    # Default p=2 → variance split σ²/(σ_a²+σ_b²)
+    sigma_main = mgr._reparam_modules["main"].sigma_out_x.mean().item() ** 2
+    sigma_short = mgr._reparam_modules["shortcut"].sigma_out_x.mean().item() ** 2
     expected_w_main = sigma_main / (sigma_main + sigma_short + 1e-8)
     assert abs(w_main - expected_w_main) < 1e-4, \
         f"w_main={w_main}, expected ~{expected_w_main}"
@@ -813,11 +828,10 @@ def test_propagation_through_residual():
     assert out["shortcut"].shape == (8,)
     assert out["tail"].shape == (8,)
 
-    # Stem fan-out: I_stem should = W̄_stem · (1.0·I_main + 1.0·I_shortcut)
+    # Stem fan-out: I_stem should = W̄_stem · (1.0·I_main + 1.0·I_shortcut), p=2 default
     rp_stem = mgr._reparam_modules["stem"]
     M_stem = _layer_M_reference(rp_stem)  # [in=3, out=8]
-    col_sums = M_stem.sum(dim=0).clamp(min=1e-8)
-    Wbar_stem = M_stem / col_sums[None, :]
+    Wbar_stem = _wbar_reference(M_stem, 2)
     I_next_stem = out["main"] + out["shortcut"]  # both weight=1.0
     I_stem_ref = Wbar_stem @ I_next_stem
     assert torch.allclose(out["stem"], I_stem_ref, atol=1e-6), \
