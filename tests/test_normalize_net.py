@@ -839,6 +839,84 @@ def test_propagation_through_residual():
 
 
 # ---------------------------------------------------------------------------
+# E0: NormalizedNetImportance adapter (manager scores → tp pruner)
+# ---------------------------------------------------------------------------
+def test_e0_per_layer_importance_aligns_to_group():
+    """per_layer scores feed a real pruning group: returns a 1-D, finite, non-negative
+    per-channel score whose values trace back to input_channel_scores()."""
+    import torch_pruning as tp
+    from normalized_net_importance import (
+        NormalizedNetImportance, extract_input_channel_scores)
+
+    model = TinyCNN()
+    mgr = MeanResidualManager(model, ["expand", "project", "fc"], CPU,
+                              lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_img_loader(3, 8, n=8, bs=4))
+    scores = extract_input_channel_scores(mgr, mode="per_layer")
+    assert scores["project"].shape == (16,)  # project's input = the 16-ch internal dim
+    mgr.merge_back()                          # plain conv/linear again
+
+    imp = NormalizedNetImportance(model, scores)
+    DG = tp.DependencyGraph().build_dependency(model, torch.randn(1, 3, 8, 8))
+    # Prune the internal 16-channel dim via project's in_channels.
+    group = DG.get_pruning_group(model.project, tp.prune_conv_in_channels,
+                                 idxs=list(range(16)))
+    s = imp(group)
+    assert s.dim() == 1 and s.numel() == 16
+    assert torch.isfinite(s).all() and (s >= 0).all()
+
+    # The score for project's in-channels must be present (not pure magnitude fallback):
+    # reconstruct the project contribution and confirm correlation with the adapter score.
+    proj_score = scores["project"]            # length 16, per input channel
+    # adapter applies normalizer="mean"; rank order must match proj_score's order
+    assert torch.equal(s.argsort(), (proj_score / proj_score.mean()).argsort())
+
+
+def test_e0_propagation_mode_and_prune_step():
+    """propagation mode end-to-end: build adapter, run MagnitudePruner.step(), net
+    actually shrinks and stays runnable."""
+    import torch_pruning as tp
+    from normalized_net_importance import (
+        NormalizedNetImportance, extract_input_channel_scores)
+
+    model = TinyCNN()
+    mgr = MeanResidualManager(model, ["expand", "project", "fc"], CPU,
+                              lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_img_loader(3, 8, n=8, bs=4))
+    ex = torch.randn(1, 3, 8, 8)
+    scores = extract_input_channel_scores(mgr, mode="propagation", example_inputs=ex)
+    mgr.merge_back()
+
+    imp = NormalizedNetImportance(model, scores)
+    params_before = sum(p.numel() for p in model.parameters())
+    pruner = tp.pruner.MagnitudePruner(
+        model, ex, importance=imp, pruning_ratio=0.5,
+        ignored_layers=[model.fc])  # keep the 2-way classifier intact
+    pruner.step()
+
+    params_after = sum(p.numel() for p in model.parameters())
+    assert params_after < params_before, "pruning should remove parameters"
+    # Still runs a forward.
+    out = model(torch.randn(2, 3, 8, 8))
+    assert out.shape == (2, 2)
+
+
+def test_e0_fallback_to_magnitude_when_no_reparam_member():
+    """A group with no reparam'd consumer in scores → magnitude fallback, not a crash."""
+    import torch_pruning as tp
+    from normalized_net_importance import NormalizedNetImportance
+
+    model = TinyCNN()
+    # Empty scores → every group hits the fallback path.
+    imp = NormalizedNetImportance(model, {}, fallback=True)
+    DG = tp.DependencyGraph().build_dependency(model, torch.randn(1, 3, 8, 8))
+    group = DG.get_pruning_group(model.project, tp.prune_conv_in_channels,
+                                 idxs=list(range(16)))
+    s = imp(group)
+    assert s is not None and s.numel() == 16  # magnitude fallback still ranks
+
+
+# ---------------------------------------------------------------------------
 # M4: per-step μ / σ EMA on Mean modules + M5: bn deprecation warning
 # ---------------------------------------------------------------------------
 def test_ema_disabled_by_default():

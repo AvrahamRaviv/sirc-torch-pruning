@@ -1346,6 +1346,25 @@ class MeanResidualManager(BaseReparamManager):
         # Return in forward order
         return OrderedDict((name, I_by_name[name]) for name, _ in layers)
 
+    def input_channel_scores(self):
+        """Per-INPUT-channel ‖σ·v‖ (L2, variance-consistent) per layer.
+
+        Returns OrderedDict[name → tensor of length in_channels^l]. norm_dim is forced
+        to 0 (reduce output + kernel → one score per input channel) regardless of
+        self.norm_dim, because channel pruning always ranks input channels (the same
+        convention as propagation_importance). This is the "per_layer" criterion the
+        E0 pruning adapter (NormalizedNetImportance) consumes; the "propagation"
+        criterion comes from propagation_importance() instead.
+
+        Call while the manager is ACTIVE (before merge_back) — reads the reparam
+        modules' v / sigma_x.
+        """
+        out = OrderedDict()
+        for name, reparam in self._reparam_modules.items():
+            w = _contribution_weight(reparam).detach()
+            out[name] = _channel_group_norm(w, 0)  # 0 → per input channel
+        return out
+
     def channel_stats(self):
         """Per-layer ‖σ_x·v‖ statistics along self.norm_dim, plus σ distribution."""
         stats = OrderedDict()

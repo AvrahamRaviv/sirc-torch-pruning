@@ -1,0 +1,111 @@
+"""
+E0 — NormalizedNetImportance: adapt normalize-net contribution scores to tp's pruner.
+
+`tp.pruner.MagnitudePruner` ranks channels by asking an `tp.Importance` object for a
+per-channel score on each pruning Group. This adapter feeds it the normalize-net score
+instead of weight magnitude:
+
+  - per_layer    → ‖σ·v‖ per input channel               (MeanResidualManager.input_channel_scores)
+  - propagation  → global I^l = W̄^l … W̄^L I^o (variance p=2)  (MeanResidualManager.propagation_importance)
+
+Both criteria are PER-INPUT-CHANNEL. In channel pruning, a prunable channel is the
+output of one layer = the input of its consumer(s). We attach our score on the
+*in_channels* side of every reparam'd consumer present in the group, then reuse tp's
+own group reduction / normalization (we subclass GroupMagnitudeImportance). Groups with
+no reparam'd consumer fall back to plain weight magnitude so every group still ranks.
+
+Flow (matches the experiment pipeline):
+
+    mgr.reparameterize(loader); train_normalized(...)          # train in σ-space
+    scores = extract_input_channel_scores(mgr, mode="per_layer")   # WHILE ACTIVE
+    mgr.merge_back()                                           # → plain nn.Conv2d/Linear
+    imp = NormalizedNetImportance(model, scores)              # plain model + frozen scores
+    pruner = tp.pruner.MagnitudePruner(model, example_inputs, importance=imp, ...)
+    pruner.step()                                             # prune, then FT
+
+Scores are extracted BEFORE merge_back (they read the reparam modules) and keyed by
+module dotted-name, which is stable across merge_back (only the module *type* at that
+name changes, not the name). The adapter maps group member modules → names on the
+merged model.
+"""
+from collections import OrderedDict
+
+import torch
+
+from torch_pruning.pruner import function
+from torch_pruning.pruner.importance import GroupMagnitudeImportance
+
+# in_channels pruning fns: the side where our per-input-channel score applies.
+_IN_FNS = (function.prune_conv_in_channels, function.prune_linear_in_channels)
+
+
+def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
+                                 I_out=None, p=2, conv_reduction="frobenius",
+                                 on_mismatch="warn"):
+    """Pull per-input-channel scores from an ACTIVE MeanResidualManager.
+
+    mode="per_layer"   → mgr.input_channel_scores()  (‖σ·v‖, the §2 criterion).
+    mode="propagation" → mgr.propagation_importance() (the §3 global criterion).
+        Pass example_inputs to build the residual/DAG topology (build_propagation_topology
+        with the SAME p); omit it for a pure sequential walk.
+
+    Returns OrderedDict[name → 1-D tensor], one score per input channel of that layer.
+    Must be called before mgr.merge_back().
+    """
+    if mode == "per_layer":
+        return mgr.input_channel_scores()
+    if mode == "propagation":
+        topo = None
+        if example_inputs is not None:
+            topo = mgr.build_propagation_topology(example_inputs, p=p)
+        return mgr.propagation_importance(
+            I_out=I_out, p=p, conv_reduction=conv_reduction,
+            on_mismatch=on_mismatch, topology=topo)
+    raise ValueError(f"mode must be 'per_layer' or 'propagation', got {mode!r}")
+
+
+class NormalizedNetImportance(GroupMagnitudeImportance):
+    """tp.Importance that ranks channels by normalize-net contribution scores.
+
+    Args:
+        model: the (merged, plain) model the pruner operates on. Used to map group
+            member modules back to dotted names.
+        scores: dict[name → 1-D per-input-channel tensor] from
+            extract_input_channel_scores(...). Frozen at construction (detached, cpu).
+        group_reduction / normalizer: passed to GroupMagnitudeImportance — how scores
+            from multiple group members combine ("mean" default) and are normalized.
+        fallback: if True (default), groups with no reparam'd consumer fall back to
+            plain weight-magnitude (super().__call__). If False, return None for them
+            (the pruner then skips / treats as un-rankable).
+        p: norm degree for the magnitude fallback only (default 2).
+    """
+
+    def __init__(self, model, scores, *, group_reduction="mean", normalizer="mean",
+                 fallback=True, p=2):
+        super().__init__(p=p, group_reduction=group_reduction, normalizer=normalizer)
+        self.scores_by_name = OrderedDict(
+            (n, s.detach().float().cpu().reshape(-1)) for n, s in scores.items())
+        self.name_by_module = {m: n for n, m in model.named_modules()}
+        self.fallback = fallback
+
+    @torch.no_grad()
+    def __call__(self, group):
+        group_imp, group_idxs = [], []
+        for i, (dep, idxs) in enumerate(group):
+            layer = dep.layer
+            if dep.pruning_fn not in _IN_FNS:
+                continue
+            name = self.name_by_module.get(layer)
+            if name is None or name not in self.scores_by_name:
+                continue
+            s = self.scores_by_name[name]
+            sel = s[list(idxs)]                 # align to this member's channel order
+            group_imp.append(sel)
+            group_idxs.append(group[i].root_idxs)
+
+        if not group_imp:
+            # No reparam'd consumer in this group → magnitude fallback (or skip).
+            return super().__call__(group) if self.fallback else None
+
+        reduced = self._reduce(group_imp, group_idxs)
+        return self._normalize(reduced, self.normalizer)
