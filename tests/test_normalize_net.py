@@ -936,6 +936,44 @@ def test_e2_build_scorer_and_prune_resnet18():
         assert model(torch.randn(2, 3, 64, 64)).shape == (2, 1000)
 
 
+def test_normnet_vbppruner_with_compensation_resnet18():
+    """Fix 3 core: VBPPruner ranks by NormalizedNetImportance (NCI) AND compensates via a
+    mean_dict — the exact DDP-harness mechanism. Compensation ON (mean_dict) and OFF
+    (mean_dict=None ≡ magnitude) both prune ~50% and stay runnable."""
+    import torchvision.models as tv
+    import torch_pruning as tp
+    from torch_pruning.utils.reparam import NormalizedResidualManager
+    from torch_pruning.utils.normnet_importance import (
+        NormalizedNetImportance, extract_normnet_scores)
+    from torch_pruning.pruner.importance import build_target_layers, collect_activation_means
+
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(torch.randn(16, 3, 64, 64),
+                                       torch.zeros(16, dtype=torch.long)), batch_size=8)
+
+    for compensate in (True, False):
+        model = tv.resnet18(weights=None).eval()
+        ex = torch.randn(1, 3, 64, 64)
+        p0 = sum(p.numel() for p in model.parameters())
+        names = build_whole_net_reparam_layers(model, exclude_classifier=True)
+        mgr = NormalizedResidualManager(model, names, CPU, lambda_reg=0.0, max_batches=2)
+        mgr.reparameterize(loader)
+        scores = extract_normnet_scores(mgr, "per_layer")   # ‖v_tilde‖ = √NCI
+        mgr.merge_back()
+        imp = NormalizedNetImportance(model, scores)
+        pruner = tp.pruner.VBPPruner(model, ex, importance=imp, pruning_ratio=0.5,
+                                     ignored_layers=[model.fc])
+        if compensate:
+            tl = build_target_layers(model, pruner.DG)
+            mean_dict = collect_activation_means(model, loader, CPU, target_layers=tl,
+                                                 max_batches=2)
+            pruner.set_mean_dict(mean_dict)   # VBPPruner.step() folds pruned means into bias
+        pruner.step()
+        p1 = sum(p.numel() for p in model.parameters())
+        assert p1 < p0 * 0.5, f"compensate={compensate}: expected ~50%, got {p1/p0:.2f}"
+        assert model(torch.randn(2, 3, 64, 64)).shape == (2, 1000)
+
+
 def test_e0_fallback_to_magnitude_when_no_reparam_member():
     """A group with no reparam'd consumer in scores → magnitude fallback, not a crash."""
     import torch_pruning as tp

@@ -80,6 +80,7 @@ except ImportError:
 _CRITERION_TO_METHOD = {
     "variance": "VBP",
     "magnitude": "GroupNormPruner",
+    "normnet": "NormNet",
     "lamp": "LAMP",
     "random": "Random",
 }
@@ -95,6 +96,23 @@ def build_pruning_config(args, model, config_dir):
     start_epoch = args.epochs_sparse if args.sparse_mode != "none" else 0
     epoch_rate = max(1, args.pat_epochs_per_step + 1)
     end_epoch = start_epoch + (args.pat_steps - 1) * epoch_rate
+
+    # NORMNET (paper NCI criterion) guards: scores are extracted ONCE from the active
+    # reparam manager and frozen, so the harness must (a) run a reparam sparse phase so a
+    # manager exists, (b) prune one-shot on a linear schedule (frozen scores go stale after
+    # any structural step). propagation additionally needs σ_out branch weighting = mean
+    # variant (sparse_mode reparam) until Fix 2 lands on the bn variant.
+    if args.criterion == "normnet":
+        imode = getattr(args, "importance_mode", "normnet_per_layer")
+        if args.sparse_mode not in ("reparam", "vnr"):
+            raise ValueError("--criterion normnet needs a reparam manager: set "
+                             "--sparse_mode vnr (per_layer) or reparam (per_layer/propagation).")
+        if args.pat_steps != 1 or args.pruning_schedule != "linear":
+            raise ValueError("--criterion normnet is one-shot: use --pat_steps 1 and "
+                             "--pruning_schedule linear (frozen scores break iterative/geometric).")
+        if imode == "normnet_propagation" and args.sparse_mode != "reparam":
+            raise ValueError("--importance_mode normnet_propagation needs the mean variant "
+                             "(σ_out branch weighting): use --sparse_mode reparam.")
 
     reparam_layers = build_reparam_layers(model, args.model_type,
                                            getattr(args, 'cnn_arch', None),
@@ -588,7 +606,10 @@ def parse_args():
 
     # Pruning
     parser.add_argument("--criterion", default="variance",
-                        choices=["variance", "magnitude", "lamp", "random"])
+                        choices=["variance", "magnitude", "normnet", "lamp", "random"],
+                        help="normnet = paper NCI: rank by ‖σ·v‖=√NCI (normnet_per_layer) "
+                             "or propagated I^l (normnet_propagation), via --importance_mode. "
+                             "Needs --sparse_mode vnr/reparam + --pat_steps 1.")
     parser.add_argument("--group_reduction", default="mean",
                         choices=["mean", "sum", "prod", "max", "first", "dw_proj", "ww"],
                         help="GroupMagnitudeImportance reduction across group members (magnitude criterion only). "
@@ -667,7 +688,7 @@ def parse_args():
     parser.add_argument("--reparam_entropy_lambda", type=float, default=0.0,
                         help="Entropy regularization strength for VNR mode")
     parser.add_argument("--importance_mode", default="variance",
-                        choices=["variance", "weight_variance", "weight_variance_both", "combined", "rank_fusion", "mag_guided", "tp_variance", "dw_proj_var"],
+                        choices=["variance", "weight_variance", "weight_variance_both", "combined", "rank_fusion", "mag_guided", "tp_variance", "dw_proj_var", "normnet_per_layer", "normnet_propagation"],
                         help="Importance scoring: variance (σ²), weight_variance (||W_fc2[:,k]||·σ_k), "
                              "weight_variance_both (||W_fc1[k,:]||·σ_k·||W_fc2[:,k]||), combined (blend magnitude + variance), "
                              "rank_fusion (percentile-rank blend), mag_guided (magnitude budget + WV ordering), "

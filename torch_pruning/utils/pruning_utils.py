@@ -1,5 +1,6 @@
 import os
 import json
+from collections import OrderedDict
 from enum import Enum
 from functools import partial
 from typing import Any, Dict, Optional, List
@@ -90,6 +91,7 @@ class PruningMethod(str, Enum):
     GROUP_NORM = "GroupNormPruner"
     MAC_AWARE = "MACAwareImportance"
     VBP = "VBP"
+    NORMNET = "NormNet"
     LAMP = "LAMP"
     RANDOM = "Random"
 
@@ -205,6 +207,8 @@ class ChannelPruning:
         # Stats collection & compensation state (used by VBP and any criterion with compensation)
         self.vbp_importance = None
         self._compensation_means = None  # collected means for bias compensation (any criterion)
+        self._normnet_scores = None      # NORMNET: per-input-channel ‖σ·v‖ / I^l, extracted
+                                         # from the active reparam manager before merge_back
         self.train_loader = train_loader  # passed at init or set externally
         self._vbp_max_batches = self.channel_sparsity_args.get("max_batches", 200)
         self._vbp_var_loss_weight = self.channel_sparsity_args.get("var_loss_weight", 0.0)
@@ -368,6 +372,20 @@ class ChannelPruning:
                     _log(log, "WARNING: tp_variance without --fold_bn_before_prune may double-count BN gamma")
             else:
                 pruner_entry = partial(tp.pruner.VBPPruner)
+        elif self.pruning_method == PruningMethod.NORMNET:
+            # Paper criterion (NCI): rank by the normalize-net contribution score
+            # ‖σ·v‖ = √NCI (per_layer) or propagated I^l. Same magnitude-on-normalized-
+            # weight ranking regardless of pruner; VBPPruner adds bias compensation via
+            # mean_dict (== MagnitudePruner when mean_dict is None / --no_compensation).
+            from torch_pruning.utils.normnet_importance import NormalizedNetImportance
+            if self._normnet_scores is not None:
+                imp = NormalizedNetImportance(model, self._normnet_scores, p=2,
+                                              group_reduction="mean", normalizer="mean")
+            else:
+                # DG-only __init__ call (scores extracted later in prune()): placeholder.
+                imp = tp.importance.GroupMagnitudeImportance(
+                    p=2, normalizer="mean", group_reduction="mean")
+            pruner_entry = partial(tp.pruner.VBPPruner)
         elif self.pruning_method == PruningMethod.LAMP:
             imp = tp.importance.LAMPImportance(p=2)
             pruner_entry = partial(tp.pruner.GroupNormPruner)
@@ -394,7 +412,9 @@ class ChannelPruning:
             isomorphic=self.channels_pruner_args["isomorphic"],
             iterative_steps=self.iterative_steps,
         )
-        if self.pruning_method == PruningMethod.VBP and self._importance_mode not in ("tp_variance", "dw_proj_var"):
+        if self.pruning_method == PruningMethod.NORMNET or (
+                self.pruning_method == PruningMethod.VBP
+                and self._importance_mode not in ("tp_variance", "dw_proj_var")):
             pruner_kwargs["verbose"] = self.verbose > 0
         else:
             pruner_kwargs["reg"] = self.channels_pruner_args["reg"]
@@ -548,6 +568,26 @@ class ChannelPruning:
         if self._reparam_manager is not None and self._reparam_manager.is_active:
             if log is not None:  # main rank only — avoid DDP file write race
                 self._reparam_manager.save_vnorm_snapshot(self.config_folder)
+            # NORMNET: extract per-input-channel scores (‖σ·v‖ = √NCI, or propagated I^l)
+            # from the ACTIVE manager, BEFORE merge_back. Sync σ buffers first, then
+            # broadcast the scores rank0→all so every rank prunes the same mask (R1: a
+            # divergence here = different masks = DDP shape-mismatch hang).
+            if self.pruning_method == PruningMethod.NORMNET:
+                from torch_pruning.utils.normnet_importance import extract_normnet_scores
+                self._reparam_manager._sync_bn_stats()
+                mode = ("propagation" if self._importance_mode == "normnet_propagation"
+                        else "per_layer")
+                scores = extract_normnet_scores(
+                    self._reparam_manager, mode, example_inputs=self.example_inputs)
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    for k in list(scores.keys()):
+                        t = scores[k].contiguous()
+                        torch.distributed.broadcast(t, src=0)
+                        scores[k] = t        # capture (contiguous may have copied)
+                self._normnet_scores = OrderedDict(
+                    (k, v.detach().clone()) for k, v in scores.items())
+                _log(log, f"NORMNET: extracted {len(self._normnet_scores)} per-layer "
+                          f"score vectors (mode={mode})")
             self._reparam_manager.merge_back()
             self._model_changed = True
             # Broadcast merged weights from rank 0 so all ranks compute
