@@ -49,7 +49,7 @@ from normalize_net import (
 )
 from torch_pruning.pruner.importance import GroupMagnitudeImportance
 from normalized_net_importance import (
-    NormalizedNetImportance, extract_input_channel_scores,
+    NormalizedNetImportance, extract_normnet_scores,
 )
 
 
@@ -136,13 +136,8 @@ def build_scorer(scorer, model, calib_loader, device, args, ex, mgr=None):
     else:
         log_info("σ from sparse phase (no cold recalibration)")
     mode = "per_layer" if scorer == "per_layer" else "propagation"
-    if mode == "propagation" and not hasattr(mgr, "propagation_importance"):
-        raise SystemExit(
-            "propagation scorer needs the mean variant (σ_out tracking for branch "
-            "weighting); the bn variant has no propagation_importance yet. Re-run with "
-            "--scorer per_layer, or --reparam_variant mean for the propagation arm.")
-    scores = extract_input_channel_scores(
-        mgr, mode=mode, example_inputs=(ex if mode == "propagation" else None), p=2)
+    scores = extract_normnet_scores(
+        mgr, mode, example_inputs=(ex if mode == "propagation" else None), p=2)
     mgr.merge_back()
     n0 = sum(int((s < 0.1).sum()) for s in scores.values())
     ntot = sum(s.numel() for s in scores.values())
