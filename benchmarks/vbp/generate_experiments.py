@@ -37,7 +37,7 @@ SCRIPT = f"{REPO}/benchmarks/vbp/normalize_net.py"
 # a stronger teacher = better KD. v1 at resize 232 reads ~75.89 (its native eval is 256).
 # Override via env CKPT=... if the filename differs.
 CKPT = os.environ.get(
-    "CKPT", "/algo/NetOptimization/outputs/VBP/ResNet50_TP/resnet50_imagenet1k_v2.pth")
+    "CKPT", "/algo/NetOptimization/outputs/VBP/ResNet50_TP/resnet50_imagenet1k.pth")
 DATA = "/algo/NetOptimization/outputs/VBP/"
 NPROC = int(os.environ.get("EXP_NPROC", "4"))
 
@@ -62,7 +62,7 @@ COMMON = (
     f"--model_type cnn --cnn_arch resnet50 --checkpoint {CKPT} --data_path {DATA} "
     f"--epochs {EPOCHS} --opt sgd --lr {LR} --wd 1e-4 --ft_eta_min 1e-6 "
     f"--ft_warmup_epochs {WARMUP} --train_batch_size 256 --val_resize 232 "
-    f"--use_kd --kd_alpha 0.5 --kd_T 2.0 --norm_bn_momentum 0.01"
+    f"--use_kd --kd_alpha 0.5 --kd_T 2.0 --norm_bn_momentum 0.01 --ckpt_interval 5"
 )
 
 SH_TEMPLATE = (

@@ -411,6 +411,18 @@ def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
             append_metrics(args, rec)
             if normalized:
                 mgr.log_channel_stats(verbose=False)
+            # Periodic salvage checkpoint (rank 0). Dumps the ACTIVE reparam state as a
+            # vnr ckpt — no merge_back (destructive + collective), just torch.save. Lets a
+            # hung/crashed long run be recovered instead of lost. Overwrites each interval;
+            # the end-of-training save writes the final vnr/merged pair. Skip the last
+            # epoch (the final save covers it).
+            ckpt_interval = int(getattr(args, "ckpt_interval", 0))
+            if (normalized and ckpt_interval > 0 and (epoch + 1) % ckpt_interval == 0
+                    and (epoch + 1) < args.epochs):
+                resolved = list(mgr._reparam_modules.keys())
+                state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                save_normnet_checkpoint(state, "vnr", resolved, args)
+                log_info(f"Periodic salvage vnr checkpoint @ epoch {epoch+1}")
         if use_ddp:
             dist.barrier()
     return best_acc
@@ -691,6 +703,10 @@ def parse_args():
                         help="Also run full-val accuracy delta (slow)")
     parser.add_argument("--save_tag", default="normnet")
     parser.add_argument("--save_dir", default="./output/normalize_net")
+    parser.add_argument("--ckpt_interval", type=int, default=0,
+                        help="Save a salvage vnr checkpoint every N epochs during training "
+                             "(rank 0, non-destructive, overwrites). 0=off. Guards long "
+                             "runs against crash/hang loss.")
 
     # DDP
     parser.add_argument("--disable_ddp", action="store_true")
