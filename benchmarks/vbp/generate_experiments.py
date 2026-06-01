@@ -32,8 +32,12 @@ import stat
 BASE_OUT = os.environ.get("EXP_BASE_OUT", "/algo/NetOptimization/outputs/NORMNET/ResNet50")
 REPO = os.environ.get("EXP_REPO", "/home/avrahamra/PycharmProjects/sirc-torch-pruning")
 SCRIPT = f"{REPO}/benchmarks/vbp/normalize_net.py"
-# Pretrained dense RN50 to fine-tune under the BN trick.
-CKPT = "/algo/NetOptimization/outputs/VBP/ResNet50_TP/resnet50_imagenet1k_v1.pth"
+# Pretrained dense RN50 to fine-tune under the BN trick. v2 (80.86) over v1 (76.13):
+# v2's NATIVE eval is resize 232 (matches --val_resize 232 below, no crop mismatch), and
+# a stronger teacher = better KD. v1 at resize 232 reads ~75.89 (its native eval is 256).
+# Override via env CKPT=... if the filename differs.
+CKPT = os.environ.get(
+    "CKPT", "/algo/NetOptimization/outputs/VBP/ResNet50_TP/resnet50_imagenet1k_v2.pth")
 DATA = "/algo/NetOptimization/outputs/VBP/"
 NPROC = int(os.environ.get("EXP_NPROC", "4"))
 
