@@ -567,14 +567,22 @@ def main(argv):
     best = train_normalized(model, mgr, train_loader, val_loader, train_sampler,
                             args, device, use_ddp, teacher=teacher)
 
-    # -- Save (rank 0). Normalized: merge back + both artifacts. Baseline: plain. --
+    # -- Merge + save. merge_back() runs a COLLECTIVE all_reduce (_sync_bn_stats) so it
+    # MUST be called on ALL ranks — never inside `if is_main()` (that deadlocks: rank 0
+    # blocks in the collective while other ranks reach cleanup()). State-dict capture +
+    # file write stay rank-0-only. --
+    resolved = vnr_state = merged_state = None
+    if mgr is not None and mgr.is_active:
+        resolved = list(mgr._reparam_modules.keys())
+        if is_main():
+            vnr_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        mgr.merge_back()                       # ALL ranks (collective inside)
+        if is_main():
+            merged_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
     if is_main():
         ckpts = {}
-        if mgr is not None and mgr.is_active:
-            resolved = list(mgr._reparam_modules.keys())
-            vnr_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            mgr.merge_back()
-            merged_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        if merged_state is not None:
             ckpts["merged_biased"] = save_normnet_checkpoint(merged_state, "merged_biased", resolved, args)
             ckpts["vnr"] = save_normnet_checkpoint(vnr_state, "vnr", resolved, args)
         else:
