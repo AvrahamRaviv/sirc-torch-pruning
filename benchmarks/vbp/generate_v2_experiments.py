@@ -18,7 +18,7 @@ Run:
 import os
 import stat
 
-BASE_OUT = os.environ.get("V2_BASE_OUT", "/algo/NetOptimization/outputs/NORMNET/ResNet50_v2")
+BASE_OUT = os.environ.get("V2_BASE_OUT", "/algo/NetOptimization/outputs/NORMNET/ResNet50")
 REPO = os.environ.get("EXP_REPO", "/home/avrahamra/PycharmProjects/sirc-torch-pruning")
 SCRIPT = f"{REPO}/benchmarks/vbp/train_v2.py"
 DATA = "/algo/NetOptimization/outputs/VBP/"
