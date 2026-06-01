@@ -52,16 +52,18 @@ ARMS = [
     ("RN_baseline", "--no_reparam"),
     ("RN_bn_l0",    "--reparam_variant bn --reparam_lambda 0"),
     ("RN_bn_l1e-4", "--reparam_variant bn --reparam_lambda 1e-4"),
+    ("RN_bn_l3e-4", "--reparam_variant bn --reparam_lambda 3e-4"),
     ("RN_bn_l1e-3", "--reparam_variant bn --reparam_lambda 1e-3"),
     ("RN_bn_l3e-3", "--reparam_variant bn --reparam_lambda 3e-3"),
-    ("RN_bn_l1e-2", "--reparam_variant bn --reparam_lambda 1e-2"),
 ]
+# Dropped λ=1e-2 (dead: <0.1=99.6%, acc gutted to 0.64). Knee is below 1e-3; this ½-decade
+# ladder {1e-4,3e-4,1e-3,3e-3} gives finer resolution near it.
 
 # --- shared recipe (proven hyperparams; KD α0.5 T2.0, slow σ-EMA) ---
 COMMON = (
     f"--model_type cnn --cnn_arch resnet50 --checkpoint {CKPT} --data_path {DATA} "
     f"--epochs {EPOCHS} --opt sgd --lr {LR} --wd 1e-4 --ft_eta_min 1e-6 "
-    f"--ft_warmup_epochs {WARMUP} --train_batch_size 256 --val_resize 232 "
+    f"--ft_warmup_epochs {WARMUP} --train_batch_size 128 --val_resize 232 "
     f"--use_kd --kd_alpha 0.5 --kd_T 2.0 --norm_bn_momentum 0.01 --ckpt_interval 5"
 )
 
