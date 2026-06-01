@@ -1475,7 +1475,10 @@ class NormalizedResidualManager(BaseReparamManager):
             W = module.weight.data.clone()  # [out, in]
             b = module.bias.data.clone() if module.bias is not None else torch.zeros(
                 module.out_features, device=self.device)
-            bn_running_var = sigma_x ** 2  # BN stores variance, not std
+            # _calibrate_stats returns σ_x = sqrt(var + eps); recover the raw variance so
+            # bn_running_var + sigma_eff exactly match the pre-Fix-2 vnr init (no eps
+            # double-count) → tp_variance / vnr stays numerically backward-compatible.
+            bn_running_var = (sigma_x ** 2 - BN_EPS).clamp(min=0.0)
             # BN eval: x_bn = (x - μ) / sqrt(var + eps)
             # For v_tilde / sqrt(var + eps) = W: v_tilde = W * sqrt(var + eps)
             sigma_eff = torch.sqrt(bn_running_var + BN_EPS)
@@ -1492,7 +1495,10 @@ class NormalizedResidualManager(BaseReparamManager):
             W = module.weight.data.clone()  # [C_out, C_in, kH, kW]
             b = module.bias.data.clone() if module.bias is not None else torch.zeros(
                 module.out_channels, device=self.device)
-            bn_running_var = sigma_x ** 2  # BN stores variance, not std
+            # _calibrate_stats returns σ_x = sqrt(var + eps); recover the raw variance so
+            # bn_running_var + sigma_eff exactly match the pre-Fix-2 vnr init (no eps
+            # double-count) → tp_variance / vnr stays numerically backward-compatible.
+            bn_running_var = (sigma_x ** 2 - BN_EPS).clamp(min=0.0)
             sigma_eff = torch.sqrt(bn_running_var + BN_EPS)
             v_tilde = W * sigma_eff[None, :, None, None]
             m = b + W.sum(dim=(2, 3)) @ mu_x
