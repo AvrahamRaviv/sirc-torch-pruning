@@ -331,6 +331,8 @@ def parse_args(argv):
     p.add_argument("--save_dir", required=True); p.add_argument("--save_tag", default="v2")
     p.add_argument("--disable_ddp", action="store_true")
     p.add_argument("--log_interval", type=int, default=50)
+    p.add_argument("--local_rank", type=int,
+                        default=int(os.environ.get("LOCAL_RANK", 0)))
     return p.parse_args(argv)
 
 
