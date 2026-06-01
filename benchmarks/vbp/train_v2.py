@@ -25,6 +25,7 @@ import argparse
 import copy
 import math
 import os
+import pickle
 import random
 import sys
 
@@ -32,13 +33,11 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 import torchvision.transforms as T
 from torchvision.datasets import ImageFolder
 
-import torch_pruning as tp
-from vbp_common import load_model, validate, build_whole_net_reparam_layers
+from vbp_common import load_model, validate, build_whole_net_reparam_layers, FastImageNet
 from normalize_net import (
     build_reparam_manager, log_info, get_device, append_metrics, write_run,
     setup_logging, is_main, _broadcast_model_state,
@@ -93,11 +92,20 @@ def build_loaders(args, use_ddp):
         T.Resize(args.val_resize, interpolation=T.InterpolationMode.BILINEAR),
         T.CenterCrop(224), T.ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
-    train_dir = os.path.join(args.data_path, "train")
-    val_dir = os.path.join(args.data_path, "val")
-    train_dst = ImageFolder(train_dir, transform=train_tf)
-    val_dst = ImageFolder(val_dir, transform=val_tf)
-    calib_dst = ImageFolder(train_dir, transform=calib_tf)
+    # Match vbp_common.build_dataloaders: cached pickle sample-lists (FastImageNet) fast
+    # path, ImageFolder only as fallback. The cluster has <data_path>/{train,val}_samples.pkl,
+    # NOT a {train,val}/ ImageFolder tree.
+    def _make_dst(split, transform):
+        pkl = os.path.join(args.data_path, f"{split}_samples.pkl")
+        if os.path.exists(pkl):
+            with open(pkl, "rb") as f:
+                samples = pickle.load(f)
+            return FastImageNet(samples, transform=transform)
+        return ImageFolder(os.path.join(args.data_path, split), transform=transform)
+
+    train_dst = _make_dst("train", train_tf)
+    val_dst = _make_dst("val", val_tf)
+    calib_dst = _make_dst("train", calib_tf)   # clean transform on train images for σ,μ
 
     if use_ddp:
         train_sampler = RASampler(train_dst, args.world_size, args.rank, reps=args.ra_reps)
