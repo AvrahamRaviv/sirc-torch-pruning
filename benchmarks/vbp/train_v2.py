@@ -191,9 +191,12 @@ def train_one_epoch(model, loader, sampler, optimizer, device, epoch, args, crit
     model.train()
     if sampler is not None and hasattr(sampler, "set_epoch"):
         sampler.set_epoch(epoch)
-    n = len(loader); log_every = max(1, n // 20)
+    n = len(loader) if not args.limit_batches else min(args.limit_batches, len(loader))
+    log_every = max(1, n // 20)
     running = 0.0
     for i, (x, y) in enumerate(loader):
+        if args.limit_batches and i >= args.limit_batches:
+            break
         x = x.to(device, non_blocking=True); y = y.to(device, non_blocking=True)
         x, ya, yb, lam = mixup_cutmix(x, y, args.mixup_alpha, args.cutmix_alpha)
         out = model(x)
@@ -205,6 +208,20 @@ def train_one_epoch(model, loader, sampler, optimizer, device, epoch, args, crit
         if is_main() and (i % log_every == 0 or i == n - 1):
             log_info(f"  [e{epoch+1} {i+1}/{n}] loss={loss.item():.4f} lr={optimizer.param_groups[0]['lr']:.4f}")
     return running / max(1, n)
+
+
+@torch.no_grad()
+def _eval(model, loader, device, args):
+    """Top-1. Full val via vbp_common.validate, or a quick N-batch pass when --limit_batches."""
+    if not args.limit_batches:
+        return validate(model, loader, device, args.model_type)[0]
+    model.eval(); correct = total = 0
+    for i, (x, y) in enumerate(loader):
+        if i >= args.limit_batches:
+            break
+        x = x.to(device, non_blocking=True); y = y.to(device, non_blocking=True)
+        correct += (model(x).argmax(1) == y).sum().item(); total += y.numel()
+    return correct / max(total, 1)
 
 
 def _unwrap(m):
@@ -266,8 +283,8 @@ def main(argv):
             ema.update(_unwrap(train_model))
 
         if is_main():
-            acc, _ = validate(_unwrap(train_model), val_loader, device, args.model_type)
-            ema_acc = (validate(ema.shadow, val_loader, device, args.model_type)[0]
+            acc = _eval(_unwrap(train_model), val_loader, device, args)
+            ema_acc = (_eval(ema.shadow, val_loader, device, args)
                        if ema is not None else None)
             log_info(f"[{arm}] Epoch {epoch+1}/{args.epochs}: train_loss={train_loss:.4f} "
                      f"val_acc={acc:.4f}" + (f" ema_acc={ema_acc:.4f}" if ema_acc else "")
@@ -288,9 +305,8 @@ def main(argv):
         os.makedirs(args.save_dir, exist_ok=True)
         path = os.path.join(args.save_dir, f"{args.save_tag}.pth")
         torch.save({k: v.detach().cpu().clone() for k, v in _unwrap(train_model).state_dict().items()}, path)
-        final, _ = validate(_unwrap(train_model), val_loader, device, args.model_type)
-        ema_final = (validate(ema.shadow, val_loader, device, args.model_type)[0]
-                     if ema is not None else None)
+        final = _eval(_unwrap(train_model), val_loader, device, args)
+        ema_final = (_eval(ema.shadow, val_loader, device, args) if ema is not None else None)
         log_info(f"DONE arm={arm}: final acc={final:.4f}"
                  + (f" ema={ema_final:.4f}" if ema_final else "") + f" → {path}")
         write_run(args, {"status": "done", "arm": arm, "config": vars(args),
@@ -339,6 +355,9 @@ def parse_args(argv):
     p.add_argument("--save_dir", required=True); p.add_argument("--save_tag", default="v2")
     p.add_argument("--disable_ddp", action="store_true")
     p.add_argument("--log_interval", type=int, default=50)
+    p.add_argument("--limit_batches", type=int, default=0,
+                   help="cap train + val batches per epoch (0=full). Use 2-3 for a fast "
+                        "functionality check.")
     p.add_argument("--local_rank", type=int,
                         default=int(os.environ.get("LOCAL_RANK", 0)))
     return p.parse_args(argv)

@@ -39,10 +39,13 @@ COMMON = (
 ARMS = [
     ("v2_baseline", "--reparam_at_epoch -1"),
     (f"v2_switch_e{SWITCH_EPOCH}", f"--reparam_at_epoch {SWITCH_EPOCH}"),
-    # 3-epoch smokes (run these FIRST to validate wiring: recipe, DDP, the switch).
-    # --epochs/--warmup_epochs after COMMON → argparse last-wins overrides the 100ep values.
-    ("v2_smoke_baseline", "--epochs 3 --warmup_epochs 1 --reparam_at_epoch -1"),
-    ("v2_smoke_switch_e1", "--epochs 3 --warmup_epochs 1 --reparam_at_epoch 1"),
+    # Fast functionality smokes (3 epochs × 3 batches each → ~1-2 min). Validate the recipe,
+    # DDP, and the switch wiring. --epochs/--warmup/--limit_batches/--calib_batches after
+    # COMMON → argparse last-wins overrides the 100ep values.
+    ("v2_smoke_baseline",
+     "--epochs 3 --warmup_epochs 1 --limit_batches 3 --calib_batches 3 --reparam_at_epoch -1"),
+    ("v2_smoke_switch_e1",
+     "--epochs 3 --warmup_epochs 1 --limit_batches 3 --calib_batches 3 --reparam_at_epoch 1"),
 ]
 
 SH = (
