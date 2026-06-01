@@ -118,8 +118,17 @@ def main(argv):
 
     # -- 3. PRUNE (magnitude of normalized weight = NCI, via stock MagnitudePruner) ------
     if not args.no_prune:
+        # DDP: σ buffers diverge per rank (local EMA); sync them, extract, then broadcast
+        # the scores rank0→all so every rank prunes the SAME mask (else shape-mismatch hang).
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            mgr._sync_bn_stats()
         scores = extract_normnet_scores(
             mgr, args.scorer, example_inputs=(ex if args.scorer == "propagation" else None))
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            for k in list(scores.keys()):
+                t = scores[k].contiguous()
+                torch.distributed.broadcast(t, src=0)
+                scores[k] = t
         mgr.merge_back()                        # back to plain modules for the tp pruner
         imp = NormalizedNetImportance(model, scores, group_reduction="mean", normalizer="mean")
         ignored = [model.fc] if hasattr(model, "fc") else []
