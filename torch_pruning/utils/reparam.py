@@ -207,7 +207,7 @@ class BNResidualLinear(nn.Module):
     """
 
     def __init__(self, in_features, out_features, v_tilde, m, bn_running_mean,
-                 bn_running_var, bn_momentum=0.1):
+                 bn_running_var, bn_momentum=0.1, sigma_out_x=None):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -216,6 +216,10 @@ class BNResidualLinear(nn.Module):
         self.bn.running_var.copy_(bn_running_var)
         self.v_tilde = nn.Parameter(v_tilde)  # [out, in] — operates on normalized input
         self.m = nn.Parameter(m)              # [out] — channel means
+        # Per-OUTPUT-channel std (calibration), for propagation branch weighting (M3).
+        if sigma_out_x is None:
+            sigma_out_x = torch.ones(out_features, device=m.device, dtype=m.dtype)
+        self.register_buffer('sigma_out_x', sigma_out_x)
 
     def forward(self, x):
         # Update EMA running stats in train mode (no grad), then normalize by RUNNING
@@ -252,7 +256,7 @@ class BNResidualConv2d(nn.Module):
 
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
                  dilation, groups, v_tilde, m, bn_running_mean, bn_running_var,
-                 bn_momentum=0.1):
+                 bn_momentum=0.1, sigma_out_x=None):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -266,6 +270,10 @@ class BNResidualConv2d(nn.Module):
         self.bn.running_var.copy_(bn_running_var)
         self.v_tilde = nn.Parameter(v_tilde)  # [C_out, C_in, kH, kW]
         self.m = nn.Parameter(m)              # [C_out]
+        # Per-OUTPUT-channel std (calibration), for propagation branch weighting (M3).
+        if sigma_out_x is None:
+            sigma_out_x = torch.ones(out_channels, device=m.device, dtype=m.dtype)
+        self.register_buffer('sigma_out_x', sigma_out_x)
 
     def forward(self, x):
         # Update BN running stats in training mode (no gradient, discard output)
@@ -1078,17 +1086,21 @@ class MeanResidualManager(BaseReparamManager):
         try:
             for name, rp in list(self._reparam_modules.items()):
                 weight, bias = rp.merge_params()
-                if isinstance(rp, MeanResidualLinear):
+                # Recognize by attribute so BOTH variants swap (MeanResidual* and
+                # BNResidual* share in_features / in_channels). DG can't trace the custom
+                # reparam modules, so we temporarily install function-preserving plain
+                # nn.Linear/Conv2d, trace, then restore in the finally block.
+                if hasattr(rp, 'in_features'):    # Linear (mean or bn)
                     tmp = nn.Linear(rp.in_features, rp.out_features, bias=True)
                     tmp.weight.data.copy_(weight); tmp.bias.data.copy_(bias)
-                elif isinstance(rp, MeanResidualConv2d):
+                elif hasattr(rp, 'in_channels'):  # Conv2d (mean or bn)
                     tmp = nn.Conv2d(rp.in_channels, rp.out_channels,
                                     kernel_size=rp.kernel_size, stride=rp.stride,
                                     padding=rp.padding, dilation=rp.dilation,
                                     groups=rp.groups, bias=True)
                     tmp.weight.data.copy_(weight); tmp.bias.data.copy_(bias)
                 else:
-                    continue  # bn variant or other — skip
+                    continue
                 tmp = tmp.to(weight.device)
                 saved[name] = rp
                 self._replace_module(name, tmp)
@@ -1403,6 +1415,17 @@ class MeanResidualManager(BaseReparamManager):
         return stats
 
 
+# The propagation criterion (build_propagation_topology / propagation_importance and
+# helpers) is variant-agnostic: it reads only _contribution_weight + sigma_out_x, both
+# present on the mean AND bn modules, and the topology swap recognizes either variant by
+# attribute. It lives on MeanResidualManager for historical reasons; promote it onto the
+# base class so NormalizedResidualManager (bn / canonical) inherits it too (Fix 2).
+for _pm in ("build_propagation_topology", "_build_topology_from_dg",
+            "propagation_importance", "_propagate_dag"):
+    setattr(BaseReparamManager, _pm, getattr(MeanResidualManager, _pm))
+del _pm
+
+
 # =====================================================================
 # NormalizedResidualManager (VNR)
 # =====================================================================
@@ -1438,88 +1461,14 @@ class NormalizedResidualManager(BaseReparamManager):
         self.bn_momentum = float(bn_momentum)
 
     def _calibrate(self, targets, loader):
-        """Calibrate μ_x and σ_x. Returns dict[name → (μ_x, σ_x)]."""
-        accumulators = {}
-        hooks = []
-
-        for name, module in targets.items():
-            acc = {'sum': None, 'sum_sq': None, 'count': 0}
-            accumulators[name] = acc
-            is_linear = isinstance(module, nn.Linear)
-
-            def make_hook(acc_ref, is_linear):
-                def hook(mod, inp, out):
-                    x = inp[0].detach()
-                    if x.dim() < 2:
-                        return
-                    # Linear: channel = last dim (2D, 3D ViT, 4D channels-last).
-                    # Conv2d: channel = dim 1 (NCHW).
-                    if is_linear:
-                        reduce_dims = tuple(range(x.dim() - 1))
-                    else:
-                        reduce_dims = (0,) + tuple(range(2, x.dim()))
-                    batch_mean = x.mean(dim=reduce_dims)
-                    batch_mean_sq = (x * x).mean(dim=reduce_dims)
-                    n = x.shape[0]
-                    if acc_ref['sum'] is None:
-                        acc_ref['sum'] = batch_mean * n
-                        acc_ref['sum_sq'] = batch_mean_sq * n
-                    else:
-                        acc_ref['sum'] += batch_mean * n
-                        acc_ref['sum_sq'] += batch_mean_sq * n
-                    acc_ref['count'] += n
-                return hook
-
-            hooks.append(module.register_forward_hook(make_hook(acc, is_linear)))
-
-        try:
-            self.model.eval()
-            with torch.no_grad():
-                for batch_idx, batch in enumerate(loader):
-                    if batch_idx >= self.max_batches:
-                        break
-                    if isinstance(batch, (list, tuple)):
-                        images = batch[0]
-                    else:
-                        images = batch
-                    images = images.to(self.device, non_blocking=True)
-                    self.model(images)
-        finally:
-            for h in hooks:
-                h.remove()
-
-        cal_dict = OrderedDict()
-        cls_name = type(self).__name__
-        for name, acc in accumulators.items():
-            if acc['sum'] is not None and acc['count'] > 0:
-                mu_x = acc['sum'] / acc['count']
-                mean_sq = acc['sum_sq'] / acc['count']
-                variance = (mean_sq - mu_x * mu_x).clamp(min=MIN_VARIANCE)
-                sigma_x = variance.sqrt().clamp(min=MIN_SIGMA)
-                cal_dict[name] = (mu_x, sigma_x)
-            else:
-                module = targets[name]
-                if isinstance(module, nn.Linear):
-                    d = module.in_features
-                elif isinstance(module, nn.Conv2d):
-                    d = module.in_channels
-                elif hasattr(module, 'mu_x'):
-                    d = module.mu_x.shape[0]
-                else:
-                    d = 1
-                cal_dict[name] = (
-                    torch.zeros(d, device=self.device),
-                    torch.ones(d, device=self.device),
-                )
-                _log_warning(f"{cls_name}: no data for '{name}', using zero μ_x / unit σ_x")
-
-        _log_info(f"{cls_name}: calibrated μ_x, σ_x for {len(cal_dict)} modules "
-                     f"({sum(a['count'] for a in accumulators.values()) // max(len(accumulators), 1)} samples avg)")
-        return cal_dict
+        """Calibrate (μ_x, σ_x, σ_out_x) via the shared per-layer stats hook (same routine
+        the mean variant uses). The 3rd element — per-output-channel std — feeds propagation
+        branch weighting (M3); v_tilde still uses σ_x (input std) for the BN-form weight."""
+        return self._calibrate_stats(targets, loader)
 
     def _make_reparam(self, module, calibration_data):
         """Create BNResidual* module from standard nn.Linear/Conv2d."""
-        mu_x, sigma_x = calibration_data
+        mu_x, sigma_x, sigma_out_x = calibration_data
         BN_EPS = 1e-5  # default nn.BatchNorm eps
 
         if isinstance(module, nn.Linear):
@@ -1536,7 +1485,7 @@ class NormalizedResidualManager(BaseReparamManager):
                 module.in_features, module.out_features,
                 v_tilde=v_tilde, m=m,
                 bn_running_mean=mu_x, bn_running_var=bn_running_var,
-                bn_momentum=self.bn_momentum)
+                bn_momentum=self.bn_momentum, sigma_out_x=sigma_out_x)
             return reparam.to(self.device)
 
         elif isinstance(module, nn.Conv2d):
@@ -1553,7 +1502,7 @@ class NormalizedResidualManager(BaseReparamManager):
                 padding=module.padding, dilation=module.dilation,
                 groups=module.groups, v_tilde=v_tilde, m=m,
                 bn_running_mean=mu_x, bn_running_var=bn_running_var,
-                bn_momentum=self.bn_momentum)
+                bn_momentum=self.bn_momentum, sigma_out_x=sigma_out_x)
             return reparam.to(self.device)
 
         raise TypeError(f"Unsupported module type: {type(module)}")

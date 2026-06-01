@@ -249,6 +249,7 @@ def _merge_vnr_state_dict(state, eps=1e-5):
             prefix + ".v_tilde", prefix + ".m",
             prefix + ".bn.running_mean", prefix + ".bn.running_var",
             prefix + ".bn.num_batches_tracked",
+            prefix + ".sigma_out_x",  # score-only buffer (propagation branch weight), drop
         ])
 
     for prefix in mean_prefixes:

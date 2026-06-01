@@ -936,6 +936,24 @@ def test_e2_build_scorer_and_prune_resnet18():
         assert model(torch.randn(2, 3, 64, 64)).shape == (2, 1000)
 
 
+def test_propagation_on_bn_variant():
+    """Fix 2: the bn (canonical) variant now carries sigma_out_x + inherits propagation
+    from Base, so propagation_importance runs on a bn-reparam'd net (was mean-only)."""
+    from torch_pruning.utils.reparam import NormalizedResidualManager
+
+    model = TinyCNN()
+    mgr = NormalizedResidualManager(model, build_whole_net_reparam_layers(model),
+                                    CPU, lambda_reg=0.0, max_batches=2)
+    mgr.reparameterize(_img_loader())
+    # sigma_out_x populated by calibration (not the unit-default placeholder).
+    rp0 = next(iter(mgr._reparam_modules.values()))
+    assert rp0.sigma_out_x.std().item() > 0
+    ex = torch.randn(1, 3, 8, 8)
+    topo = mgr.build_propagation_topology(ex)
+    I = mgr.propagation_importance(topology=topo)
+    assert I and all(v.dim() == 1 and v.numel() > 0 for v in I.values())
+
+
 def test_normnet_vbppruner_with_compensation_resnet18():
     """Fix 3 core: VBPPruner ranks by NormalizedNetImportance (NCI) AND compensates via a
     mean_dict — the exact DDP-harness mechanism. Compensation ON (mean_dict) and OFF

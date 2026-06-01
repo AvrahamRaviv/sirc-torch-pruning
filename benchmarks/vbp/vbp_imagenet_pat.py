@@ -100,19 +100,15 @@ def build_pruning_config(args, model, config_dir):
     # NORMNET (paper NCI criterion) guards: scores are extracted ONCE from the active
     # reparam manager and frozen, so the harness must (a) run a reparam sparse phase so a
     # manager exists, (b) prune one-shot on a linear schedule (frozen scores go stale after
-    # any structural step). propagation additionally needs σ_out branch weighting = mean
-    # variant (sparse_mode reparam) until Fix 2 lands on the bn variant.
+    # any structural step). Both variants now carry σ_out (Fix 2), so propagation runs on
+    # vnr (bn) and reparam (mean) alike.
     if args.criterion == "normnet":
-        imode = getattr(args, "importance_mode", "normnet_per_layer")
         if args.sparse_mode not in ("reparam", "vnr"):
             raise ValueError("--criterion normnet needs a reparam manager: set "
-                             "--sparse_mode vnr (per_layer) or reparam (per_layer/propagation).")
+                             "--sparse_mode vnr (bn, canonical) or reparam (mean).")
         if args.pat_steps != 1 or args.pruning_schedule != "linear":
             raise ValueError("--criterion normnet is one-shot: use --pat_steps 1 and "
                              "--pruning_schedule linear (frozen scores break iterative/geometric).")
-        if imode == "normnet_propagation" and args.sparse_mode != "reparam":
-            raise ValueError("--importance_mode normnet_propagation needs the mean variant "
-                             "(σ_out branch weighting): use --sparse_mode reparam.")
 
     reparam_layers = build_reparam_layers(model, args.model_type,
                                            getattr(args, 'cnn_arch', None),
