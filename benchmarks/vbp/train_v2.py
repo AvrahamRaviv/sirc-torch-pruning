@@ -260,6 +260,15 @@ def main(argv):
         # ---- continuous switch to normalized coordinates ----
         if mgr is None and args.reparam_at_epoch >= 0 and epoch == args.reparam_at_epoch:
             raw = _unwrap(train_model)
+            # Save the PLAIN net right before normalizing. Only the weights are needed to
+            # retry the switch with a different lr — optimizer is rebuilt and σ,μ are
+            # re-calibrated at switch time (deterministic from these weights). Retry via:
+            #   --checkpoint <preswitch> --reparam_at_epoch 0 --epochs <remaining> --lr <new>
+            if is_main():
+                os.makedirs(args.save_dir, exist_ok=True)
+                pre = os.path.join(args.save_dir, f"{args.save_tag}_preswitch_e{epoch}.pth")
+                torch.save({k: v.detach().cpu().clone() for k, v in raw.state_dict().items()}, pre)
+                log_info(f"saved pre-switch checkpoint → {pre}")
             names = build_whole_net_reparam_layers(
                 raw, exclude_classifier=True, exclude_stem=args.exclude_stem)
             args.max_batches = args.calib_batches
