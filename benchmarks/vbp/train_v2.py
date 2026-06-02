@@ -56,8 +56,12 @@ class RASampler(torch.utils.data.Sampler):
     def __init__(self, dataset, num_replicas, rank, shuffle=True, reps=4):
         self.dataset = dataset; self.num_replicas = num_replicas; self.rank = rank
         self.shuffle = shuffle; self.reps = reps; self.epoch = 0
+        # stride basis for the reps-expanded pool …
         self.num_samples = math.ceil(len(dataset) * reps / num_replicas)
         self.total_size = self.num_samples * num_replicas
+        # … but each rank YIELDS only len/world per epoch (torchvision RASampler), so one
+        # epoch ≈ one pass over the data (drawn from the reps-repeated pool), NOT reps passes.
+        self.num_selected = len(dataset) // num_replicas
 
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -68,10 +72,10 @@ class RASampler(torch.utils.data.Sampler):
                else torch.arange(len(self.dataset))).tolist()
         idx = [i for i in idx for _ in range(self.reps)][:self.total_size]
         idx = idx[self.rank:self.total_size:self.num_replicas]
-        return iter(idx[:self.num_samples])
+        return iter(idx[:self.num_selected])
 
     def __len__(self):
-        return self.num_samples
+        return self.num_selected
 
 
 def build_loaders(args, use_ddp):
