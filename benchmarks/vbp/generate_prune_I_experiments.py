@@ -44,10 +44,13 @@ MAC_TARGET_G = float(os.environ.get("MAC_TARGET_G", "2.0"))   # GMAC budget
 FT = int(os.environ.get("FT_EPOCHS", "30"))                    # post-prune FT (DDP)
 A_REG = int(os.environ.get("A_REG_EPOCHS", "5"))              # Option A short λ-reg norm-ft
 
-# Completed RN_bn sparse vnr ckpts to prune (Option B). l1e-4 ≈ 20% channels <0.1, l3e-4 ≈ 65%.
+# Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
+# ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
+# (edit RN_CKPTS to point at it). Until then only Option A (self-contained from 80.86) runs.
+INCLUDE_B = os.environ.get("INCLUDE_OPTION_B", "0") != "0"
 RN_CKPTS = {
-    "l1e-4": f"{BASE_OUT}/RN_bn_l1e-4/RN_bn_l1e-4_vnr.pth",
-    "l3e-4": f"{BASE_OUT}/RN_bn_l3e-4/RN_bn_l3e-4_vnr.pth",
+    "l1e-3": f"{BASE_OUT}/RN_bn_l1e-3/RN_bn_l1e-3_vnr.pth",
+    "l3e-3": f"{BASE_OUT}/RN_bn_l3e-3/RN_bn_l3e-3_vnr.pth",
 }
 
 # Shared knobs for both routes (reparam mean for propagation σ_out; KD on; bs 128 for DDP×4).
@@ -85,10 +88,12 @@ def _write(tag, ckpt, extra, rflag):
 
 def main():
     made = []
-    # OPTION B — propagation (rel + nonrel) on each completed RN_bn vnr ckpt.
-    for lam, ckpt in RN_CKPTS.items():
-        for rname, rflag in REL_VARIANTS:
-            made.append(_write(f"B_prop_{rname}_{lam}", ckpt, B_EXTRA, rflag))
+    # OPTION B — propagation (rel + nonrel) on a pre-regularized RN_bn vnr ckpt.
+    # OFF unless INCLUDE_OPTION_B=1 (all RN_bn ckpts currently lost).
+    if INCLUDE_B:
+        for lam, ckpt in RN_CKPTS.items():
+            for rname, rflag in REL_VARIANTS:
+                made.append(_write(f"B_prop_{rname}_{lam}", ckpt, B_EXTRA, rflag))
     # OPTION A — propagation (rel + nonrel) from the dense 80.86.
     for rname, rflag in REL_VARIANTS:
         made.append(_write(f"A_prop_{rname}", DENSE_8086, A_EXTRA, rflag))
