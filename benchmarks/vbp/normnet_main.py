@@ -208,37 +208,38 @@ def main(argv):
     _run_phase(model, mgr, loaders, args, device, use_ddp,
                epochs=args.epochs_norm_ft, lr=args.lr_norm_ft, tag="NORM-FT", teacher=teacher)
 
-    # -- 3. PRUNE (magnitude of normalized weight = NCI, via stock MagnitudePruner) ------
+    # -- 3. PRUNE — normnet criterion (per_layer/propagation) OR a classical tp baseline ---
+    _NORMNET_SCORERS = ("per_layer", "propagation")
     if not args.no_prune:
-        # DDP: σ buffers diverge per rank (local EMA); sync them, extract, then broadcast
-        # the scores rank0→all so every rank prunes the SAME mask (else shape-mismatch hang).
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            mgr._sync_bn_stats()
-        # PDF seed: propagation runs to the classifier (I^o = 𝟙 over classes, back through
-        # W̄^fc). Pass the classifier so the final-stage features get real importance instead
-        # of a uniform tie (which global pruning guts).
-        clf = model.fc if hasattr(model, "fc") else None
-        scores = extract_normnet_scores(
-            mgr, args.scorer, example_inputs=(ex if args.scorer == "propagation" else None),
-            relative=not args.prop_non_relative, classifier=clf)
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            for k in list(scores.keys()):
-                t = scores[k].contiguous()
-                torch.distributed.broadcast(t, src=0)
-                scores[k] = t
-        # score distribution (how many channels the criterion ranks near-zero, per layer
-        # + global) — tells whether the ranking is concentrated or flat/degenerate.
-        n0 = sum(int((s < 0.1).sum()) for s in scores.values())
-        ntot = sum(s.numel() for s in scores.values())
-        cvs = [float(s.std() / (s.mean() + 1e-12)) for s in scores.values() if s.numel() > 1]
-        cv_med = sorted(cvs)[len(cvs) // 2] if cvs else 0.0
-        log_info(f"scores ({args.scorer}): {ntot} channels, {n0} below 0.1 "
-                 f"({100.0 * n0 / max(ntot, 1):.1f}%), median per-layer CV={cv_med:.3f}")
+        scores = None
+        if args.scorer in _NORMNET_SCORERS:
+            # DDP: σ buffers diverge per rank (local EMA); sync, extract, then broadcast the
+            # scores rank0→all so every rank prunes the SAME mask (else shape-mismatch hang).
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                mgr._sync_bn_stats()
+            # PDF seed: propagation runs to the classifier (I^o = 𝟙 over classes, back through
+            # W̄^fc) → final-stage features get real importance instead of a uniform tie.
+            clf = model.fc if hasattr(model, "fc") else None
+            scores = extract_normnet_scores(
+                mgr, args.scorer, example_inputs=(ex if args.scorer == "propagation" else None),
+                relative=not args.prop_non_relative, classifier=clf)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                for k in list(scores.keys()):
+                    t = scores[k].contiguous()
+                    torch.distributed.broadcast(t, src=0)
+                    scores[k] = t
+            n0 = sum(int((s < 0.1).sum()) for s in scores.values())
+            ntot = sum(s.numel() for s in scores.values())
+            cvs = [float(s.std() / (s.mean() + 1e-12)) for s in scores.values() if s.numel() > 1]
+            cv_med = sorted(cvs)[len(cvs) // 2] if cvs else 0.0
+            log_info(f"scores ({args.scorer}): {ntot} channels, {n0} below 0.1 "
+                     f"({100.0 * n0 / max(ntot, 1):.1f}%), median per-layer CV={cv_med:.3f}")
+        else:
+            log_info(f"classical scorer ({args.scorer}) — stock tp importance, no normnet scores")
 
         mgr.merge_back()                        # back to plain modules for the tp pruner
         # Save the pre-prune (post-norm-ft, merged) DENSE net so a prune+FT can be retried
-        # without redoing training: --checkpoint <preprune> --epochs_norm_ft 0 → normalize →
-        # prune → FT. Plain state_dict (σ re-calibrated on reload). rank 0 only.
+        # without redoing training: --checkpoint <preprune> --epochs_norm_ft 0.
         if is_main() and not args.no_save_preprune:
             from ckpt import save_ckpt
             pp = os.path.join(args.save_dir, f"{args.save_tag}_preprune.pth")
@@ -248,6 +249,10 @@ def main(argv):
         pre_w = _layer_widths(model)            # widths before the structural edit
 
         def _imp(mdl):
+            if args.scorer == "magnitude":
+                return tp.importance.GroupMagnitudeImportance(p=2, group_reduction="mean", normalizer="mean")
+            if args.scorer == "bn_scale":
+                return tp.importance.BNScaleImportance()
             return NormalizedNetImportance(mdl, scores, group_reduction="mean", normalizer="mean")
 
         def _ignored(mdl):
@@ -342,7 +347,11 @@ def parse_args(argv):
     p.add_argument("--calib_batches", type=int, default=50)
     # 3. prune
     p.add_argument("--no_prune", action="store_true")
-    p.add_argument("--scorer", default="per_layer", choices=["per_layer", "propagation"])
+    p.add_argument("--scorer", default="per_layer",
+                   choices=["per_layer", "propagation", "magnitude", "bn_scale"],
+                   help="normnet: per_layer (‖σv‖=√NCI) / propagation (I). classical baselines "
+                        "(same harness, no normnet scores): magnitude (group L2) / bn_scale "
+                        "(network-slimming BN γ).")
     p.add_argument("--prop_non_relative", action="store_true",
                    help="propagation: W̄=M^p (non-relative, drop column-normalizer D). "
                         "Default = relative W̄=M^p·D.")

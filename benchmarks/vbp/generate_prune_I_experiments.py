@@ -48,6 +48,7 @@ A_REG = int(os.environ.get("A_REG_EPOCHS", "5"))              # Option A short �
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
 # (edit RN_CKPTS to point at it). Until then only Option A (self-contained from 80.86) runs.
 INCLUDE_B = os.environ.get("INCLUDE_OPTION_B", "0") != "0"
+INCLUDE_CLASSICAL = os.environ.get("INCLUDE_CLASSICAL", "1") != "0"   # magnitude + bn_scale
 RN_CKPTS = {
     "l1e-3": f"{BASE_OUT}/RN_bn_l1e-3/RN_bn_l1e-3_vnr.pth",
     "l3e-3": f"{BASE_OUT}/RN_bn_l3e-3/RN_bn_l3e-3_vnr.pth",
@@ -103,6 +104,12 @@ def main():
     # OPTION A0 — same, NO sparse phase (prune at init) → does the reg phase help?
     for rname, rflag in REL_VARIANTS:
         made.append(_write(f"A0_prop_{rname}", DENSE_8086, A0_EXTRA, rflag))
+    # CLASSICAL baselines (same harness: 80.86, mac 2G global, KD, no sparse phase). The
+    # --scorer override (last-wins over SHARED's propagation) swaps the criterion. These are
+    # the controls that should recover — magnitude/bn_scale lack the propagation gutting.
+    if INCLUDE_CLASSICAL:
+        for sc in ("magnitude", "bn_scale"):
+            made.append(_write(f"C0_{sc}", DENSE_8086, A0_EXTRA, f" --scorer {sc}"))
 
     print(f"\n{len(made)} experiments (mac_target={MAC_TARGET_G}G, FT={FT} DDP×{NPROC}, "
           f"A_reg={A_REG}). Submit each:")
