@@ -135,4 +135,8 @@ class NormalizedNetImportance(GroupMagnitudeImportance):
             return super().__call__(group) if self.fallback else None
 
         reduced = self._reduce(group_imp, group_idxs)
-        return self._normalize(reduced, self.normalizer)
+        out = self._normalize(reduced, self.normalizer)
+        # normalizer="mean" divides by the group mean with no eps: a fully zeroed group
+        # (e.g. a heavily λ-regularized layer) → mean≈0 → nan, which would corrupt the
+        # global pruning sort. nan→0 makes those dead channels rank as prunable (correct).
+        return torch.nan_to_num(out, nan=0.0)
