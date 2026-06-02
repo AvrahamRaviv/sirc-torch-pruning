@@ -43,13 +43,16 @@ _IN_FNS = (function.prune_conv_in_channels, function.prune_linear_in_channels)
 
 def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
                                  I_out=None, p=2, conv_reduction="frobenius",
-                                 on_mismatch="warn"):
+                                 on_mismatch="warn", relative=True):
     """Pull per-input-channel scores from an ACTIVE reparam manager.
 
     mode="per_layer"   → mgr.input_channel_scores()  (‖σ·v‖ = √NCI, the §2 criterion).
     mode="propagation" → mgr.propagation_importance() (the §3 global criterion).
         Pass example_inputs to build the residual/DAG topology (build_propagation_topology
         with the SAME p); omit it for a pure sequential walk.
+        `relative` picks the PDF's two derivations: True (default) → W̄=M^p·D (column-
+        normalized, mass-preserving); False → W̄=M^p (non-relative, magnitudes compound
+        through depth). Ignored for mode="per_layer".
 
     Returns OrderedDict[name → 1-D tensor], one score per input channel of that layer.
     Must be called before mgr.merge_back().
@@ -62,18 +65,22 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
             topo = mgr.build_propagation_topology(example_inputs, p=p)
         return mgr.propagation_importance(
             I_out=I_out, p=p, conv_reduction=conv_reduction,
-            on_mismatch=on_mismatch, topology=topo)
+            on_mismatch=on_mismatch, topology=topo, relative=relative)
     raise ValueError(f"mode must be 'per_layer' or 'propagation', got {mode!r}")
 
 
 def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
-                           conv_reduction="frobenius", on_mismatch="warn"):
+                           conv_reduction="frobenius", on_mismatch="warn",
+                           relative=True):
     """Score extraction with the propagation-needs-mean-variant guard, shared by the
     single-GPU (prune_e2) and DDP (pruning_utils) paths.
 
     propagation needs per-branch output std (sigma_out_x), which only the mean variant
     tracks → propagation_importance is a mean-manager method. The bn (canonical) variant
     has no propagation_importance yet, so guard with a clear error.
+
+    `relative` (propagation only): True → relative W̄=M^p·D (default); False → non-
+    relative W̄=M^p (raw normalized-weight product, compounds through depth).
     """
     if mode == "propagation" and not hasattr(mgr, "propagation_importance"):
         raise ValueError(
@@ -82,7 +89,7 @@ def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
             "with the mean variant (--sparse_mode reparam / --reparam_variant mean).")
     return extract_input_channel_scores(
         mgr, mode=mode, example_inputs=example_inputs, p=p,
-        conv_reduction=conv_reduction, on_mismatch=on_mismatch)
+        conv_reduction=conv_reduction, on_mismatch=on_mismatch, relative=relative)
 
 
 class NormalizedNetImportance(GroupMagnitudeImportance):

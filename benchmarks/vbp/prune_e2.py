@@ -136,8 +136,12 @@ def build_scorer(scorer, model, calib_loader, device, args, ex, mgr=None):
     else:
         log_info("σ from sparse phase (no cold recalibration)")
     mode = "per_layer" if scorer == "per_layer" else "propagation"
+    non_relative = getattr(args, "prop_non_relative", False)
     scores = extract_normnet_scores(
-        mgr, mode, example_inputs=(ex if mode == "propagation" else None), p=2)
+        mgr, mode, example_inputs=(ex if mode == "propagation" else None), p=2,
+        relative=not non_relative)
+    if mode == "propagation":
+        log_info(f"propagation: {'NON-relative (W̄=M^p)' if non_relative else 'relative (W̄=M^p·D)'}")
     mgr.merge_back()
     n0 = sum(int((s < 0.1).sum()) for s in scores.values())
     ntot = sum(s.numel() for s in scores.values())
@@ -158,6 +162,10 @@ def main(argv):
     # scorer / pruning
     ap.add_argument("--scorer", required=True,
                     choices=["magnitude", "per_layer", "propagation"])
+    ap.add_argument("--prop_non_relative", action="store_true",
+                    help="propagation: drop the column-normalizer D → W̄=M^p (the PDF "
+                         "non-relative I; magnitudes compound through depth). Default off "
+                         "= relative W̄=M^p·D (mass-preserving per layer).")
     ap.add_argument("--pruning_ratio", type=float, default=0.5)
     ap.add_argument("--global_pruning", action="store_true",
                     help="cross-layer global ranking (criterion-4 setting). "

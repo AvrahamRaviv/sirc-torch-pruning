@@ -123,7 +123,8 @@ def main(argv):
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             mgr._sync_bn_stats()
         scores = extract_normnet_scores(
-            mgr, args.scorer, example_inputs=(ex if args.scorer == "propagation" else None))
+            mgr, args.scorer, example_inputs=(ex if args.scorer == "propagation" else None),
+            relative=not args.prop_non_relative)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             for k in list(scores.keys()):
                 t = scores[k].contiguous()
@@ -191,6 +192,9 @@ def parse_args(argv):
     # 3. prune
     p.add_argument("--no_prune", action="store_true")
     p.add_argument("--scorer", default="per_layer", choices=["per_layer", "propagation"])
+    p.add_argument("--prop_non_relative", action="store_true",
+                   help="propagation: W̄=M^p (non-relative, drop column-normalizer D). "
+                        "Default = relative W̄=M^p·D.")
     p.add_argument("--pruning_ratio", type=float, default=0.5)
     p.add_argument("--global_pruning", action="store_true")
     p.add_argument("--no_bn_recalib", action="store_true")

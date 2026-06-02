@@ -1192,7 +1192,8 @@ class MeanResidualManager(BaseReparamManager):
                                conv_reduction="frobenius",
                                on_mismatch="warn",
                                topology=None,
-                               p=2):
+                               p=2,
+                               relative=True):
         """Per-input-channel global importance via reverse-walk recursion.
 
         Implements the paper's propagation criterion (Recap §3 — the best one):
@@ -1201,6 +1202,17 @@ class MeanResidualManager(BaseReparamManager):
               M[i, j] = |σ_i · reduce_kernel(v[j, i, :])|       (in × out)
               D = Diag(1 / Σ_i M[i, j]^p)  clamp ε               (column-normalize per j)
             I^{L+1} = I_out (default uniform 1/out_dim on the last layer's outputs)
+
+        `relative` selects the two PDF derivations of the SAME recursion:
+          relative=True  (default) → W̄ = M^p · D  — each column normalized to sum 1
+              (mass-preserving / probability redistribution per layer). Output importance
+              is split among inputs by relative contribution; magnitude does NOT compound
+              through depth.
+          relative=False → W̄ = M^p  (the D column-normalizer dropped) — the raw
+              normalized-weight product. The non-relative `I` of the PDF; magnitudes
+              compound through depth (deep-layer contributions scale by ∏ column masses).
+        Both share M, the kernel reduction, the DAG fan-in, and the I_out seed; they
+        differ ONLY in the per-layer D.
 
         The exponent `p` selects the paper's two relative-contribution flavors
         (relative-contribution section): p=2 = variance `σ²w²/Σσ²w²` (DEFAULT,
@@ -1264,7 +1276,7 @@ class MeanResidualManager(BaseReparamManager):
 
         # ---- DAG walk path (M3): topology provided ----
         if topology is not None:
-            return self._propagate_dag(layers, Ms, topology, I_out, eps, p)
+            return self._propagate_dag(layers, Ms, topology, I_out, eps, p, relative)
 
         # ---- Sequential path (M2): no topology ----
         # Seed I_out at last layer's output
@@ -1300,8 +1312,11 @@ class MeanResidualManager(BaseReparamManager):
                 I_l = M.norm(p=2, dim=1)  # [in]
             else:
                 Mp = M.pow(p)                           # variance (p=2) or std (p=1)
-                col_sums = Mp.sum(dim=0).clamp(min=eps)  # [out]
-                Wbar = Mp / col_sums[None, :]           # [in, out], columns sum to 1
+                if relative:
+                    col_sums = Mp.sum(dim=0).clamp(min=eps)  # [out]
+                    Wbar = Mp / col_sums[None, :]       # [in, out], columns sum to 1
+                else:
+                    Wbar = Mp                           # non-relative: raw M^p product
                 I_l = Wbar @ I_next                     # [in]
 
             results.append((name, I_l))
@@ -1309,7 +1324,7 @@ class MeanResidualManager(BaseReparamManager):
 
         return OrderedDict(reversed(results))
 
-    def _propagate_dag(self, layers, Ms, topology, I_out, eps, p=2):
+    def _propagate_dag(self, layers, Ms, topology, I_out, eps, p=2, relative=True):
         """DAG reverse-walk using a downstream+weight topology (M3).
 
         For each layer L (visited in reverse forward order — assumes named_modules order
@@ -1380,8 +1395,11 @@ class MeanResidualManager(BaseReparamManager):
                     I_next = I_next + float(w) * I_d
 
             Mp = M.pow(p)
-            col_sums = Mp.sum(dim=0).clamp(min=eps)
-            Wbar = Mp / col_sums[None, :]
+            if relative:
+                col_sums = Mp.sum(dim=0).clamp(min=eps)
+                Wbar = Mp / col_sums[None, :]
+            else:
+                Wbar = Mp                               # non-relative: raw M^p product
             I_by_name[name] = Wbar @ I_next
 
         # Return in forward order

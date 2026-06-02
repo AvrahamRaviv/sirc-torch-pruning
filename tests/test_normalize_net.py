@@ -646,6 +646,35 @@ def test_propagation_two_layer_mlp():
         mgr.propagation_importance(I_out=I_out, p=3)
 
 
+def test_propagation_relative_vs_non_relative():
+    """relative=True → W̄=M^p·D (column-normalized); relative=False → W̄=M^p (raw).
+    Lock both against hand-derived references and confirm they differ."""
+    model = TinyMLP()
+    mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4)
+    mgr.reparameterize(_vec_loader(16))
+
+    I_out = torch.tensor([1.0 if i == 0 else 0.0 for i in range(16)])
+    M_fc1 = _layer_M_reference(mgr._reparam_modules["fc1"])
+    M_fc2 = _layer_M_reference(mgr._reparam_modules["fc2"])
+    p = 2
+
+    # relative (default) = column-normalized
+    rel = mgr.propagation_importance(I_out=I_out, p=p, relative=True)
+    I_fc2_rel = _wbar_reference(M_fc2, p) @ I_out
+    assert torch.allclose(rel["fc2"], I_fc2_rel, atol=1e-6)
+    assert torch.allclose(rel["fc1"], _wbar_reference(M_fc1, p) @ I_fc2_rel, atol=1e-6)
+
+    # non-relative = raw M^p product (no D)
+    nonrel = mgr.propagation_importance(I_out=I_out, p=p, relative=False)
+    I_fc2_raw = M_fc2.pow(p) @ I_out
+    assert torch.allclose(nonrel["fc2"], I_fc2_raw, atol=1e-6), "non-relative fc2 = M^p·I_out"
+    assert torch.allclose(nonrel["fc1"], M_fc1.pow(p) @ I_fc2_raw, atol=1e-6)
+
+    # the two derivations must disagree (D actually changes the ranking)
+    assert not torch.allclose(rel["fc1"], nonrel["fc1"], atol=1e-4), \
+        "relative and non-relative should differ"
+
+
 def test_propagation_uniform_default_seed():
     """No I_out → uniform 1/out_dim seed; chain executes; shapes match in_dims."""
     model = TinyMLP()
