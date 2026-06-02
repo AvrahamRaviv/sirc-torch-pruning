@@ -51,6 +51,46 @@ def _count(model, ex):
     return macs / 1e9, params / 1e6
 
 
+def _load_any(args, device):
+    """Load a plain ckpt (load_model), or a normnet VNR ckpt when the .meta.json sidecar
+    says format=='vnr'. The latter lets Option B reuse the completed RN_bn sparse ckpts
+    straight onto the DDP path (the merged_biased save is broken on the cluster)."""
+    ckpt = args.checkpoint
+    if ckpt:
+        meta = os.path.splitext(ckpt)[0] + ".meta.json"
+        if os.path.exists(meta):
+            import json
+            with open(meta) as f:
+                if json.load(f).get("format") == "vnr":
+                    from normalize_net import load_normnet_checkpoint
+                    log_info(f"VNR checkpoint detected → {ckpt}")
+                    args.checkpoint = None       # inner load_model random-inits the arch;
+                    return load_normnet_checkpoint(ckpt, device, args)  # strict-load overwrites
+    return load_model(args, device)
+
+
+def _ratio_for_mac(model, ex, imp_factory, ignored_factory, target_g, global_pruning,
+                   lo=0.0, hi=0.95, iters=12):
+    """Binary-search the global channel pruning_ratio whose pruned MACs ≤ target_g (GMAC).
+    Pure search on deepcopies with the SAME frozen scores → caller does the real prune at
+    the returned ratio. Deterministic, so every DDP rank lands on the identical ratio."""
+    import copy
+    best = hi
+    for _ in range(iters):
+        mid = (lo + hi) / 2.0
+        trial = copy.deepcopy(model)
+        tp.pruner.MagnitudePruner(
+            trial, ex, importance=imp_factory(trial), global_pruning=global_pruning,
+            pruning_ratio=mid, ignored_layers=ignored_factory(trial)).step()
+        g = tp.utils.count_ops_and_params(trial, ex)[0] / 1e9
+        del trial
+        if g <= target_g:
+            best, hi = mid, mid          # feasible → tighten downward (less pruning)
+        else:
+            lo = mid                     # still too big → prune more
+    return best
+
+
 def _run_phase(model, mgr, loaders, args, device, use_ddp, *, epochs, lr, tag, teacher=None):
     """Run one train/FT phase via the shared train_normalized loop. mgr=None → plain
     training; mgr active → training in normalized coordinates (WD acts on v_tilde). Swaps
@@ -86,7 +126,7 @@ def main(argv):
 
     loaders = build_dataloaders(args, use_ddp=use_ddp)
     train_loader, val_loader, _ = loaders
-    model = load_model(args, device)            # random init if --checkpoint is None
+    model = _load_any(args, device)             # plain ckpt, VNR ckpt, or random init
     ex = torch.randn(1, 3, 224, 224).to(device)
     dense_macs, dense_params = _count(model, ex)
     write_run(args, {"status": "running", "config": vars(args),
@@ -131,17 +171,33 @@ def main(argv):
                 torch.distributed.broadcast(t, src=0)
                 scores[k] = t
         mgr.merge_back()                        # back to plain modules for the tp pruner
-        imp = NormalizedNetImportance(model, scores, group_reduction="mean", normalizer="mean")
-        ignored = [model.fc] if hasattr(model, "fc") else []
+
+        def _imp(mdl):
+            return NormalizedNetImportance(mdl, scores, group_reduction="mean", normalizer="mean")
+
+        def _ignored(mdl):
+            return [mdl.fc] if hasattr(mdl, "fc") else []
+
+        # MAC target overrides the raw channel ratio: 2G on RN50 (4.1G) ≈ 30% channels,
+        # not 50% — channel-ratio ≠ MAC-ratio. Binary-search the global ratio whose
+        # pruned MACs ≤ target_g, then prune the real model at it. Deterministic across
+        # ranks (scores already broadcast), so DDP masks stay identical.
+        ratio = args.pruning_ratio
+        if args.mac_target_g > 0:
+            ratio = _ratio_for_mac(model, ex, _imp, _ignored,
+                                   args.mac_target_g, args.global_pruning)
+            log_info(f"mac_target {args.mac_target_g:.2f}G → global pruning_ratio={ratio:.4f}")
+
         tp.pruner.MagnitudePruner(
-            model, ex, importance=imp, global_pruning=args.global_pruning,
-            pruning_ratio=args.pruning_ratio, ignored_layers=ignored).step()
+            model, ex, importance=_imp(model), global_pruning=args.global_pruning,
+            pruning_ratio=ratio, ignored_layers=_ignored(model)).step()
         model.to(device)
         if not args.no_bn_recalib:
             _recalibrate_bn(model, train_loader, device, max_batches=args.calib_batches)
         pr_macs, pr_params = _count(model, ex)
         acc, _ = validate(model, val_loader, device, args.model_type)
-        log_info(f"PRUNE ({args.scorer}, ratio={args.pruning_ratio}): pre-FT acc={acc:.4f}  "
+        tgt = f"mac={args.mac_target_g}G" if args.mac_target_g > 0 else f"ratio={args.pruning_ratio}"
+        log_info(f"PRUNE ({args.scorer}, {tgt}): pre-FT acc={acc:.4f}  "
                  f"{pr_macs:.2f}G ({100*pr_macs/dense_macs:.0f}%) {pr_params:.2f}M params")
         append_metrics(args, {"stage": "post_prune", "val_acc": round(acc, 6),
                               "macs_g": round(pr_macs, 4), "params_m": round(pr_params, 4)})
@@ -196,6 +252,9 @@ def parse_args(argv):
                    help="propagation: W̄=M^p (non-relative, drop column-normalizer D). "
                         "Default = relative W̄=M^p·D.")
     p.add_argument("--pruning_ratio", type=float, default=0.5)
+    p.add_argument("--mac_target_g", type=float, default=0.0,
+                   help="target MACs in GMAC (e.g. 2.0). >0 overrides --pruning_ratio: "
+                        "binary-search the global ratio that hits it. 0 = use ratio.")
     p.add_argument("--global_pruning", action="store_true")
     p.add_argument("--no_bn_recalib", action="store_true")
     # 4. fine-tune
@@ -220,6 +279,8 @@ def parse_args(argv):
     p.add_argument("--save_dir", required=True)
     p.add_argument("--save_tag", default="normnet")
     p.add_argument("--disable_ddp", action="store_true")
+    p.add_argument("--local_rank", type=int, default=int(os.environ.get("LOCAL_RANK", 0)),
+                   help="set by torch.distributed.launch")
     return p.parse_args(argv)
 
 

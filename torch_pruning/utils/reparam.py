@@ -230,8 +230,9 @@ class BNResidualLinear(nn.Module):
                 self.bn(x.reshape(-1, D)) if x.dim() >= 3 else self.bn(x)
         sigma = torch.sqrt(self.bn.running_var + self.bn.eps)
         mu = self.bn.running_mean
-        w_eff = self.v_tilde / sigma[None, :]
-        eff_bias = self.m - w_eff @ mu
+        # Effective-bias trick: ṽ·(x−μ)/σ + m, computed without materializing the BN.
+        w_eff = self.v_tilde / sigma[None, :]   # un-fold σ for the forward (ṽ/σ = W)
+        eff_bias = self.m - w_eff @ mu          # un-fold μ:  m − W·μ = b
         return F.linear(x, w_eff, eff_bias)
 
     def merge_params(self):
@@ -1311,13 +1312,14 @@ class MeanResidualManager(BaseReparamManager):
                 # variance-consistent, independent of p).
                 I_l = M.norm(p=2, dim=1)  # [in]
             else:
-                Mp = M.pow(p)                           # variance (p=2) or std (p=1)
+                # SCORE RECURSION:  I^l = W̄^l · I^{l+1},  W̄ = M^p · D
+                Mp = M.pow(p)                           # M^p: variance (p=2) or std (p=1)
                 if relative:
                     col_sums = Mp.sum(dim=0).clamp(min=eps)  # [out]
-                    Wbar = Mp / col_sums[None, :]       # [in, out], columns sum to 1
+                    Wbar = Mp / col_sums[None, :]       # · D: each column → sum 1 (relative)
                 else:
                     Wbar = Mp                           # non-relative: raw M^p product
-                I_l = Wbar @ I_next                     # [in]
+                I_l = Wbar @ I_next                     # propagate one layer back → [in]
 
             results.append((name, I_l))
             I_next = I_l  # chains to layer l-1 (whose out_dim should equal in_l = I_next.numel())
@@ -1500,8 +1502,8 @@ class NormalizedResidualManager(BaseReparamManager):
             # BN eval: x_bn = (x - μ) / sqrt(var + eps)
             # For v_tilde / sqrt(var + eps) = W: v_tilde = W * sqrt(var + eps)
             sigma_eff = torch.sqrt(bn_running_var + BN_EPS)
-            v_tilde = W * sigma_eff[None, :]
-            m = b + W @ mu_x
+            v_tilde = W * sigma_eff[None, :]   # FOLD σ INTO WEIGHT: ṽ = σ·W (now acts on unit-var input)
+            m = b + W @ mu_x                   # FOLD μ INTO BIAS:   m = b + W·μ
             reparam = BNResidualLinear(
                 module.in_features, module.out_features,
                 v_tilde=v_tilde, m=m,
