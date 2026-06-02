@@ -141,7 +141,7 @@ def build_scorer(scorer, model, calib_loader, device, args, ex, mgr=None):
         mgr, mode, example_inputs=(ex if mode == "propagation" else None), p=2,
         relative=not non_relative)
     if mode == "propagation":
-        log_info(f"propagation: {'NON-relative (W̄=M^p)' if non_relative else 'relative (W̄=M^p·D)'}")
+        log_info(f"propagation: {'NON-relative (+σ_out^p inter-layer, cross-layer)' if non_relative else 'relative (within-layer)'}")
     mgr.merge_back()
     n0 = sum(int((s < 0.1).sum()) for s in scores.values())
     ntot = sum(s.numel() for s in scores.values())
@@ -163,9 +163,9 @@ def main(argv):
     ap.add_argument("--scorer", required=True,
                     choices=["magnitude", "per_layer", "propagation"])
     ap.add_argument("--prop_non_relative", action="store_true",
-                    help="propagation: drop the column-normalizer D → W̄=M^p (the PDF "
-                         "non-relative I; magnitudes compound through depth). Default off "
-                         "= relative W̄=M^p·D (mass-preserving per layer).")
+                    help="propagation: non-relative criterion — keeps the inter-layer "
+                         "transfer Σ^{l+1}=σ_out^p (PDF cross-layer/global metric). Default "
+                         "off = relative (within-layer metric).")
     ap.add_argument("--pruning_ratio", type=float, default=0.5)
     ap.add_argument("--global_pruning", action="store_true",
                     help="cross-layer global ranking (criterion-4 setting). "

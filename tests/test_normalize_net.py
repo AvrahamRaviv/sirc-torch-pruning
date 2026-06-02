@@ -647,30 +647,34 @@ def test_propagation_two_layer_mlp():
 
 
 def test_propagation_relative_vs_non_relative():
-    """relative=True → W̄=M^p·D (column-normalized); relative=False → W̄=M^p (raw).
-    Lock both against hand-derived references and confirm they differ."""
+    """Both keep the column-normalizer D (for p=2 rel and non-rel share D). They differ ONLY
+    by the inter-layer transfer Σ^{l+1}=σ_out^p that the non-relative KEEPS and the relative
+    drops (PDF): non-rel scales I_next by σ_out^p before W̄. Lock both vs hand-derived refs."""
     model = TinyMLP()
     mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4)
     mgr.reparameterize(_vec_loader(16))
 
     I_out = torch.tensor([1.0 if i == 0 else 0.0 for i in range(16)])
-    M_fc1 = _layer_M_reference(mgr._reparam_modules["fc1"])
-    M_fc2 = _layer_M_reference(mgr._reparam_modules["fc2"])
+    rp1, rp2 = mgr._reparam_modules["fc1"], mgr._reparam_modules["fc2"]
+    M_fc1 = _layer_M_reference(rp1)
+    M_fc2 = _layer_M_reference(rp2)
     p = 2
 
-    # relative (default) = column-normalized
+    # relative (default) = column-normalized, NO σ_out factor
     rel = mgr.propagation_importance(I_out=I_out, p=p, relative=True)
     I_fc2_rel = _wbar_reference(M_fc2, p) @ I_out
     assert torch.allclose(rel["fc2"], I_fc2_rel, atol=1e-6)
     assert torch.allclose(rel["fc1"], _wbar_reference(M_fc1, p) @ I_fc2_rel, atol=1e-6)
 
-    # non-relative = raw M^p product (no D)
+    # non-relative = relative · σ_out^p inter-layer transfer (scale I_next before W̄)
     nonrel = mgr.propagation_importance(I_out=I_out, p=p, relative=False)
-    I_fc2_raw = M_fc2.pow(p) @ I_out
-    assert torch.allclose(nonrel["fc2"], I_fc2_raw, atol=1e-6), "non-relative fc2 = M^p·I_out"
-    assert torch.allclose(nonrel["fc1"], M_fc1.pow(p) @ I_fc2_raw, atol=1e-6)
+    so2 = rp2.sigma_out_x.detach() ** p
+    I_fc2_nr = _wbar_reference(M_fc2, p) @ (so2 * I_out)
+    assert torch.allclose(nonrel["fc2"], I_fc2_nr, atol=1e-6), "non-rel fc2 = W̄·(σ_out^p⊙I_out)"
+    so1 = rp1.sigma_out_x.detach() ** p
+    assert torch.allclose(nonrel["fc1"], _wbar_reference(M_fc1, p) @ (so1 * I_fc2_nr), atol=1e-6)
 
-    # the two derivations must disagree (D actually changes the ranking)
+    # the two derivations must disagree (σ_out factor changes the ranking)
     assert not torch.allclose(rel["fc1"], nonrel["fc1"], atol=1e-4), \
         "relative and non-relative should differ"
 

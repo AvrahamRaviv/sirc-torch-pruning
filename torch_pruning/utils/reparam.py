@@ -1314,11 +1314,14 @@ class MeanResidualManager(BaseReparamManager):
             else:
                 # SCORE RECURSION:  I^l = W̄^l · I^{l+1},  W̄ = M^p · D
                 Mp = M.pow(p)                           # M^p: variance (p=2) or std (p=1)
-                if relative:
-                    col_sums = Mp.sum(dim=0).clamp(min=eps)  # [out]
-                    Wbar = Mp / col_sums[None, :]       # · D: each column → sum 1 (relative)
-                else:
-                    Wbar = Mp                           # non-relative: raw M^p product
+                col_sums = Mp.sum(dim=0).clamp(min=eps)  # [out]
+                Wbar = Mp / col_sums[None, :]           # · D: column-normalized
+                if not relative:
+                    # non-relative keeps the inter-layer transfer Σ^{l+1}=σ_out^p (PDF) →
+                    # cross-layer comparable. relative drops it (within-layer only).
+                    so = getattr(rp, "sigma_out_x", None)
+                    if so is not None:
+                        I_next = (so.detach() ** p) * I_next
                 I_l = Wbar @ I_next                     # propagate one layer back → [in]
 
             results.append((name, I_l))
@@ -1397,11 +1400,17 @@ class MeanResidualManager(BaseReparamManager):
                     I_next = I_next + float(w) * I_d
 
             Mp = M.pow(p)
-            if relative:
-                col_sums = Mp.sum(dim=0).clamp(min=eps)
-                Wbar = Mp / col_sums[None, :]
-            else:
-                Wbar = Mp                               # non-relative: raw M^p product
+            col_sums = Mp.sum(dim=0).clamp(min=eps)
+            Wbar = Mp / col_sums[None, :]               # the D factor (for p=2, D = col-norm)
+            if not relative:
+                # NON-relative keeps the inter-layer transfer Σ^{l+1}=σ_out^p that relative
+                # drops (PDF: "propagating through statistical measurements of inter-layer
+                # transfer functions D^l Σ^{l+1}"). Re-injects the actual signal magnitude →
+                # cross-layer comparable (this is THE global criterion). For p=2, rel and
+                # non-rel share D, so the only difference is this σ_out^p factor.
+                so = getattr(rp, "sigma_out_x", None)
+                if so is not None:
+                    I_next = (so.detach() ** p) * I_next
             I_by_name[name] = Wbar @ I_next
 
         # Return in forward order

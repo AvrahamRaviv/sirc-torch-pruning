@@ -83,9 +83,10 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
     mode="propagation" → mgr.propagation_importance() (the §3 global criterion).
         Pass example_inputs to build the residual/DAG topology (build_propagation_topology
         with the SAME p); omit it for a pure sequential walk.
-        `relative` picks the PDF's two derivations: True (default) → W̄=M^p·D (column-
-        normalized, mass-preserving); False → W̄=M^p (non-relative, magnitudes compound
-        through depth). Ignored for mode="per_layer".
+        `relative` picks the PDF's two derivations (both keep the column-normalizer D; for
+        p=2 they share it): True (default) → within-layer metric, drops the inter-layer
+        transfer; False → non-relative, KEEPS the inter-layer transfer Σ^{l+1}=σ_out^p
+        (the cross-layer / global criterion). Ignored for mode="per_layer".
 
     Returns OrderedDict[name → 1-D tensor], one score per input channel of that layer.
     Must be called before mgr.merge_back().
@@ -118,8 +119,8 @@ def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
     tracks → propagation_importance is a mean-manager method. The bn (canonical) variant
     has no propagation_importance yet, so guard with a clear error.
 
-    `relative` (propagation only): True → relative W̄=M^p·D (default); False → non-
-    relative W̄=M^p (raw normalized-weight product, compounds through depth).
+    `relative` (propagation only): True → relative/within-layer (default); False → non-
+    relative = relative · σ_out^p inter-layer transfer (PDF cross-layer/global criterion).
     """
     if mode == "propagation" and not hasattr(mgr, "propagation_importance"):
         raise ValueError(
