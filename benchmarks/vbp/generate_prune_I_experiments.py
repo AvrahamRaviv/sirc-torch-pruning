@@ -61,7 +61,8 @@ RN_CKPTS = {
 # mac_target search then finds the global ratio whose globally-bottom channels hit the budget.
 SHARED = (
     f"--model_type cnn --cnn_arch resnet50 --data_path {DATA} --reparam_variant mean "
-    f"--scorer propagation --global_pruning --mac_target_g {MAC_TARGET_G} --calib_batches 50 "
+    f"--scorer propagation --global_pruning --mac_target_g {MAC_TARGET_G} --max_prune_ratio 0.8 "
+    f"--calib_batches 50 "
     f"--epochs_ft {FT} --lr_ft 2e-2 --wd 1e-4 --momentum 0.9 --use_kd --kd_alpha 0.5 "
     f"--kd_T 2.0 --train_batch_size 128 --val_resize 232"
 )

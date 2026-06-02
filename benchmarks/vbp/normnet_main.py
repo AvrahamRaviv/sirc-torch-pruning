@@ -77,10 +77,11 @@ def _load_any(args, device):
 
 
 def _ratio_for_mac(model, ex, imp_factory, ignored_factory, target_g, global_pruning,
-                   lo=0.0, hi=0.95, iters=12):
+                   max_pruning_ratio=1.0, lo=0.0, hi=0.95, iters=12):
     """Binary-search the global channel pruning_ratio whose pruned MACs ≤ target_g (GMAC).
     Pure search on deepcopies with the SAME frozen scores → caller does the real prune at
-    the returned ratio. Deterministic, so every DDP rank lands on the identical ratio."""
+    the returned ratio. Deterministic, so every DDP rank lands on the identical ratio.
+    max_pruning_ratio caps how much ANY single layer may be pruned (per-layer floor)."""
     import copy
     best = hi
     for _ in range(iters):
@@ -88,7 +89,8 @@ def _ratio_for_mac(model, ex, imp_factory, ignored_factory, target_g, global_pru
         trial = copy.deepcopy(model)
         tp.pruner.MagnitudePruner(
             trial, ex, importance=imp_factory(trial), global_pruning=global_pruning,
-            pruning_ratio=mid, ignored_layers=ignored_factory(trial)).step()
+            pruning_ratio=mid, max_pruning_ratio=max_pruning_ratio,
+            ignored_layers=ignored_factory(trial)).step()
         g = tp.utils.count_ops_and_params(trial, ex)[0] / 1e9
         del trial
         if g <= target_g:
@@ -262,15 +264,19 @@ def main(argv):
         # not 50% — channel-ratio ≠ MAC-ratio. Binary-search the global ratio whose
         # pruned MACs ≤ target_g, then prune the real model at it. Deterministic across
         # ranks (scores already broadcast), so DDP masks stay identical.
+        # per-layer floor: cap how much ANY layer may be pruned so global ranking can't gut a
+        # cheap-but-critical layer (e.g. the 64-ch stem → ~0 MAC saving, huge acc cost). 1.0=off.
+        mpr = args.max_prune_ratio if args.max_prune_ratio > 0 else 1.0
         ratio = args.pruning_ratio
         if args.mac_target_g > 0:
             ratio = _ratio_for_mac(model, ex, _imp, _ignored,
-                                   args.mac_target_g, args.global_pruning)
-            log_info(f"mac_target {args.mac_target_g:.2f}G → global pruning_ratio={ratio:.4f}")
+                                   args.mac_target_g, args.global_pruning, max_pruning_ratio=mpr)
+            log_info(f"mac_target {args.mac_target_g:.2f}G → global pruning_ratio={ratio:.4f} "
+                     f"(max_prune_ratio={mpr})")
 
         tp.pruner.MagnitudePruner(
             model, ex, importance=_imp(model), global_pruning=args.global_pruning,
-            pruning_ratio=ratio, ignored_layers=_ignored(model)).step()
+            pruning_ratio=ratio, max_pruning_ratio=mpr, ignored_layers=_ignored(model)).step()
         model.to(device)
         per_layer_dist, global_kept = log_prune_distribution(pre_w, _layer_widths(model))
         if not args.no_bn_recalib:
@@ -363,6 +369,10 @@ def parse_args(argv):
     p.add_argument("--no_bn_recalib", action="store_true")
     p.add_argument("--no_save_preprune", action="store_true",
                    help="skip saving the pre-prune dense checkpoint (default: save it)")
+    p.add_argument("--max_prune_ratio", type=float, default=0.0,
+                   help="per-layer floor: cap any single layer's prune fraction (e.g. 0.8 = "
+                        "keep ≥20%% of every layer). Stops global pruning gutting cheap-but-"
+                        "critical layers (stem/early). 0 = off.")
     # 4. fine-tune
     p.add_argument("--epochs_ft", type=int, default=0, help="post-prune plain FT (0=skip)")
     p.add_argument("--lr_ft", type=float, default=0.02)
