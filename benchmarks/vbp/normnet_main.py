@@ -98,7 +98,9 @@ def _run_phase(model, mgr, loaders, args, device, use_ddp, *, epochs, lr, tag, t
     if epochs <= 0:
         return None
     train_loader, val_loader, train_sampler = loaders
-    saved = (args.epochs, args.lr)
+    # train_normalized reads args.epochs/args.lr; normnet_main only has phase-specific
+    # flags (epochs_norm_ft/lr_ft/…), so set these transiently (getattr-safe restore).
+    saved = (getattr(args, "epochs", None), getattr(args, "lr", None))
     args.epochs, args.lr = epochs, lr
     log_info(f"[{tag}] {epochs} epochs, lr={lr}, "
              f"{'normalized (v_tilde)' if mgr is not None and mgr.is_active else 'plain'}")
