@@ -187,7 +187,7 @@ def lr_at(epoch, args):
     return args.eta_min + 0.5 * (args.lr - args.eta_min) * (1 + math.cos(math.pi * t))
 
 
-def train_one_epoch(model, loader, sampler, optimizer, device, epoch, args, criterion):
+def train_one_epoch(model, loader, sampler, optimizer, device, epoch, args, criterion, ema=None):
     model.train()
     if sampler is not None and hasattr(sampler, "set_epoch"):
         sampler.set_epoch(epoch)
@@ -204,6 +204,8 @@ def train_one_epoch(model, loader, sampler, optimizer, device, epoch, args, crit
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        if ema is not None:
+            ema.update(model)          # EMA must step EVERY batch (window 1/(1-decay) steps)
         running += loss.item()
         if is_main() and (i % log_every == 0 or i == n - 1):
             log_info(f"  [e{epoch+1} {i+1}/{n}] loss={loss.item():.4f} lr={optimizer.param_groups[0]['lr']:.4f}")
@@ -287,9 +289,7 @@ def main(argv):
         for g in optimizer.param_groups:
             g["lr"] = lr_at(epoch, args)
         train_loss = train_one_epoch(train_model, train_loader, train_sampler,
-                                     optimizer, device, epoch, args, criterion)
-        if ema is not None:
-            ema.update(_unwrap(train_model))
+                                     optimizer, device, epoch, args, criterion, ema=ema)
 
         if is_main():
             acc = _eval(_unwrap(train_model), val_loader, device, args)
