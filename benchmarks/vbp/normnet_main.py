@@ -103,16 +103,21 @@ def _layer_widths(model):
 
 
 def log_prune_distribution(pre, post):
-    """Log per-layer kept/removed channels + the global summary (ported from prune_e2)."""
+    """Log per-layer kept/removed channels + the global summary (ported from prune_e2).
+    Returns (per_layer dict {name: {pre, post, kept_pct}}, global_kept_pct) for the
+    structured prune summary."""
     log_info("per-layer pruning (out width pre → post, kept%):")
     tot_pre = tot_post = 0
+    per_layer = {}
     for name in pre:
         a, b = pre[name], post.get(name, pre[name])
         tot_pre += a; tot_post += b
+        per_layer[name] = {"pre": a, "post": b, "kept_pct": round(100.0 * b / max(a, 1), 1)}
         if b != a:
             log_info(f"  {name}: {a} → {b}  ({100.0*b/a:.0f}% kept, -{a-b})")
-    log_info(f"channels total: {tot_pre} → {tot_post} "
-             f"({100.0*tot_post/max(tot_pre,1):.1f}% kept)")
+    global_kept = round(100.0 * tot_post / max(tot_pre, 1), 1)
+    log_info(f"channels total: {tot_pre} → {tot_post} ({global_kept}% kept)")
+    return per_layer, global_kept
 
 
 def _run_phase(model, mgr, loaders, args, device, use_ddp, *, epochs, lr, tag, teacher=None):
@@ -242,7 +247,7 @@ def main(argv):
             model, ex, importance=_imp(model), global_pruning=args.global_pruning,
             pruning_ratio=ratio, ignored_layers=_ignored(model)).step()
         model.to(device)
-        log_prune_distribution(pre_w, _layer_widths(model))
+        per_layer_dist, global_kept = log_prune_distribution(pre_w, _layer_widths(model))
         if not args.no_bn_recalib:
             _recalibrate_bn(model, train_loader, device, max_batches=args.calib_batches)
         pr_macs, pr_params = _count(model, ex)
@@ -250,8 +255,18 @@ def main(argv):
         tgt = f"mac={args.mac_target_g}G" if args.mac_target_g > 0 else f"ratio={args.pruning_ratio}"
         log_info(f"PRUNE ({args.scorer}, {tgt}): pre-FT acc={acc:.4f}  "
                  f"{pr_macs:.2f}G ({100*pr_macs/dense_macs:.0f}%) {pr_params:.2f}M params")
-        append_metrics(args, {"stage": "post_prune", "val_acc": round(acc, 6),
-                              "macs_g": round(pr_macs, 4), "params_m": round(pr_params, 4)})
+        # Structured prune summary → dedicated <tag>_prune.json (NOT metrics.jsonl, which is
+        # per-epoch only — an epochless record there breaks the curve parsers). Holds the
+        # per-layer pruning ratios the user wants.
+        if is_main():
+            import json as _json
+            with open(os.path.join(args.save_dir, f"{args.save_tag}_prune.json"), "w") as f:
+                _json.dump({"scorer": args.scorer, "relative": not args.prop_non_relative,
+                            "global_pruning": args.global_pruning, "target": tgt,
+                            "global_ratio": round(ratio, 4), "pre_ft_val_acc": round(acc, 6),
+                            "macs_g": round(pr_macs, 4), "macs_pct": round(100*pr_macs/dense_macs, 1),
+                            "params_m": round(pr_params, 4), "global_kept_pct": global_kept,
+                            "per_layer": per_layer_dist}, f, indent=2)
     else:
         mgr.merge_back()
 

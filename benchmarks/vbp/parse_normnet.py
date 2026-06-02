@@ -61,8 +61,9 @@ def _load(run_json):
                     continue
                 r = json.loads(line)
                 ep = r.get("epoch")
-                if ep is not None:
-                    records[ep] = r
+                if not isinstance(ep, int):
+                    continue              # skip non-epoch records (e.g. stage summaries)
+                records[ep] = r
                 if r.get("val_acc") is not None:
                     epochs[ep] = r["val_acc"]
     return tag, run, epochs, records
