@@ -52,11 +52,18 @@ def _count(model, ex):
 
 
 def _load_any(args, device):
-    """Load a plain ckpt (load_model), or a normnet VNR ckpt when the .meta.json sidecar
-    says format=='vnr'. The latter lets Option B reuse the completed RN_bn sparse ckpts
-    straight onto the DDP path (the merged_biased save is broken on the cluster)."""
+    """Load whatever the --checkpoint points at, returning a ready model:
+      - normnet-ckpt bundle (ckpt.py)  → load_ckpt (full object; pruned/merged/ema nets).
+        Uses the EMA model by default (the deployable one) — set --load_raw for the endpoint.
+      - VNR ckpt (.meta.json format=vnr) → load_normnet_checkpoint (reparam reload).
+      - plain state_dict / None         → load_model (rebuild arch + load, or random init)."""
     ckpt = args.checkpoint
     if ckpt:
+        from ckpt import is_bundle, load_ckpt
+        if is_bundle(ckpt):
+            prefer = "raw" if getattr(args, "load_raw", False) else "ema"
+            log_info(f"normnet-ckpt bundle → {ckpt} (prefer={prefer})")
+            return load_ckpt(ckpt, device, prefer=prefer)
         meta = os.path.splitext(ckpt)[0] + ".meta.json"
         if os.path.exists(meta):
             import json
@@ -233,8 +240,10 @@ def main(argv):
         # without redoing training: --checkpoint <preprune> --epochs_norm_ft 0 → normalize →
         # prune → FT. Plain state_dict (σ re-calibrated on reload). rank 0 only.
         if is_main() and not args.no_save_preprune:
+            from ckpt import save_ckpt
             pp = os.path.join(args.save_dir, f"{args.save_tag}_preprune.pth")
-            torch.save({k: v.detach().cpu().clone() for k, v in model.state_dict().items()}, pp)
+            save_ckpt(pp, model, kind="merged", arch=args.cnn_arch,
+                      meta={"stage": "preprune", "note": "post-norm-ft merged dense net"})
             log_info(f"saved pre-prune checkpoint → {pp}")
         pre_w = _layer_widths(model)            # widths before the structural edit
 
@@ -287,11 +296,17 @@ def main(argv):
 
     # -- save (rank 0) -------------------------------------------------------------------
     if is_main():
+        from ckpt import save_ckpt
         os.makedirs(args.save_dir, exist_ok=True)
         path = os.path.join(args.save_dir, f"{args.save_tag}.pth")
-        torch.save({k: v.detach().cpu().clone() for k, v in model.state_dict().items()}, path)
         final_acc, _ = validate(model, val_loader, device, args.model_type)
         fmacs, fparams = _count(model, ex)
+        # Pruned model → save the FULL object (reduced channel dims can't rebuild from a bare
+        # state_dict). load_ckpt(path) returns it ready to infer / ft-more.
+        kind = "dense" if args.no_prune else "pruned"
+        save_ckpt(path, model, kind=kind, arch=args.cnn_arch,
+                  meta={"final_val_acc": final_acc, "best_ft_val_acc": best,
+                        "macs_g": fmacs, "params_m": fparams, "scorer": args.scorer})
         log_info(f"DONE: final acc={final_acc:.4f}  best_ft={best}  {fmacs:.2f}G  {fparams:.2f}M  → {path}")
         write_run(args, {"status": "done", "config": vars(args),
                          "final_val_acc": final_acc, "best_ft_val_acc": best,
@@ -308,7 +323,11 @@ def parse_args(argv):
     p.add_argument("--model_type", default="cnn", choices=["cnn", "vit", "convnext"])
     p.add_argument("--model_name", default="resnet50")
     p.add_argument("--cnn_arch", default="resnet50")
-    p.add_argument("--checkpoint", default=None, help="None → random init (from scratch)")
+    p.add_argument("--checkpoint", default=None, help="None → random init (from scratch). "
+                   "Accepts a normnet-ckpt bundle, a VNR ckpt, or a plain state_dict.")
+    p.add_argument("--load_raw", action="store_true",
+                   help="when --checkpoint is a bundle, load the raw (trajectory-endpoint) "
+                        "model instead of the EMA (default: EMA, the deployable one)")
     p.add_argument("--data_path", required=True)
     p.add_argument("--exclude_stem", action="store_true")
     # 1. train

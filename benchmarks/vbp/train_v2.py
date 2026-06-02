@@ -313,18 +313,29 @@ def main(argv):
 
     # ---- merge normalized net back + save (rank 0) ----
     if mgr is not None and mgr.is_active:
-        mgr.merge_back()
+        mgr.merge_back()                                   # raw model: collective, all ranks
     if is_main():
+        from ckpt import save_ckpt, merge_reparam_modules
         os.makedirs(args.save_dir, exist_ok=True)
-        path = os.path.join(args.save_dir, f"{args.save_tag}.pth")
-        torch.save({k: v.detach().cpu().clone() for k, v in _unwrap(train_model).state_dict().items()}, path)
-        final = _eval(_unwrap(train_model), val_loader, device, args)
+        raw = _unwrap(train_model)
+        # Switch arm: the EMA shadow is still in reparam'd (BNResidual) form — merge it to
+        # plain before saving so the deployable EMA checkpoint loads as a standard net.
+        if ema is not None and mgr is not None:
+            merge_reparam_modules(ema.shadow)
+        final = _eval(raw, val_loader, device, args)
         ema_final = (_eval(ema.shadow, val_loader, device, args) if ema is not None else None)
+        path = os.path.join(args.save_dir, f"{args.save_tag}.pth")
+        # Bundle: raw (trajectory endpoint) + EMA (the model you report/deploy — 80.86 is EMA).
+        save_ckpt(path, raw, kind="ema-trained", arch=args.cnn_arch,
+                  ema_model=(ema.shadow if ema is not None else None),
+                  meta={"arm": arm, "epochs": args.epochs,
+                        "val_acc": final, "ema_val_acc": ema_final})
         log_info(f"DONE arm={arm}: final acc={final:.4f}"
-                 + (f" ema={ema_final:.4f}" if ema_final else "") + f" → {path}")
+                 + (f" ema={ema_final:.4f} (← reported)" if ema_final else "")
+                 + f" → {path} (load_ckpt prefer='ema')")
         write_run(args, {"status": "done", "arm": arm, "config": vars(args),
                          "final_val_acc": final, "ema_final_val_acc": ema_final,
-                         "checkpoint": path})
+                         "checkpoint": path, "reported_metric": "ema_val_acc"})
     if use_ddp:
         from normalize_net import cleanup
         cleanup()

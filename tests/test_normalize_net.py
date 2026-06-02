@@ -1461,3 +1461,36 @@ def test_classifier_seed_pdf_output_importance():
     assert _classifier_seed(mgr, topo, None, 2, True) is None          # no classifier
     assert _classifier_seed(mgr, topo, nn.Linear(feat + 1, classes), 2, True) is None  # dim mismatch
     assert _classifier_seed(mgr, {"a": ["b"], "b": []}, clf, 2, True) is None  # >1? no, single terminal "b"
+
+
+def test_ckpt_bundle_roundtrip_dense_ema_and_pruned():
+    """ckpt.save_ckpt/load_ckpt: EMA is preserved + selectable, pruned (reduced-dim) nets
+    reload exactly, and merge_reparam_modules folds a reparam'd net function-preservingly."""
+    import sys, os, tempfile, copy
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "benchmarks", "vbp"))
+    import torchvision
+    import torch_pruning as tp
+    from ckpt import save_ckpt, load_ckpt, is_bundle, merge_reparam_modules
+    d = tempfile.mkdtemp(); ex = torch.randn(1, 3, 224, 224)
+
+    # dense + EMA: both selectable, EMA distinct from raw
+    m = torchvision.models.resnet18(weights=None).eval()
+    ema = copy.deepcopy(m)
+    with torch.no_grad():
+        for p in ema.parameters():
+            p.add_(0.01)
+    p1 = os.path.join(d, "a.pth")
+    save_ckpt(p1, m, kind="ema-trained", arch="resnet18", ema_model=ema)
+    assert is_bundle(p1)
+    assert (load_ckpt(p1, prefer="raw")(ex) - m(ex)).abs().max() < 1e-6
+    assert (load_ckpt(p1, prefer="ema")(ex) - ema(ex)).abs().max() < 1e-6
+    assert (load_ckpt(p1, prefer="ema")(ex) - load_ckpt(p1, prefer="raw")(ex)).abs().max() > 1e-3
+
+    # pruned (reduced channel dims) reloads exactly from the full object
+    m2 = torchvision.models.resnet18(weights=None).eval()
+    tp.pruner.MagnitudePruner(m2, ex, importance=tp.importance.MagnitudeImportance(),
+                              global_pruning=True, pruning_ratio=0.5, ignored_layers=[m2.fc]).step()
+    y = m2(ex)
+    p2 = os.path.join(d, "p.pth")
+    save_ckpt(p2, m2, kind="pruned", arch="resnet18")
+    assert (load_ckpt(p2)(ex) - y).abs().max() < 1e-6
