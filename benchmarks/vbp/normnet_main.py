@@ -91,6 +91,30 @@ def _ratio_for_mac(model, ex, imp_factory, ignored_factory, target_g, global_pru
     return best
 
 
+def _layer_widths(model):
+    """name → output width (out_channels / out_features) for every Conv2d / Linear."""
+    w = {}
+    for name, m in model.named_modules():
+        if isinstance(m, torch.nn.Conv2d):
+            w[name] = m.out_channels
+        elif isinstance(m, torch.nn.Linear):
+            w[name] = m.out_features
+    return w
+
+
+def log_prune_distribution(pre, post):
+    """Log per-layer kept/removed channels + the global summary (ported from prune_e2)."""
+    log_info("per-layer pruning (out width pre → post, kept%):")
+    tot_pre = tot_post = 0
+    for name in pre:
+        a, b = pre[name], post.get(name, pre[name])
+        tot_pre += a; tot_post += b
+        if b != a:
+            log_info(f"  {name}: {a} → {b}  ({100.0*b/a:.0f}% kept, -{a-b})")
+    log_info(f"channels total: {tot_pre} → {tot_post} "
+             f"({100.0*tot_post/max(tot_pre,1):.1f}% kept)")
+
+
 def _run_phase(model, mgr, loaders, args, device, use_ddp, *, epochs, lr, tag, teacher=None):
     """Run one train/FT phase via the shared train_normalized loop. mgr=None → plain
     training; mgr active → training in normalized coordinates (WD acts on v_tilde). Swaps
@@ -172,7 +196,17 @@ def main(argv):
                 t = scores[k].contiguous()
                 torch.distributed.broadcast(t, src=0)
                 scores[k] = t
+        # score distribution (how many channels the criterion ranks near-zero, per layer
+        # + global) — tells whether the ranking is concentrated or flat/degenerate.
+        n0 = sum(int((s < 0.1).sum()) for s in scores.values())
+        ntot = sum(s.numel() for s in scores.values())
+        cvs = [float(s.std() / (s.mean() + 1e-12)) for s in scores.values() if s.numel() > 1]
+        cv_med = sorted(cvs)[len(cvs) // 2] if cvs else 0.0
+        log_info(f"scores ({args.scorer}): {ntot} channels, {n0} below 0.1 "
+                 f"({100.0 * n0 / max(ntot, 1):.1f}%), median per-layer CV={cv_med:.3f}")
+
         mgr.merge_back()                        # back to plain modules for the tp pruner
+        pre_w = _layer_widths(model)            # widths before the structural edit
 
         def _imp(mdl):
             return NormalizedNetImportance(mdl, scores, group_reduction="mean", normalizer="mean")
@@ -194,6 +228,7 @@ def main(argv):
             model, ex, importance=_imp(model), global_pruning=args.global_pruning,
             pruning_ratio=ratio, ignored_layers=_ignored(model)).step()
         model.to(device)
+        log_prune_distribution(pre_w, _layer_widths(model))
         if not args.no_bn_recalib:
             _recalibrate_bn(model, train_loader, device, max_batches=args.calib_batches)
         pr_macs, pr_params = _count(model, ex)
