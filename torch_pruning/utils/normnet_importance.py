@@ -41,9 +41,42 @@ from torch_pruning.pruner.importance import GroupMagnitudeImportance
 _IN_FNS = (function.prune_conv_in_channels, function.prune_linear_in_channels)
 
 
+def _classifier_seed(mgr, topology, classifier, p, relative):
+    """Build the propagation output seed I^o per the PDF: I^L = W̄^fc · 𝟙_classes, NOT a
+    uniform-over-features vector. The PDF chain runs to the NETWORK output (the classifier),
+    seeded uniform over CLASSES; the terminal feature layer's importance is that uniform
+    class-importance propagated back through the classifier. Seeding uniform-over-features
+    instead (the bug) ties every final-stage channel → global pruning guts them.
+
+    M^fc[feature, class] = σ_feature · |W_fc[class, feature]|, with σ_feature = the terminal
+    layer's per-output-channel std (sigma_out_x). Returns {terminal_name → seed[feat]} or
+    None (→ caller falls back to uniform) when the head isn't a single Linear on the terminal.
+    """
+    if classifier is None or not hasattr(classifier, "weight"):
+        return None
+    terminals = [n for n, dsts in topology.items() if not dsts]
+    if len(terminals) != 1:
+        return None                                  # multi-head / non-standard → uniform
+    tname = terminals[0]
+    rp = mgr._reparam_modules.get(tname)
+    sigma_out = getattr(rp, "sigma_out_x", None)
+    if rp is None or sigma_out is None:
+        return None
+    W = classifier.weight.detach()                   # [num_classes, feat]
+    sigma_out = sigma_out.detach()
+    if W.dim() != 2 or W.shape[1] != sigma_out.numel():
+        return None                                  # in_features ≠ terminal out → can't seed
+    M = (W.abs() * sigma_out[None, :]).t()           # [feat, classes]
+    Mp = M.pow(p)
+    Wbar = Mp / Mp.sum(dim=0).clamp(min=1e-8)[None, :] if relative else Mp
+    num_classes = W.shape[0]
+    ones = torch.full((num_classes,), 1.0 / num_classes, device=Wbar.device, dtype=Wbar.dtype)
+    return {tname: Wbar @ ones}                      # [feat] — real per-feature importance
+
+
 def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
                                  I_out=None, p=2, conv_reduction="frobenius",
-                                 on_mismatch="warn", relative=True):
+                                 on_mismatch="warn", relative=True, classifier=None):
     """Pull per-input-channel scores from an ACTIVE reparam manager.
 
     mode="per_layer"   → mgr.input_channel_scores()  (‖σ·v‖ = √NCI, the §2 criterion).
@@ -63,15 +96,21 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
         topo = None
         if example_inputs is not None:
             topo = mgr.build_propagation_topology(example_inputs, p=p)
+        # PDF seed: I^o propagated back through the classifier (W̄^fc · 𝟙_classes), so the
+        # final-stage features get REAL importance. Without it the terminal seeds uniform →
+        # ties → global pruning guts the last stage. None → uniform fallback.
+        seed = I_out
+        if seed is None and classifier is not None and topo is not None:
+            seed = _classifier_seed(mgr, topo, classifier, p, relative)
         return mgr.propagation_importance(
-            I_out=I_out, p=p, conv_reduction=conv_reduction,
+            I_out=seed, p=p, conv_reduction=conv_reduction,
             on_mismatch=on_mismatch, topology=topo, relative=relative)
     raise ValueError(f"mode must be 'per_layer' or 'propagation', got {mode!r}")
 
 
 def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
                            conv_reduction="frobenius", on_mismatch="warn",
-                           relative=True):
+                           relative=True, classifier=None):
     """Score extraction with the propagation-needs-mean-variant guard, shared by the
     single-GPU (prune_e2) and DDP (pruning_utils) paths.
 
@@ -89,7 +128,8 @@ def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
             "with the mean variant (--sparse_mode reparam / --reparam_variant mean).")
     return extract_input_channel_scores(
         mgr, mode=mode, example_inputs=example_inputs, p=p,
-        conv_reduction=conv_reduction, on_mismatch=on_mismatch, relative=relative)
+        conv_reduction=conv_reduction, on_mismatch=on_mismatch, relative=relative,
+        classifier=classifier)
 
 
 class NormalizedNetImportance(GroupMagnitudeImportance):

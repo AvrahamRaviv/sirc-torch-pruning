@@ -207,9 +207,13 @@ def main(argv):
         # the scores rank0→all so every rank prunes the SAME mask (else shape-mismatch hang).
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             mgr._sync_bn_stats()
+        # PDF seed: propagation runs to the classifier (I^o = 𝟙 over classes, back through
+        # W̄^fc). Pass the classifier so the final-stage features get real importance instead
+        # of a uniform tie (which global pruning guts).
+        clf = model.fc if hasattr(model, "fc") else None
         scores = extract_normnet_scores(
             mgr, args.scorer, example_inputs=(ex if args.scorer == "propagation" else None),
-            relative=not args.prop_non_relative)
+            relative=not args.prop_non_relative, classifier=clf)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             for k in list(scores.keys()):
                 t = scores[k].contiguous()
@@ -225,6 +229,13 @@ def main(argv):
                  f"({100.0 * n0 / max(ntot, 1):.1f}%), median per-layer CV={cv_med:.3f}")
 
         mgr.merge_back()                        # back to plain modules for the tp pruner
+        # Save the pre-prune (post-norm-ft, merged) DENSE net so a prune+FT can be retried
+        # without redoing training: --checkpoint <preprune> --epochs_norm_ft 0 → normalize →
+        # prune → FT. Plain state_dict (σ re-calibrated on reload). rank 0 only.
+        if is_main() and not args.no_save_preprune:
+            pp = os.path.join(args.save_dir, f"{args.save_tag}_preprune.pth")
+            torch.save({k: v.detach().cpu().clone() for k, v in model.state_dict().items()}, pp)
+            log_info(f"saved pre-prune checkpoint → {pp}")
         pre_w = _layer_widths(model)            # widths before the structural edit
 
         def _imp(mdl):
@@ -323,6 +334,8 @@ def parse_args(argv):
                         "binary-search the global ratio that hits it. 0 = use ratio.")
     p.add_argument("--global_pruning", action="store_true")
     p.add_argument("--no_bn_recalib", action="store_true")
+    p.add_argument("--no_save_preprune", action="store_true",
+                   help="skip saving the pre-prune dense checkpoint (default: save it)")
     # 4. fine-tune
     p.add_argument("--epochs_ft", type=int, default=0, help="post-prune plain FT (0=skip)")
     p.add_argument("--lr_ft", type=float, default=0.02)

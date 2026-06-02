@@ -1433,3 +1433,31 @@ def test_propagation_vs_per_layer_score_difference():
     # Propagation factors in fc2's downstream weights → different ranking/magnitudes.
     assert not torch.allclose(prop["fc1"], per_layer_fc1, atol=1e-3), \
         "propagation should differ from per-layer score once downstream layer has bias"
+
+
+def test_classifier_seed_pdf_output_importance():
+    """The PDF seeds propagation from the network output (classifier), I^L = W̄^fc·𝟙_classes,
+    NOT uniform over features. _classifier_seed must return a NON-uniform per-feature vector,
+    and None for the cases that should fall back to the uniform seed."""
+    import torch.nn as nn
+    from torch_pruning.utils.normnet_importance import _classifier_seed
+    feat, classes = 8, 5
+
+    class _RP:  # minimal reparam-module stub carrying sigma_out_x
+        pass
+    rp = _RP(); rp.sigma_out_x = torch.rand(feat) + 0.5
+
+    class _MGR:
+        pass
+    mgr = _MGR(); mgr._reparam_modules = {"last": rp}
+    topo = {"last": []}                      # single terminal
+    clf = nn.Linear(feat, classes)
+
+    seed = _classifier_seed(mgr, topo, clf, p=2, relative=True)
+    assert seed is not None and "last" in seed
+    assert seed["last"].numel() == feat
+    assert float(seed["last"].std()) > 0.0, "seed must be non-uniform (else global pruning guts)"
+    # fall-backs → None (caller uses uniform)
+    assert _classifier_seed(mgr, topo, None, 2, True) is None          # no classifier
+    assert _classifier_seed(mgr, topo, nn.Linear(feat + 1, classes), 2, True) is None  # dim mismatch
+    assert _classifier_seed(mgr, {"a": ["b"], "b": []}, clf, 2, True) is None  # >1? no, single terminal "b"

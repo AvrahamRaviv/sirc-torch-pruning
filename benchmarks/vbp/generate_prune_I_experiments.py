@@ -66,8 +66,11 @@ SHARED = (
 )
 # Option B: load vnr, no reg recompute (already 30-ep trained).
 B_EXTRA = "--epochs_train 0 --epochs_norm_ft 0"
-# Option A: dense 80.86, short λ-reg norm-ft before pruning.
+# Option A: dense 80.86, short λ-reg norm-ft (sparse phase) before pruning.
 A_EXTRA = f"--epochs_train 0 --epochs_norm_ft {A_REG} --reparam_lambda 1e-4 --lr_norm_ft 0.01"
+# Option A0: dense 80.86, NO sparse phase — prune the net at init (tests whether the reg
+# phase actually helps the I-prune, or the criterion alone suffices).
+A0_EXTRA = "--epochs_train 0 --epochs_norm_ft 0"
 
 REL_VARIANTS = [("rel", ""), ("nonrel", " --prop_non_relative")]
 
@@ -94,9 +97,12 @@ def main():
         for lam, ckpt in RN_CKPTS.items():
             for rname, rflag in REL_VARIANTS:
                 made.append(_write(f"B_prop_{rname}_{lam}", ckpt, B_EXTRA, rflag))
-    # OPTION A — propagation (rel + nonrel) from the dense 80.86.
+    # OPTION A — propagation (rel + nonrel) from the dense 80.86, WITH 5ep λ-reg sparse phase.
     for rname, rflag in REL_VARIANTS:
         made.append(_write(f"A_prop_{rname}", DENSE_8086, A_EXTRA, rflag))
+    # OPTION A0 — same, NO sparse phase (prune at init) → does the reg phase help?
+    for rname, rflag in REL_VARIANTS:
+        made.append(_write(f"A0_prop_{rname}", DENSE_8086, A0_EXTRA, rflag))
 
     print(f"\n{len(made)} experiments (mac_target={MAC_TARGET_G}G, FT={FT} DDP×{NPROC}, "
           f"A_reg={A_REG}). Submit each:")
