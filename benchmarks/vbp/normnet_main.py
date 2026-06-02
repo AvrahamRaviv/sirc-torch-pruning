@@ -40,7 +40,7 @@ from vbp_common import (
 )
 from normalize_net import (
     build_reparam_manager, train_normalized, log_info, get_device,
-    append_metrics, write_run, save_normnet_checkpoint,
+    append_metrics, write_run, save_normnet_checkpoint, is_main,
 )
 from normalized_net_importance import NormalizedNetImportance, extract_normnet_scores
 from torch_pruning.utils.pruning_utils import _recalibrate_bn
@@ -286,7 +286,6 @@ def main(argv):
                       epochs=args.epochs_ft, lr=args.lr_ft, tag="FINE-TUNE", teacher=teacher)
 
     # -- save (rank 0) -------------------------------------------------------------------
-    from normalize_net import is_main
     if is_main():
         os.makedirs(args.save_dir, exist_ok=True)
         path = os.path.join(args.save_dir, f"{args.save_tag}.pth")
