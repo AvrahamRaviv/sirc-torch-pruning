@@ -152,11 +152,25 @@ def main(argv):
 
     loaders = build_dataloaders(args, use_ddp=use_ddp)
     train_loader, val_loader, _ = loaders
+    had_ckpt = args.checkpoint is not None       # _load_any nulls it for vnr → capture first
     model = _load_any(args, device)             # plain ckpt, VNR ckpt, or random init
     ex = torch.randn(1, 3, 224, 224).to(device)
     dense_macs, dense_params = _count(model, ex)
     write_run(args, {"status": "running", "config": vars(args),
                      "dense_macs_g": dense_macs, "dense_params_m": dense_params})
+
+    # KD teacher = frozen copy of the loaded DENSE net (before normalize/prune). Skipped for
+    # from-scratch (no ckpt → a random teacher would be worse than useless). train_one_epoch
+    # gates KD on (args.use_kd and teacher is not None), so teacher=None ≡ plain CE.
+    teacher = None
+    if args.use_kd and had_ckpt:
+        import copy
+        teacher = copy.deepcopy(model).eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        log_info("KD teacher = frozen dense net (pre-prune)")
+    elif args.use_kd:
+        log_info("--use_kd set but no checkpoint (from-scratch) → KD off (no teacher)")
 
     # -- 1. TRAIN (plain) ---------------------------------------------------------------
     _run_phase(model, None, loaders, args, device, use_ddp,
@@ -180,7 +194,7 @@ def main(argv):
 
     # -- 2b. optional FT in normalized coordinates (train v_tilde; WD on σW = contrib reg)
     _run_phase(model, mgr, loaders, args, device, use_ddp,
-               epochs=args.epochs_norm_ft, lr=args.lr_norm_ft, tag="NORM-FT")
+               epochs=args.epochs_norm_ft, lr=args.lr_norm_ft, tag="NORM-FT", teacher=teacher)
 
     # -- 3. PRUNE (magnitude of normalized weight = NCI, via stock MagnitudePruner) ------
     if not args.no_prune:
@@ -243,7 +257,7 @@ def main(argv):
 
     # -- 4. FINE-TUNE (plain post-prune / post-normalize recovery) ----------------------
     best = _run_phase(model, None, loaders, args, device, use_ddp,
-                      epochs=args.epochs_ft, lr=args.lr_ft, tag="FINE-TUNE")
+                      epochs=args.epochs_ft, lr=args.lr_ft, tag="FINE-TUNE", teacher=teacher)
 
     # -- save (rank 0) -------------------------------------------------------------------
     from normalize_net import is_main
