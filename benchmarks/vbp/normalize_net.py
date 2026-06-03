@@ -386,10 +386,18 @@ def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
             cur_lr = optimizer.param_groups[0]["lr"]
             # reg_loss = the λ‖σ·v‖ aux term (avg per step); CE/KD = train_loss − reg.
             reg_loss = float(aux.get("aux", 0.0)) if aux else 0.0
+            # During the reg phase, append the ‖ṽ‖ sparsity so the reg effect is visible live:
+            # reg_loss (the λ‖σv‖ term) shrinking + frac_below growing = channels going prunable.
+            reg_str = ""
+            if normalized:
+                _s = mgr.vnorm_summary()
+                if _s:
+                    reg_str = (f", reg_loss={reg_loss:.3e}, vnorm_mean={_s['mean']:.3e}, "
+                               f"frac‖ṽ‖<0.1={_s['frac_below_0.1']:.3f}")
             # Human line (capital "Epoch", comma-separated → parse_logs-compatible style)
             log_info(f"[{phase}] Epoch {epoch+1}/{args.epochs}: "
                      f"train_loss={train_loss:.4f}, val_acc={acc:.4f}, "
-                     f"val_loss={val_loss:.4f}, best={best_acc:.4f}, lr={cur_lr:.2e}")
+                     f"val_loss={val_loss:.4f}, best={best_acc:.4f}, lr={cur_lr:.2e}{reg_str}")
             # Machine line (one JSON object per epoch). reg_loss + the ‖σ·v‖ sparsity
             # summary let parse_normnet plot the λ-sweep natural-sparsity surface.
             rec = {

@@ -129,6 +129,32 @@ def log_prune_distribution(pre, post):
     return per_layer, global_kept
 
 
+def log_contribution_norms(mgr, args, stage):
+    """Snapshot the per-channel contribution norm ‖ṽ‖=‖σv‖ (= the thing λ-reg drives to 0).
+    Call BEFORE and AFTER the norm-ft/reg phase: the delta is the reg effect — how many
+    channels got pushed toward 0 (= prunable). Logs global + per-layer fraction below
+    thresholds, saves <tag>_contrib_<stage>.json. mgr must be active (pre merge_back)."""
+    scores = extract_normnet_scores(mgr, "per_layer")           # ‖σv‖ per input channel
+    allv = torch.cat([s.float().flatten() for s in scores.values()]) if scores else torch.zeros(1)
+    glob = {"mean": float(allv.mean()), "median": float(allv.median()),
+            "frac_below_1e-3": float((allv < 1e-3).float().mean()),
+            "frac_below_1e-2": float((allv < 1e-2).float().mean()),
+            "frac_below_1e-1": float((allv < 1e-1).float().mean())}
+    log_info(f"[reg-track {stage}] ‖ṽ‖ global: mean={glob['mean']:.3e} median={glob['median']:.3e} "
+             f"| prunable frac <1e-3={glob['frac_below_1e-3']:.3f} <1e-2={glob['frac_below_1e-2']:.3f} "
+             f"<1e-1={glob['frac_below_1e-1']:.3f}  ({allv.numel()} channels)")
+    per_layer = {}
+    for name, s in scores.items():
+        s = s.float()
+        per_layer[name] = {"mean": float(s.mean()),
+                           "frac_below_1e-2": float((s < 1e-2).float().mean())}
+    if is_main():
+        import json as _json
+        with open(os.path.join(args.save_dir, f"{args.save_tag}_contrib_{stage}.json"), "w") as f:
+            _json.dump({"stage": stage, "global": glob, "per_layer": per_layer}, f, indent=2)
+    return glob
+
+
 def log_score_distribution(scores, args):
     """Per-layer propagation/per_layer SCORE stats (BEFORE pruning) → log + <tag>_scores.json.
     This is the real-data measurement: the per-layer MEAN reveals depth-compounding (does the
@@ -242,8 +268,15 @@ def main(argv):
              f"(function-preserving — should match post-train)")
 
     # -- 2b. optional FT in normalized coordinates (train v_tilde; WD on σW = contrib reg)
+    # Bracket the reg phase with ‖ṽ‖ snapshots → the delta = how much λ-reg made channels
+    # prunable (contribution pushed toward 0). Only meaningful when a reg phase actually runs.
+    reg_active = args.epochs_norm_ft > 0
+    if reg_active:
+        log_contribution_norms(mgr, args, "pre_reg")
     _run_phase(model, mgr, loaders, args, device, use_ddp,
                epochs=args.epochs_norm_ft, lr=args.lr_norm_ft, tag="NORM-FT", teacher=teacher)
+    if reg_active:
+        log_contribution_norms(mgr, args, "post_reg")
 
     # -- 3. PRUNE — normnet criterion (per_layer/propagation) OR a classical tp baseline ---
     _NORMNET_SCORERS = ("per_layer", "propagation")

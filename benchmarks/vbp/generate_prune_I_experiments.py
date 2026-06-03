@@ -50,7 +50,15 @@ DENSE_8086 = os.environ.get(
     "CKPT", "/algo/NetOptimization/outputs/VBP/ResNet50_TP/resnet50_imagenet1k.pth")
 MAC_TARGET_G = float(os.environ.get("MAC_TARGET_G", "2.0"))   # GMAC budget
 FT = int(os.environ.get("FT_EPOCHS", "30"))                    # post-prune FT (DDP)
-A_REG = int(os.environ.get("A_REG_EPOCHS", "5"))              # Option A short λ-reg norm-ft
+A_REG = int(os.environ.get("A_REG_EPOCHS", "10"))             # Option A λ-reg norm-ft epochs
+A_LAMBDA = os.environ.get("A_LAMBDA", "1e-4")                 # λ on ‖ṽ‖ (sweepable)
+A_MU_EMA = os.environ.get("A_MU_EMA", "0.1")                  # σ/μ EMA momentum → LIVE σ in reg
+
+# Which arms to emit. Default: Option A relative only (the viable global criterion). nonrel is
+# parked (raw M^p compounds ~1e9 by depth → global sort ≈ by depth, not contribution). A0 (cold,
+# no reg) already characterized. Flip these on to regenerate them.
+INCLUDE_NONREL = os.environ.get("INCLUDE_NONREL", "0") != "0"
+INCLUDE_A0 = os.environ.get("INCLUDE_A0", "0") != "0"
 
 # Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
@@ -78,13 +86,17 @@ SHARED = (
 )
 # Option B: load vnr, no reg recompute (already 30-ep trained).
 B_EXTRA = "--epochs_train 0 --epochs_norm_ft 0"
-# Option A: dense 80.86, short λ-reg norm-ft (sparse phase) before pruning.
-A_EXTRA = f"--epochs_train 0 --epochs_norm_ft {A_REG} --reparam_lambda 1e-4 --lr_norm_ft 0.01"
-# Option A0: dense 80.86, NO sparse phase — prune the net at init (tests whether the reg
-# phase actually helps the I-prune, or the criterion alone suffices).
+# Option A (THE thesis test): dense 80.86 → λ-reg norm-ft (push low-contribution ‖ṽ‖→0 so the
+# criterion has genuinely-redundant channels to drop) → prune-by-I → FT. mu_ema_momentum>0 keeps
+# σ LIVE during the reg phase (mean variant). normnet_main brackets the reg phase with ‖ṽ‖
+# snapshots (_contrib_pre_reg / _contrib_post_reg json) — the delta = the reg effect.
+A_EXTRA = (f"--epochs_train 0 --epochs_norm_ft {A_REG} --reparam_lambda {A_LAMBDA} "
+           f"--lr_norm_ft 0.01 --mu_ema_momentum {A_MU_EMA}")
+# Option A0: dense 80.86, NO sparse phase — cold prune at init (already characterized).
 A0_EXTRA = "--epochs_train 0 --epochs_norm_ft 0"
 
-REL_VARIANTS = [("rel", ""), ("nonrel", " --prop_non_relative")]
+# rel = the hero (mass-conserving, span~1e4, true contribution-to-output). nonrel optional.
+REL_VARIANTS = [("rel", "")] + ([("nonrel", " --prop_non_relative")] if INCLUDE_NONREL else [])
 
 
 def _write(tag, ckpt, extra, rflag):
@@ -109,12 +121,13 @@ def main():
         for lam, ckpt in RN_CKPTS.items():
             for rname, rflag in REL_VARIANTS:
                 made.append(_write(f"B_prop_{rname}_{lam}", ckpt, B_EXTRA, rflag))
-    # OPTION A — propagation (rel + nonrel) from the dense 80.86, WITH 5ep λ-reg sparse phase.
+    # OPTION A — propagation from the dense 80.86, WITH λ-reg sparse phase (THE thesis test).
     for rname, rflag in REL_VARIANTS:
         made.append(_write(f"A_prop_{rname}", DENSE_8086, A_EXTRA, rflag))
-    # OPTION A0 — same, NO sparse phase (prune at init) → does the reg phase help?
-    for rname, rflag in REL_VARIANTS:
-        made.append(_write(f"A0_prop_{rname}", DENSE_8086, A0_EXTRA, rflag))
+    # OPTION A0 — same, NO sparse phase (cold). Off by default (already characterized).
+    if INCLUDE_A0:
+        for rname, rflag in REL_VARIANTS:
+            made.append(_write(f"A0_prop_{rname}", DENSE_8086, A0_EXTRA, rflag))
     # CLASSICAL baselines (same harness: 80.86, mac 2G global, KD, no sparse phase). The
     # --scorer override (last-wins over SHARED's propagation) swaps the criterion. These are
     # the controls that should recover — magnitude/bn_scale lack the propagation gutting.
@@ -123,7 +136,7 @@ def main():
             made.append(_write(f"C0_{sc}", DENSE_8086, A0_EXTRA, f" --scorer {sc}"))
 
     print(f"\n{len(made)} experiments (mac_target={MAC_TARGET_G}G, FT={FT} DDP×{NPROC}, "
-          f"A_reg={A_REG}). Submit each:")
+          f"A_reg={A_REG}ep λ={A_LAMBDA} μ_ema={A_MU_EMA}). Submit each:")
     for tag in made:
         print(f"  python run_ddp.py --out_dir_name {tag}")
 
