@@ -129,6 +129,38 @@ def log_prune_distribution(pre, post):
     return per_layer, global_kept
 
 
+def log_score_distribution(scores, args):
+    """Per-layer propagation/per_layer SCORE stats (BEFORE pruning) → log + <tag>_scores.json.
+    This is the real-data measurement: the per-layer MEAN reveals depth-compounding (does the
+    score span orders of magnitude early→late?), CV the within-layer spread. Scores ordered by
+    the manager = forward order, so reading top→bottom is shallow→deep."""
+    log_info("per-layer score distribution (mean / CV / min / max, forward order):")
+    per_layer = {}
+    means = []
+    for name, s in scores.items():
+        s = s.float()
+        mean = float(s.mean()); std = float(s.std()) if s.numel() > 1 else 0.0
+        cv = std / (mean + 1e-12)
+        rec = {"width": int(s.numel()), "mean": mean, "cv": cv,
+               "min": float(s.min()), "max": float(s.max())}
+        per_layer[name] = rec
+        means.append((name, mean))
+        log_info(f"  {name}: w={s.numel():4d}  mean={mean:.3e}  cv={cv:.3f}  "
+                 f"min={float(s.min()):.3e}  max={float(s.max()):.3e}")
+    # cross-layer span = how many orders of magnitude the per-layer means cover (the
+    # compounding signature: a large span → global ranking sorts ~by depth, not importance).
+    mvals = [m for _, m in means if m > 0]
+    span = (max(mvals) / min(mvals)) if len(mvals) > 1 else 1.0
+    shallowest = means[0] if means else ("", 0.0)
+    deepest = means[-1] if means else ("", 0.0)
+    log_info(f"score cross-layer span (max layer-mean / min layer-mean) = {span:.3e}  "
+             f"[shallow {shallowest[0]}={shallowest[1]:.3e} → deep {deepest[0]}={deepest[1]:.3e}]")
+    import json as _json
+    with open(os.path.join(args.save_dir, f"{args.save_tag}_scores.json"), "w") as f:
+        _json.dump({"scorer": args.scorer, "relative": not args.prop_non_relative,
+                    "cross_layer_span": span, "per_layer": per_layer}, f, indent=2)
+
+
 def _run_phase(model, mgr, loaders, args, device, use_ddp, *, epochs, lr, tag, teacher=None):
     """Run one train/FT phase via the shared train_normalized loop. mgr=None → plain
     training; mgr active → training in normalized coordinates (WD acts on v_tilde). Swaps
@@ -239,6 +271,8 @@ def main(argv):
             cv_med = sorted(cvs)[len(cvs) // 2] if cvs else 0.0
             log_info(f"scores ({args.scorer}): {ntot} channels, {n0} below 0.1 "
                      f"({100.0 * n0 / max(ntot, 1):.1f}%), median per-layer CV={cv_med:.3f}")
+            if is_main():
+                log_score_distribution(scores, args)
         else:
             log_info(f"classical scorer ({args.scorer}) — stock tp importance, no normnet scores")
 
