@@ -1371,8 +1371,23 @@ class MeanResidualManager(BaseReparamManager):
         seeds = {name: _seed_for(name) for name in terminals}
 
         I_by_name = {}  # name → I^l (per-input-channel)
-        # Reverse forward order (named_modules order = topological sort assumption).
-        for name, rp in reversed(layers):
+        # Reverse-topological order from the DAG itself: a layer is ready only once ALL its
+        # downstream consumers are computed (I^l depends on I_by_name[d] for every d in dsts).
+        # named_modules order is NOT a valid topo sort for branched nets (e.g. ConvNeXt lists
+        # all downsample_layers before all stages, but downsample_layers.3 runs AFTER stages.2)
+        # — so derive the order explicitly instead of assuming reversed(layers) works.
+        rp_by_name = dict(layers)
+        done, order, remaining = set(), [], [name for name, _ in layers]
+        while remaining:
+            ready = [n for n in remaining
+                     if all(d in done for d, _ in topology.get(n, []))]
+            if not ready:
+                raise RuntimeError("propagation topology is cyclic or references unknown "
+                                   f"layers; stuck on {remaining}")
+            order.extend(ready); done.update(ready)
+            remaining = [n for n in remaining if n not in done]
+        for name in order:
+            rp = rp_by_name[name]
             M = Ms[name]
             out_l = _out_dim(rp)
             dsts = topology.get(name, [])

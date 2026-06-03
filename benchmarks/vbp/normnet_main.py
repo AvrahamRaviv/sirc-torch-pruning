@@ -100,6 +100,37 @@ def _ratio_for_mac(model, ex, imp_factory, ignored_factory, target_g, global_pru
     return best
 
 
+def _classifier(model):
+    """The logits head: resnet/mobilenet → .fc, convnext/timm → .head. None if neither."""
+    for attr in ("fc", "head"):
+        m = getattr(model, attr, None)
+        if isinstance(m, torch.nn.Linear):
+            return m
+    return None
+
+
+def _ignored_layers(model, model_type):
+    """Layers the global pruner must NOT touch.
+
+    cnn (resnet): only the classifier (.fc) — interior convs are all prunable.
+    convnext: MLP-only, exactly like ViT. Prune ONLY pwconv1's output (= the block's
+        4×dim intermediate, = pwconv2's input). Ignore the head, every downsample/stem
+        conv (their out-channels are the residual stream width), the depthwise dwconv, and
+        pwconv2 (its out-channels = residual stream). Mirrors vbp_imagenet.py's convnext arm.
+    """
+    ig = []
+    clf = _classifier(model)
+    if clf is not None:
+        ig.append(clf)
+    if model_type == "convnext":
+        for ds in model.downsample_layers:
+            ig += [m for m in ds.modules() if isinstance(m, torch.nn.Conv2d)]
+        for stage in model.stages:
+            for block in stage:
+                ig += [block.dwconv, block.pwconv2]
+    return ig
+
+
 def _layer_widths(model):
     """name → output width (out_channels / out_features) for every Conv2d / Linear."""
     w = {}
@@ -289,7 +320,7 @@ def main(argv):
                 mgr._sync_bn_stats()
             # PDF seed: propagation runs to the classifier (I^o = 𝟙 over classes, back through
             # W̄^fc) → final-stage features get real importance instead of a uniform tie.
-            clf = model.fc if hasattr(model, "fc") else None
+            clf = _classifier(model)
             scores = extract_normnet_scores(
                 mgr, args.scorer, example_inputs=(ex if args.scorer == "propagation" else None),
                 relative=not args.prop_non_relative, classifier=clf)
@@ -337,7 +368,7 @@ def main(argv):
             return NormalizedNetImportance(mdl, scores, group_reduction="mean", normalizer=norm)
 
         def _ignored(mdl):
-            return [mdl.fc] if hasattr(mdl, "fc") else []
+            return _ignored_layers(mdl, args.model_type)
 
         # MAC target overrides the raw channel ratio: 2G on RN50 (4.1G) ≈ 30% channels,
         # not 50% — channel-ratio ≠ MAC-ratio. Binary-search the global ratio whose
