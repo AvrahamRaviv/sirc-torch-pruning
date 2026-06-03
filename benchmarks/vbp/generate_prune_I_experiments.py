@@ -4,8 +4,8 @@ ALL from the v2 (80.86) lineage, targeting a fixed MAC budget. run_ddp.py fashio
 
 Hero criterion = the PDF's PROPAGATION importance I^l = W̄^l·I^{l+1} (--scorer propagation),
 NOT NCI. Both PDF derivations are swept:
-  relative     within-layer redistribution (drops the inter-layer transfer)   [default]
-  non-relative keeps σ_out^p inter-layer transfer → GLOBAL by design  (--prop_non_relative)
+  relative     W̄ = M^p·D  (columns normalized → within-layer/local)          [default]
+  non-relative W̄ = M^p     (raw product, no column-norm → cross-layer, compounds)
 
 Carries the two fixes that sabotaged the earlier run (both now on by default):
   P1  σ calibrated on CLEAN center-crop images (was the scale-0.08 augmented loader →

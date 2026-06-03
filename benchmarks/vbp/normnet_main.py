@@ -372,8 +372,8 @@ def parse_args(argv):
                         "(same harness, no normnet scores): magnitude (group L2) / bn_scale "
                         "(network-slimming BN γ).")
     p.add_argument("--prop_non_relative", action="store_true",
-                   help="propagation: use the non-relative criterion (keeps the inter-layer "
-                        "transfer σ_out^p → cross-layer/global). Default = relative (within-layer).")
+                   help="propagation: non-relative criterion W̄=M^p (raw product, no column-norm "
+                        "→ cross-layer, compounds). Default = relative W̄=M^p·D (within-layer).")
     p.add_argument("--pruning_ratio", type=float, default=0.5)
     p.add_argument("--mac_target_g", type=float, default=0.0,
                    help="target MACs in GMAC (e.g. 2.0). >0 overrides --pruning_ratio: "
