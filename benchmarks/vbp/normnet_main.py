@@ -35,7 +35,7 @@ import torch
 import torch_pruning as tp
 
 from vbp_common import (
-    setup_logging, build_dataloaders, load_model, validate,
+    setup_logging, build_dataloaders, build_calib_loader, load_model, validate,
     build_whole_net_reparam_layers,
 )
 from normalize_net import (
@@ -198,7 +198,10 @@ def main(argv):
         model, exclude_classifier=True, exclude_stem=args.exclude_stem)
     args.max_batches = args.calib_batches
     mgr = build_reparam_manager(model, names, device, args)
-    mgr.reparameterize(train_loader)            # post-act BN(affine=False) + v_tilde=σW
+    # Calibrate σ/μ on CLEAN center-crop images, NOT the augmented train loader (scale-0.08
+    # RandomResizedCrop distorts σ — and σ defines the normalized weight every score uses).
+    calib_loader = build_calib_loader(args, use_ddp=use_ddp)
+    mgr.reparameterize(calib_loader)            # post-act BN(affine=False) + v_tilde=σW
     if use_ddp:
         from normalize_net import _broadcast_model_state
         _broadcast_model_state(model)
@@ -250,12 +253,21 @@ def main(argv):
             log_info(f"saved pre-prune checkpoint → {pp}")
         pre_w = _layer_widths(model)            # widths before the structural edit
 
+        # GLOBAL pruning ranks all groups against ONE threshold (base_pruner cats every group's
+        # importance). A per-group normalizer ("mean" → each layer forced to mean-1) ERASES the
+        # cross-layer scale before that global ranking → reduces global pruning to ~per-layer-
+        # uniform AND kills the propagation criterion's σ_out^p inter-layer transfer (which is
+        # what makes non-relative I globally comparable BY DESIGN). normalizer=None keeps raw
+        # cross-layer-comparable scores → the global criterion is actually tested. Same setting
+        # for every scorer so the comparison is apples-to-apples.
+        norm = None if args.imp_normalizer == "none" else args.imp_normalizer
+
         def _imp(mdl):
             if args.scorer == "magnitude":
-                return tp.importance.GroupMagnitudeImportance(p=2, group_reduction="mean", normalizer="mean")
+                return tp.importance.GroupMagnitudeImportance(p=2, group_reduction="mean", normalizer=norm)
             if args.scorer == "bn_scale":
-                return tp.importance.BNScaleImportance()
-            return NormalizedNetImportance(mdl, scores, group_reduction="mean", normalizer="mean")
+                return tp.importance.BNScaleImportance(normalizer=norm)
+            return NormalizedNetImportance(mdl, scores, group_reduction="mean", normalizer=norm)
 
         def _ignored(mdl):
             return [mdl.fc] if hasattr(mdl, "fc") else []
@@ -293,6 +305,7 @@ def main(argv):
             import json as _json
             with open(os.path.join(args.save_dir, f"{args.save_tag}_prune.json"), "w") as f:
                 _json.dump({"scorer": args.scorer, "relative": not args.prop_non_relative,
+                            "imp_normalizer": args.imp_normalizer,
                             "global_pruning": args.global_pruning, "target": tgt,
                             "global_ratio": round(ratio, 4), "pre_ft_val_acc": round(acc, 6),
                             "macs_g": round(pr_macs, 4), "macs_pct": round(100*pr_macs/dense_macs, 1),
@@ -366,6 +379,12 @@ def parse_args(argv):
                    help="target MACs in GMAC (e.g. 2.0). >0 overrides --pruning_ratio: "
                         "binary-search the global ratio that hits it. 0 = use ratio.")
     p.add_argument("--global_pruning", action="store_true")
+    p.add_argument("--imp_normalizer", default="none",
+                   choices=["none", "mean", "max", "sum", "standarization", "gaussian"],
+                   help="per-group importance normalizer (applied BEFORE the global threshold). "
+                        "Default 'none' = keep raw cross-layer-comparable scores (REQUIRED for "
+                        "global pruning + the propagation criterion). 'mean' = old behavior "
+                        "(per-layer mean-1 → global pruning collapses to per-layer-uniform).")
     p.add_argument("--no_bn_recalib", action="store_true")
     p.add_argument("--no_save_preprune", action="store_true",
                    help="skip saving the pre-prune dense checkpoint (default: save it)")

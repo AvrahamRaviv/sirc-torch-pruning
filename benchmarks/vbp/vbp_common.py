@@ -204,6 +204,28 @@ def build_dataloaders(args, use_ddp=True):
     return train_loader, val_loader, train_sampler
 
 
+def build_calib_loader(args, use_ddp=True):
+    """Loader over the TRAIN split with the CLEAN (val) transform — center-crop, no
+    RandomResizedCrop/flip/augmentation. Used to calibrate the reparam σ/μ stats: those
+    stats define the normalized weight v_tilde=σW that every normnet score is built on, so
+    they must reflect the real input distribution, NOT the scale-0.08 augmented crops the
+    training loader serves (which inflate/distort σ). Mirrors train_v2's calib_loader.
+
+    Shuffled so a small max_batches calibration sees a representative class mix. Single-rank
+    (no DistributedSampler): calibration is a short read; every rank computing the same stats
+    on the same shuffled stream is fine and avoids a sharded-stats sync."""
+    calib_transform = get_val_transform(args.model_type, resize=getattr(args, "val_resize", 256))
+    train_pkl = os.path.join(args.data_path, "train_samples.pkl")
+    if os.path.exists(train_pkl):
+        with open(train_pkl, "rb") as f:
+            samples = pickle.load(f)
+        calib_dst = FastImageNet(samples, transform=calib_transform)
+    else:
+        calib_dst = ImageFolder(os.path.join(args.data_path, "train"), transform=calib_transform)
+    return DataLoader(calib_dst, batch_size=args.val_batch_size, shuffle=True,
+                      num_workers=args.num_workers, pin_memory=True, drop_last=True)
+
+
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
