@@ -1272,12 +1272,28 @@ class MeanResidualManager(BaseReparamManager):
                 w_red = w                                          # [out, in]
             return w_red.t().abs()                                 # [in, out]
 
+        def _post_act_std(rp, consumer):
+            """Post-activation output std of rp = the PDF inter-layer transfer Σ^{l+1}.
+            Best source: the downstream consumer's input std (sigma_x — measured AFTER the
+            nonlinearity, so it IS rp's post-act output std). Falls back to rp's own
+            sigma_out_x (pre-act) or ones when unavailable / dim-mismatched."""
+            od = _out_dim(rp)
+            for obj, attr in ((consumer, "sigma_x"), (rp, "sigma_out_x")):
+                s = getattr(obj, attr, None) if obj is not None else None
+                if s is not None and s.numel() == od:
+                    return s.detach()
+            ref = getattr(rp, "sigma_out_x", None)
+            dev = ref.device if ref is not None else next(rp.parameters()).device
+            dt = ref.dtype if ref is not None else next(rp.parameters()).dtype
+            return torch.ones(od, device=dev, dtype=dt)
+
         layers = list(self._reparam_modules.items())  # forward order
         Ms = {name: _layer_M(rp) for name, rp in layers}
 
         # ---- DAG walk path (M3): topology provided ----
         if topology is not None:
-            return self._propagate_dag(layers, Ms, topology, I_out, eps, p, relative)
+            return self._propagate_dag(layers, Ms, topology, I_out, eps, p, relative,
+                                       post_act_std=_post_act_std)
 
         # ---- Sequential path (M2): no topology ----
         # Seed I_out at last layer's output
@@ -1293,6 +1309,14 @@ class MeanResidualManager(BaseReparamManager):
             if I_next.numel() != last_out_dim:
                 raise ValueError(f"I_out has {I_next.numel()} entries, "
                                  f"expected {last_out_dim} (last layer's out_dim)")
+
+        # Post-activation output std per layer = the PDF transfer Σ^{l+1} (= consumer input
+        # std after the nonlinearity). Sequential: consumer = the next layer; its sigma_x is
+        # this layer's post-act output std. Terminal → own sigma_out_x (pre-act) fallback.
+        sigma_post = {}
+        for idx, (name, rp) in enumerate(layers):
+            cons = layers[idx + 1][1] if idx + 1 < len(layers) else None
+            sigma_post[name] = _post_act_std(rp, cons)
 
         results = []  # reverse-collected, flipped at end
         for idx in range(len(layers) - 1, -1, -1):
@@ -1312,21 +1336,27 @@ class MeanResidualManager(BaseReparamManager):
                 # variance-consistent, independent of p).
                 I_l = M.norm(p=2, dim=1)  # [in]
             else:
-                # SCORE RECURSION:  I^l = W̄^l · I^{l+1}  (spec: additions.md §4)
-                Mp = M.pow(p)                           # M^p: variance (p=2) or std (p=1)
-                if relative:
-                    col_sums = Mp.sum(dim=0).clamp(min=eps)  # [out]
-                    Wbar = Mp / col_sums[None, :]       # · D: columns→sum 1 (within-layer/local)
-                else:
-                    Wbar = Mp                           # non-relative: raw M^p (cross-layer, compounds)
-                I_l = Wbar @ I_next                     # propagate one layer back → [in]
+                # SCORE RECURSION I^l = W̄^l·I^{l+1} (normalized_nets_pruning.pdf steps 7-8).
+                # BOTH forms use the column-stochastic W̄ = M^p·D, D=1/col-sum = 1/σ^l_j^p
+                # (cancels the pre-activation output variance). They differ ONLY by the
+                # inter-layer transfer Σ^{l+1} = post-act output std^p: relative DROPS it
+                # (within-layer/local — PDF p3); non-relative KEEPS it (D^lΣ^{l+1}=f_j the
+                # measured activation gain → cross-layer). Raw M^p (no D) was a BUG: it
+                # compounds the σ^l_j it should divide out (∏ col-sum ≪1 → vanish).
+                Mp = M.pow(p)
+                col_sums = Mp.sum(dim=0).clamp(min=eps)        # = σ^l_j^p (pre-act output)
+                Wbar = Mp / col_sums[None, :]                  # · D: column-stochastic
+                if not relative:
+                    I_next = sigma_post[name].pow(p) * I_next  # · Σ^{l+1}: post-act transfer
+                I_l = Wbar @ I_next                            # propagate one layer back → [in]
 
             results.append((name, I_l))
             I_next = I_l  # chains to layer l-1 (whose out_dim should equal in_l = I_next.numel())
 
         return OrderedDict(reversed(results))
 
-    def _propagate_dag(self, layers, Ms, topology, I_out, eps, p=2, relative=True):
+    def _propagate_dag(self, layers, Ms, topology, I_out, eps, p=2, relative=True,
+                       post_act_std=None):
         """DAG reverse-walk using a downstream+weight topology (M3).
 
         For each layer L (visited in reverse forward order — assumes named_modules order
@@ -1334,7 +1364,8 @@ class MeanResidualManager(BaseReparamManager):
         and other standard architectures), gather:
             I_next = Σ_{(d, w) in topology[L]} w · I[d]
         with I[d] already computed. Terminal layers (empty downstream list) seed from I_out.
-        Then I[L] = W̄^L · I_next.
+        Then I[L] = W̄^L · I_next. `post_act_std(rp, consumer)` supplies the non-relative
+        inter-layer transfer Σ^{l+1} (= consumer input std).
         """
         def _out_dim(rp):
             return rp.out_features if hasattr(rp, "out_features") else rp.out_channels
@@ -1386,6 +1417,16 @@ class MeanResidualManager(BaseReparamManager):
                                    f"layers; stuck on {remaining}")
             order.extend(ready); done.update(ready)
             remaining = [n for n in remaining if n not in done]
+
+        # Non-relative inter-layer transfer Σ^{l+1} = post-act output std per layer = a
+        # downstream consumer's input std (sigma_x). All consumers share the same activation,
+        # so any one gives the channel's post-act std; terminals fall back to own sigma_out_x.
+        sigma_post = {}
+        if not relative and post_act_std is not None:
+            for name, rp in layers:
+                dsts = topology.get(name, [])
+                cons = rp_by_name.get(dsts[0][0]) if dsts else None
+                sigma_post[name] = post_act_std(rp, cons)
         for name in order:
             rp = rp_by_name[name]
             M = Ms[name]
@@ -1411,17 +1452,18 @@ class MeanResidualManager(BaseReparamManager):
                                            f"between them.")
                     I_next = I_next + float(w) * I_d
 
-            # SCORE RECURSION (spec: additions.md §4). relative → W̄=M^p·D (columns→sum 1,
-            # within-layer/local); non-relative → W̄=M^p raw product (cross-layer, compounds).
-            # σ_out^p is NOT a per-layer transfer here — it weights residual-branch JOINS only
-            # (build_propagation_topology). (Reverted e809fff, which wrongly added D+σ_out^p
-            # to non-relative and made the chain explode multiplicatively with depth.)
+            # SCORE RECURSION I^l = W̄^l·I^{l+1} (normalized_nets_pruning.pdf steps 7-8). BOTH
+            # forms use column-stochastic W̄ = M^p·D, D=1/col-sum=1/σ^l_j^p (divides out the
+            # pre-act output variance). They differ ONLY by the inter-layer transfer Σ^{l+1} =
+            # post-act output std^p: relative DROPS it (within-layer/local); non-relative KEEPS
+            # it (D^lΣ^{l+1}=f_j the measured activation gain → cross-layer comparison, PDF p3).
+            # This is distinct from the residual-JOIN weights `w` above (σ^p/Σσ^p fan-in split):
+            # `w` mixes branches into I_next; Σ^{l+1} is THIS layer's per-channel output gain.
             Mp = M.pow(p)
-            if relative:
-                col_sums = Mp.sum(dim=0).clamp(min=eps)
-                Wbar = Mp / col_sums[None, :]           # · D: column-normalized
-            else:
-                Wbar = Mp                               # raw M^p product
+            col_sums = Mp.sum(dim=0).clamp(min=eps)     # = σ^l_j^p (pre-act output)
+            Wbar = Mp / col_sums[None, :]               # · D: column-stochastic
+            if not relative:
+                I_next = sigma_post[name].pow(p) * I_next   # · Σ^{l+1}: post-act transfer
             I_by_name[name] = Wbar @ I_next
 
         # Return in forward order

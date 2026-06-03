@@ -68,7 +68,10 @@ def _classifier_seed(mgr, topology, classifier, p, relative):
         return None                                  # in_features ≠ terminal out → can't seed
     M = (W.abs() * sigma_out[None, :]).t()           # [feat, classes]
     Mp = M.pow(p)
-    Wbar = Mp / Mp.sum(dim=0).clamp(min=1e-8)[None, :] if relative else Mp
+    # Column-stochastic (D = 1/col-sum) for BOTH forms — the classifier transfer W̄^fc·𝟙 is
+    # the D^L normalizer of the PDF chain; the relative/non-relative split lives in the layer
+    # recursion's inter-layer transfer Σ^{l+1}, not the seed. (`relative` no longer branches here.)
+    Wbar = Mp / Mp.sum(dim=0).clamp(min=1e-8)[None, :]
     num_classes = W.shape[0]
     ones = torch.full((num_classes,), 1.0 / num_classes, device=Wbar.device, dtype=Wbar.dtype)
     return {tname: Wbar @ ones}                      # [feat] — real per-feature importance
