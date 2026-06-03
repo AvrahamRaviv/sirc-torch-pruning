@@ -1,18 +1,22 @@
 """
-Generate the 2 v2-recipe from-scratch experiments (100 epochs each), run_ddp.py fashion:
+Generate the v2-recipe from-scratch experiments (100 epochs each), run_ddp.py fashion.
+v2_baseline is KEPT (already run); regenerate only the switch arm:
 
-  A  v2_baseline       official torchvision v2 recipe, plain, 100ep.
-  B  v2_switch_e{X}     identical recipe, switch to normalized coords at epoch X.
+  v2_switch_e{X}   official recipe, switch to normalized coords at epoch X, WITH the S1
+                   σ² grad-preconditioner (--switch_precond) that cancels the 1/σ² post-
+                   switch LR inflation. Without it the net collapsed the epoch after the
+                   switch (grad/param ×~50). The switch also dumps a σ sidecar
+                   (<tag>_preswitch_e{X}_meta.pt) + pre-switch weights so the fix can be
+                   iterated from the checkpoint without retraining to epoch X.
 
-Compare per-epoch val_acc (raw + EMA) curves in <tag>_metrics.jsonl → §7: does the
-mid-training switch converge faster / higher than the plain official protocol?
+Compare per-epoch val_acc (raw + EMA) curves in <tag>_metrics.jsonl vs v2_baseline → §7:
+does the mid-training switch converge faster / higher than the plain protocol?
 
 lr is scaled for the effective batch: official used 0.5 @ batch 1024 (8×128); here 4 GPUs
 × 128 = 512 → lr 0.25 (linear scaling). Adjust if you change GPUs/batch.
 
 Run:
     python benchmarks/vbp/generate_v2_experiments.py
-    python run_ddp.py --out_dir_name v2_baseline
     python run_ddp.py --out_dir_name v2_switch_e30
 """
 import os
@@ -36,16 +40,14 @@ COMMON = (
     f"--reparam_variant bn --norm_bn_momentum 0.01 --calib_batches 50"
 )
 
+# v2_baseline kept from the prior run — not regenerated. Switch arm carries the S1 fix.
 ARMS = [
-    ("v2_baseline", "--reparam_at_epoch -1"),
-    (f"v2_switch_e{SWITCH_EPOCH}", f"--reparam_at_epoch {SWITCH_EPOCH}"),
-    # Fast functionality smokes (3 epochs × 3 batches each → ~1-2 min). Validate the recipe,
-    # DDP, and the switch wiring. --epochs/--warmup/--limit_batches/--calib_batches after
-    # COMMON → argparse last-wins overrides the 100ep values.
-    ("v2_smoke_baseline",
-     "--epochs 3 --warmup_epochs 1 --limit_batches 3 --calib_batches 3 --reparam_at_epoch -1"),
+    (f"v2_switch_e{SWITCH_EPOCH}", f"--reparam_at_epoch {SWITCH_EPOCH} --switch_precond"),
+    # Fast smoke (switch at e1, 3 epochs × 3 batches) — verifies the switch + precond wiring
+    # and that val_acc does NOT collapse post-switch. ~1-2 min. argparse last-wins overrides.
     ("v2_smoke_switch_e1",
-     "--epochs 3 --warmup_epochs 1 --limit_batches 3 --calib_batches 3 --reparam_at_epoch 1"),
+     "--epochs 3 --warmup_epochs 1 --limit_batches 3 --calib_batches 3 "
+     "--reparam_at_epoch 1 --switch_precond"),
 ]
 
 SH = (

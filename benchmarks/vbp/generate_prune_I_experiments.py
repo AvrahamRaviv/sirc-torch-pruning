@@ -4,8 +4,16 @@ ALL from the v2 (80.86) lineage, targeting a fixed MAC budget. run_ddp.py fashio
 
 Hero criterion = the PDF's PROPAGATION importance I^l = W̄^l·I^{l+1} (--scorer propagation),
 NOT NCI. Both PDF derivations are swept:
-  relative     W̄ = M^p·D   (column-normalized, mass-preserving)        [default]
-  non-relative W̄ = M^p     (--prop_non_relative; compounds through depth)
+  relative     within-layer redistribution (drops the inter-layer transfer)   [default]
+  non-relative keeps σ_out^p inter-layer transfer → GLOBAL by design  (--prop_non_relative)
+
+Carries the two fixes that sabotaged the earlier run (both now on by default):
+  P1  σ calibrated on CLEAN center-crop images (was the scale-0.08 augmented loader →
+      distorted the normalized weights every score is built on).
+  P2  --imp_normalizer none: keep raw cross-layer-comparable scores. The old per-group
+      mean-1 normalization erased the global scale BEFORE the global threshold, collapsing
+      global pruning to per-layer-uniform and nullifying non-relative's σ_out^p. nonrel was
+      never actually tested as global until now.
 
 MAC target (not channel ratio): --mac_target_g 2.0 → normnet_main binary-searches the
 global ratio that hits 2 GMAC. On RN50 (4.1G dense) 2G ≈ 30% channels, NOT 50% — channel
@@ -48,7 +56,9 @@ A_REG = int(os.environ.get("A_REG_EPOCHS", "5"))              # Option A short �
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
 # (edit RN_CKPTS to point at it). Until then only Option A (self-contained from 80.86) runs.
 INCLUDE_B = os.environ.get("INCLUDE_OPTION_B", "0") != "0"
-INCLUDE_CLASSICAL = os.environ.get("INCLUDE_CLASSICAL", "1") != "0"   # magnitude + bn_scale
+# C0_magnitude already run + kept → classical baselines OFF by default now. Set
+# INCLUDE_CLASSICAL=1 to regenerate them.
+INCLUDE_CLASSICAL = os.environ.get("INCLUDE_CLASSICAL", "0") != "0"   # magnitude + bn_scale
 RN_CKPTS = {
     "l1e-3": f"{BASE_OUT}/RN_bn_l1e-3/RN_bn_l1e-3_vnr.pth",
     "l3e-3": f"{BASE_OUT}/RN_bn_l3e-3/RN_bn_l3e-3_vnr.pth",

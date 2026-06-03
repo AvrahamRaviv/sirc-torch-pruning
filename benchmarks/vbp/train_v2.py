@@ -172,6 +172,47 @@ class EMA:
             p.requires_grad_(False)
 
 
+def _collect_switch_sigma(mgr):
+    """Per-layer input σ at the switch point. bn variant → sqrt(bn.running_var+eps); mean
+    variant → the sigma_x buffer. σ drives the post-switch (grad/param)=plain/σ² inflation,
+    so this is the data the switch-LR fix is calibrated from."""
+    out = {}
+    for name, rp in mgr._reparam_modules.items():
+        bn = getattr(rp, "bn", None)
+        if bn is not None and hasattr(bn, "running_var"):
+            out[name] = torch.sqrt(bn.running_var + bn.eps).detach().cpu().clone()
+        else:
+            s = getattr(rp, "sigma_x", None)
+            if s is not None:
+                out[name] = s.detach().cpu().clone()
+    return out
+
+
+def _install_switch_precond(mgr):
+    """S1 fix: cancel the post-switch 1/σ² LR inflation by scaling each v_tilde gradient by σ².
+
+    After the switch the trainable weight is v_tilde=σW. By chain rule grad_vtilde=grad_W/σ,
+    so the per-step RELATIVE move (grad/param) inflates by 1/σ² vs plain coords — same LR then
+    overshoots ~50× (×∞ for dead channels) and destroys the net in one epoch. Multiplying
+    grad_vtilde by σ² restores the plain-coords relative step exactly:
+        lr·(σ²·grad_vtilde)/v_tilde = lr·(σ²·grad_W/σ)/(σW) = lr·grad_W/W   (plain).
+    σ² is FROZEN at switch from bn.running_var (already broadcast → identical across DDP ranks,
+    so every rank scales identically). Dead channels (σ²→0) get a ~0 factor → frozen at their
+    function-preserving value (they contribute ~nothing, so freezing is safe, not a collapse).
+    Returns the hook handles (kept alive by the caller)."""
+    handles = []
+    for rp in mgr._reparam_modules.values():
+        bn = getattr(rp, "bn", None)
+        vt = getattr(rp, "v_tilde", None)
+        if bn is None or vt is None or not hasattr(bn, "running_var"):
+            continue
+        sig2 = bn.running_var.detach().clone()                  # [in] frozen σ² at switch
+        shape = [1, sig2.numel()] + [1] * (vt.dim() - 2)        # broadcast on in-dim
+        factor = sig2.view(*shape)
+        handles.append(vt.register_hook(lambda g, f=factor: g * f))
+    return handles
+
+
 def build_opt(model, lr, args):
     decay, no_decay = [], []
     for _n, p in model.named_parameters():
@@ -283,10 +324,33 @@ def main(argv):
             if use_ddp:
                 _broadcast_model_state(raw)
             optimizer = build_opt(raw, lr_at(epoch, args), args)   # new params (v_tilde,m)
+            if args.switch_precond:
+                _switch_precond_handles = _install_switch_precond(mgr)
+                log_info(f"switch σ² grad-preconditioner ON ({len(_switch_precond_handles)} "
+                         f"layers) — cancels the 1/σ² LR inflation")
             if ema is not None:
                 ema.rebuild(raw)                            # EMA stale after structural change
             train_model = (nn.parallel.DistributedDataParallel(raw, device_ids=[args.local_rank])
                            if use_ddp else raw)
+            # Sidecar (rank 0): the per-layer σ at the switch + EMA/epoch/lr. σ is what drives
+            # the post-switch dynamics — (grad/param) inflates by 1/σ², so this is the data the
+            # switch-LR fix is designed from. Lets a fix be iterated from the checkpoint (load
+            # → reparam → fix → a few epochs) instead of retraining to this epoch each time.
+            if is_main():
+                sig = _collect_switch_sigma(mgr)
+                allsig = torch.cat([s.flatten() for s in sig.values()]) if sig else torch.zeros(1)
+                meta = os.path.join(args.save_dir, f"{args.save_tag}_preswitch_e{epoch}_meta.pt")
+                torch.save({"epoch": epoch, "lr": lr_at(epoch, args), "arch": args.cnn_arch,
+                            "ema_state": (ema.shadow.state_dict() if ema is not None else None),
+                            "sigma_per_layer": sig,
+                            "sigma_summary": {"median": float(allsig.median()),
+                                              "p10": float(allsig.quantile(0.1)),
+                                              "min": float(allsig.min()),
+                                              "frac_below_0.05": float((allsig < 0.05).float().mean())}},
+                           meta)
+                log_info(f"SWITCH σ: median={allsig.median():.3f} p10={allsig.quantile(0.1):.3f} "
+                         f"frac(σ<0.05)={float((allsig<0.05).float().mean()):.2f} → 1/σ² LR inflation "
+                         f"median≈{float((1.0/allsig.clamp(min=1e-3)**2).median()):.0f}× (saved {meta})")
             log_info(f"SWITCHED to normalized coords at epoch {epoch} "
                      f"({len(names)} layers; optimizer + EMA rebuilt)")
 
@@ -374,6 +438,9 @@ def parse_args(argv):
     p.add_argument("--reparam_lambda", type=float, default=0.0)
     p.add_argument("--mu_ema_momentum", type=float, default=0.0)
     p.add_argument("--exclude_stem", action="store_true")
+    p.add_argument("--switch_precond", action="store_true",
+                   help="S1 fix: scale post-switch v_tilde grads by σ² to cancel the 1/σ² LR "
+                        "inflation that otherwise collapses the net the epoch after the switch.")
     p.add_argument("--calib_batches", type=int, default=50)
     # io / ddp
     p.add_argument("--save_dir", required=True); p.add_argument("--save_tag", default="v2")
