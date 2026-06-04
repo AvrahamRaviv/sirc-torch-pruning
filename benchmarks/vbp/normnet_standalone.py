@@ -208,33 +208,102 @@ def select_prunable(model, first_conv, classifier):
 
 
 @torch.no_grad()
+def fold_bn(model, example_inputs):
+    """Fold every Conv2d/Linear -> BatchNorm adjacency into the layer weights; replace the
+    BN with Identity. Function-preserving (uses running stats; call in eval()).
+
+    BN is a real per-channel operator (γ/σ_run scale) in the forward chain. If it's NOT
+    folded, the score either ignores it (raw-W magnitude) or smuggles it in via the
+    calibrated activation σ — entangling weight scale with activation scale. Folding bakes
+    γ/σ_run into the weight so M is honest and the propagation chain is pure Conv/Linear.
+
+    Adjacency is found by TRACING (data_ptr match), not by walking nn.Sequential — so it
+    also catches ResNet bottleneck BNs (conv1->bn1 ... are block attributes, NOT in a
+    Sequential, which the Sequential-only fold_all_conv_bn misses). ConvNeXt has no BN
+    (LayerNorm) -> folds 0, logits unchanged."""
+    model.eval()
+    producers = {}      # data_ptr(conv/linear output) -> module
+    pairs = []          # (conv_or_linear, bn) where bn consumes that output directly
+    def prod_hook(mod, inp, out):
+        producers[out.data_ptr()] = mod
+    def bn_hook(mod, inp, out):
+        p = producers.get(inp[0].data_ptr())
+        if p is not None:
+            pairs.append((p, mod))
+    handles = []
+    for m in model.modules():
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            handles.append(m.register_forward_hook(prod_hook))
+        elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            handles.append(m.register_forward_hook(bn_hook))
+    model(example_inputs)
+    for h in handles:
+        h.remove()
+
+    name2mod = dict(model.named_modules())
+    mod2name = {m: n for n, m in name2mod.items()}
+    folded = 0
+    for conv, bn in pairs:
+        sigma = torch.sqrt(bn.running_var + bn.eps)
+        gamma = bn.weight if bn.affine else torch.ones_like(bn.running_mean)
+        beta  = bn.bias   if bn.affine else torch.zeros_like(bn.running_mean)
+        scale = gamma / sigma                                   # [C_out]
+        if isinstance(conv, nn.Conv2d):
+            conv.weight.data.mul_(scale[:, None, None, None])
+        else:
+            conv.weight.data.mul_(scale[:, None])
+        b = conv.bias.data if conv.bias is not None else torch.zeros(scale.numel(), device=conv.weight.device)
+        b_eff = scale * (b - bn.running_mean) + beta
+        if conv.bias is None:
+            conv.bias = nn.Parameter(b_eff.detach().clone())
+        else:
+            conv.bias.data.copy_(b_eff)
+        parent_name, _, child = mod2name[bn].rpartition(".")
+        setattr(name2mod[parent_name] if parent_name else model, child, nn.Identity())
+        folded += 1
+    return folded
+
+
+@torch.no_grad()
 def calibrate(model, prunable, loader, device, n_batches, save_input_for):
-    """One pass: per prunable layer capture input mean/std (mu_in, sigma_in) per input
-    channel, and forward FIRING ORDER (a valid topo sort of the prunable DAG).
-    `save_input_for` modules also stash one input batch (for the fold sanity check)."""
-    stats = {m: {"sum": None, "sqsum": None, "n": 0} for m in prunable.values()}
+    """One pass: per prunable layer capture input mean/std (mu_in, sigma_in) per INPUT
+    channel AND output std (sigma_out) per OUTPUT channel, plus forward FIRING ORDER (a
+    valid topo sort of the prunable DAG). `save_input_for` modules also stash one input
+    batch (for the fold sanity check).
+
+    sigma_out is the layer's OWN per-output-channel activation std = the non-relative
+    inter-layer transfer Σ^{l+1}. Measured directly (consumer-INDEPENDENT) — NOT borrowed
+    from a downstream consumer's input σ, which double-counts the σ already inside that
+    consumer's M and gets poisoned by off-path residual-stream consumers (the drift bug)."""
+    stats     = {m: {"sum": None, "sqsum": None, "n": 0} for m in prunable.values()}
+    out_stats = {m: {"sum": None, "sqsum": None, "n": 0} for m in prunable.values()}
     fire_order = []
     seen = set()
     saved_inputs = {}
+
+    def _accum(st, t, conv):
+        # conv-type -> NCHW reduce (dim 1 channels); else channels-LAST (dim -1)
+        if conv:
+            s = t.sum(dim=(0, 2, 3)); sq = (t * t).sum(dim=(0, 2, 3)); cnt = t.numel() // t.size(1)
+        else:
+            tf = t.reshape(-1, t.size(-1)); s = tf.sum(0); sq = (tf * tf).sum(0); cnt = tf.size(0)
+        st["sum"]   = s  if st["sum"]   is None else st["sum"]   + s
+        st["sqsum"] = sq if st["sqsum"] is None else st["sqsum"] + sq
+        st["n"]    += cnt
 
     def pre_hook(mod, inp):
         x = inp[0].detach()
         if mod not in seen:
             fire_order.append(mod); seen.add(mod)
-        # channel axis depends on LAYER TYPE, not tensor rank: Conv2d is NCHW (dim 1);
-        # Linear is channels-LAST (dim -1) — and in ConvNeXt its input is 4-D [N,H,W,C].
-        if isinstance(mod, nn.Conv2d):
-            s  = x.sum(dim=(0, 2, 3)); sq = (x * x).sum(dim=(0, 2, 3)); cnt = x.numel() // x.size(1)
-        else:                   # Linear: [..., C]
-            xf = x.reshape(-1, x.size(-1)); s = xf.sum(0); sq = (xf * xf).sum(0); cnt = xf.size(0)
-        st = stats[mod]
-        st["sum"]   = s  if st["sum"]   is None else st["sum"]   + s
-        st["sqsum"] = sq if st["sqsum"] is None else st["sqsum"] + sq
-        st["n"]    += cnt
+        _accum(stats[mod], x, isinstance(mod, nn.Conv2d))
         if mod in save_input_for and mod not in saved_inputs:
             saved_inputs[mod] = x[:4].clone()       # tiny slice for the assert
 
-    handles = [m.register_forward_pre_hook(pre_hook) for m in prunable.values()]
+    def post_hook(mod, inp, out):
+        _accum(out_stats[mod], out.detach(), isinstance(mod, nn.Conv2d))
+
+    handles  = [m.register_forward_pre_hook(pre_hook) for m in prunable.values()]
+    handles += [m.register_forward_hook(post_hook)    for m in prunable.values()]
     model.eval()
     log(f"calib: starting {n_batches} batches on {device} ...")
     bi = 0
@@ -248,13 +317,16 @@ def calibrate(model, prunable, loader, device, n_batches, save_input_for):
     for h in handles:
         h.remove()
 
-    mu, sigma = {}, {}
-    for m, st in stats.items():
+    def _finalize(st):
         mean = st["sum"] / st["n"]
         var  = st["sqsum"] / st["n"] - mean * mean
-        mu[m]    = mean
-        sigma[m] = var.clamp_min(1e-8).sqrt()
-    return mu, sigma, fire_order, saved_inputs
+        return mean, var.clamp_min(1e-8).sqrt()
+
+    mu, sigma, sigma_out = {}, {}, {}
+    for m in prunable.values():
+        mu[m], sigma[m]    = _finalize(stats[m])
+        _,     sigma_out[m] = _finalize(out_stats[m])
+    return mu, sigma, sigma_out, fire_order, saved_inputs
 
 
 def assert_fold_preserving(layer, mu, sigma, x):
@@ -317,7 +389,7 @@ def discover_edges(model, example_inputs, prunable):
 
 
 @torch.no_grad()
-def compute_scores(prunable, sigma, mu, edges, fire_order, p=2):
+def compute_scores(prunable, sigma, sigma_out, mu, edges, fire_order, p=2):
     """Returns dict mode -> {layer: per-input-channel score}.
 
     nonrel spectral caveat: propagation is an inhomogeneous product of per-layer
@@ -327,18 +399,19 @@ def compute_scores(prunable, sigma, mu, edges, fire_order, p=2):
     dist}[sigma_post^p] != 1 in general -> geometric drift over depth. So nonrel is
     cross-layer in intent; verify its dynamic range before trusting it globally
     (a within-layer ranker via 'mean' normalization is the safe use).
+
+    sigma_post = each layer's OWN measured output std (consumer-INDEPENDENT). NOT the
+    downstream consumer's input σ: that borrow double-counts the σ already inside the
+    consumer's M and averages in off-path residual-stream consumers — production
+    (reparam._propagate_dag) warns this "poisoned ... by orders of magnitude".
     """
     def n_out(L): return L.out_channels if isinstance(L, nn.Conv2d) else L.out_features
 
     M = {L: layer_M(L, sigma[L]) for L in prunable.values()}
-    sigma_post = {}     # per-OUTPUT-channel post-act std = a consumer's input std (Sigma^{l+1})
-    for L in prunable.values():
-        cons = edges[L]
-        s = None
-        for C in cons:
-            if sigma[C].numel() == n_out(L):
-                s = sigma[C] if s is None else s + sigma[C]
-        sigma_post[L] = (s / len(cons)) if (s is not None and cons) else torch.ones(n_out(L), device=M[L].device)
+    # Σ^{l+1} transfer = layer's own per-output-channel std (fallback: ones if shape off).
+    sigma_post = {L: (sigma_out[L] if sigma_out[L].numel() == n_out(L)
+                      else torch.ones(n_out(L), device=M[L].device))
+                  for L in prunable.values()}
 
     nci = {L: (M[L].pow(2)).sum(dim=1) for L in prunable.values()}   # one hop = sigma_i^2||W_i||^2
     # plain magnitude on the SAME input axis (no sigma): mag_i = ||W[:,i]||.  nci = sigma^2 mag^2
@@ -523,6 +596,16 @@ def main():
     log("model ready")
     example_inputs = torch.randn(1, 3, 224, 224, device=device)
 
+    # fold native BN into the preceding Conv/Linear BEFORE scoring: bakes γ/σ_run into the
+    # weight so M is honest and the chain is pure Conv/Linear (boss's "fold BN back").
+    # Function-preserving -> logits must be unchanged.
+    model.eval()
+    ref = model(example_inputs).detach().clone()
+    n_bn = fold_bn(model, example_inputs)
+    dlogit = (ref - model(example_inputs)).abs().max().item()
+    log(f"fold_bn: {n_bn} BNs folded into Conv/Linear | max|Δlogit| = {dlogit:.2e} "
+        f"{'OK' if dlogit < 1e-3 else 'FAIL (fold not function-preserving!)'}")
+
     # base = loaded checkpoint (no training; weights come from --ckpt)
     _, acc0 = run_epoch(model, val_loader, device, limit=args.limit_batches)
     macs0, params0 = tp.utils.count_ops_and_params(model, example_inputs)
@@ -534,8 +617,8 @@ def main():
     name2mod = dict(model.named_modules())
     mod2name = {m: n for n, m in name2mod.items()}
     fold_check = list(prunable.values())[:2]
-    mu, sigma, fire_order, saved = calibrate(model, prunable, train_loader, device,
-                                             args.calib_batches, save_input_for=fold_check)
+    mu, sigma, sigma_out, fire_order, saved = calibrate(model, prunable, train_loader, device,
+                                                        args.calib_batches, save_input_for=fold_check)
     log(f"calib done: {len(prunable)} prunable layers | fire-order len {len(fire_order)}")
 
     # 3) fold function-preservation check
@@ -549,7 +632,7 @@ def main():
     log("discovering layer graph (dependency) ...")
     edges = discover_edges(model, example_inputs, prunable)
     log("computing scores (magnitude/nci/rel/nonrel) ...")
-    scores_by_mode = compute_scores(prunable, sigma, mu, edges, fire_order, p=args.p)
+    scores_by_mode = compute_scores(prunable, sigma, sigma_out, mu, edges, fire_order, p=args.p)
     align_ok = assert_alignment(model, example_inputs, prunable, scores_by_mode["nci"])
     print(f"[align] input-score -> physical channel mapping: {'OK' if align_ok else 'CHECK'}")
     for mode, sc in scores_by_mode.items():
