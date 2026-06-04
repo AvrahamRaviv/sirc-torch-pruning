@@ -50,6 +50,16 @@ from torch_pruning.pruner import function as tp_fn
 IN_FNS  = (tp_fn.prune_conv_in_channels,  tp_fn.prune_linear_in_channels)
 OUT_FNS = (tp_fn.prune_conv_out_channels, tp_fn.prune_linear_out_channels)
 
+_LOG_FH = None   # set in main() -> <save_dir>/<tag>_progress.log
+
+
+def log(msg):
+    """Timestamped line to stdout (docker job log) AND <tag>_progress.log, flushed."""
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    if _LOG_FH is not None:
+        _LOG_FH.write(line + "\n"); _LOG_FH.flush()
+
 
 # ----------------------------------------------------------------------------- device / data / model
 def pick_device():
@@ -89,12 +99,15 @@ def build_data(args):
         val_pkl   = os.path.join(args.data_path, "val_samples.pkl")
         if os.path.isfile(val_pkl):                       # cluster fast path (cached pickle)
             import pickle
+            log(f"data: loading cached pickle val={val_pkl}")
             with open(val_pkl, "rb") as f:
                 val_set = _FastImageNet(pickle.load(f), tf)
             calib_pkl = train_pkl if os.path.isfile(train_pkl) else val_pkl
+            log(f"data: loading cached pickle calib={calib_pkl}")
             with open(calib_pkl, "rb") as f:
                 train_set = _FastImageNet(pickle.load(f), tf)
         elif os.path.isdir(os.path.join(args.data_path, "val")):   # ImageFolder fallback
+            log(f"data: ImageFolder scan {args.data_path}/val (slow; no pkl found)")
             val_set = torchvision.datasets.ImageFolder(os.path.join(args.data_path, "val"), tf)
             cdir = "train" if os.path.isdir(os.path.join(args.data_path, "train")) else "val"
             train_set = torchvision.datasets.ImageFolder(os.path.join(args.data_path, cdir), tf)
@@ -102,6 +115,7 @@ def build_data(args):
             raise SystemExit(f"[data] no imagenet data at {args.data_path}: expected "
                              f"val_samples.pkl (cached) or val/ (ImageFolder)")
         n_classes = 1000
+        log(f"data: imagenet ready (calib {len(train_set)} / val {len(val_set)})")
         pin = args.device.type == "cuda"
         train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
                                                    num_workers=args.workers, pin_memory=pin, drop_last=True)
@@ -161,7 +175,7 @@ def build_model(args, n_classes):
         sd = sd.get("state_dict", sd) if isinstance(sd, dict) else sd
         sd = {k.replace("module.", "", 1): v for k, v in sd.items()}
         missing, unexpected = model.load_state_dict(sd, strict=False)
-        print(f"[ckpt] loaded {args.ckpt} (missing {len(missing)}, unexpected {len(unexpected)})")
+        log(f"ckpt loaded {args.ckpt} (missing {len(missing)}, unexpected {len(unexpected)})")
     return model, first_conv, classifier
 
 
@@ -243,10 +257,13 @@ def calibrate(model, prunable, loader, device, n_batches, save_input_for):
 
     handles = [m.register_forward_pre_hook(pre_hook) for m in prunable.values()]
     model.eval()
+    log(f"calib: starting {n_batches} batches on {device} ...")
     bi = 0
     for x, _ in loader:
         model(x.to(device))
         bi += 1
+        if bi == 1 or bi % 10 == 0 or bi >= n_batches:
+            log(f"calib: batch {bi}/{n_batches}")
         if bi >= n_batches:
             break
     for h in handles:
@@ -462,7 +479,8 @@ def prune_and_eval(base_model, example_inputs, prunable_names, first_conv_name, 
         fp = dump_channel_scores(
             os.path.join(args.save_dir, f"{args.tag}_{args.mode}_{cfg}_channel_scores.json"),
             args.model, args.mode, layer_scores, stage="pre_prune", kept=kept)
-        print(f"[dump] {fp}")
+        log(f"mode {args.mode}: dumped {os.path.basename(fp)} "
+            f"(params -{100*(1-params1/params0):.1f}%)")
 
     _, acc_pre = run_epoch(model, val_loader, device, limit=args.limit_batches)
     train_model(model, train_loader, device, args.epochs_ft, args.lr_ft, args.limit_batches, tag=f"ft-{args.mode}")
@@ -514,13 +532,23 @@ def main():
     if args.tag is None:
         args.tag = f"{args.model}_{args.dataset}"
 
-    args.device = device = pick_device()
-    print(f"== device {device} | model {args.model} | dataset {args.dataset} | img {args.img_size} ==")
+    global _LOG_FH
+    os.makedirs(args.save_dir, exist_ok=True)
+    _LOG_FH = open(os.path.join(args.save_dir, f"{args.tag}_progress.log"), "a")
 
+    args.device = device = pick_device()
+    log(f"== START tag={args.tag} model={args.model} dataset={args.dataset} "
+        f"device={device} cuda_avail={torch.cuda.is_available()} ==")
+    if device.type != "cuda":
+        log("WARNING: not on CUDA — GPU will look idle and resnet50 calibration will be slow")
+
+    log("loading data ...")
     train_loader, val_loader, n_classes = build_data(args)
     args.num_classes = n_classes
+    log(f"building model {args.model} (pretrained={args.pretrained}, ckpt={args.ckpt}) ...")
     model, first_conv, classifier = build_model(args, n_classes)
     model = model.to(device)
+    log("model ready")
     img = 224 if args.dataset == "imagenet" else args.img_size
     example_inputs = torch.randn(1, 3, img, img, device=device)
 
@@ -537,7 +565,7 @@ def main():
     fold_check = list(prunable.values())[:2]
     mu, sigma, fire_order, saved = calibrate(model, prunable, train_loader, device,
                                              args.calib_batches, save_input_for=fold_check)
-    print(f"[calib] {len(prunable)} prunable layers | fire-order len {len(fire_order)}")
+    log(f"calib done: {len(prunable)} prunable layers | fire-order len {len(fire_order)}")
 
     # 3) fold function-preservation check
     for L in fold_check:
@@ -547,7 +575,9 @@ def main():
                   f"{'OK' if d < 1e-3 else 'FAIL'}")
 
     # 4) scores
+    log("discovering layer graph (dependency) ...")
     edges = discover_edges(model, example_inputs, prunable)
+    log("computing scores (magnitude/nci/rel/nonrel) ...")
     scores_by_mode = compute_scores(prunable, sigma, mu, edges, fire_order, p=args.p)
     align_ok = assert_alignment(model, example_inputs, prunable, scores_by_mode["nci"])
     print(f"[align] input-score -> physical channel mapping: {'OK' if align_ok else 'CHECK'}")
@@ -564,8 +594,8 @@ def main():
     rows = []
     for mode in [m.strip() for m in args.modes.split(",") if m.strip()]:
         args.mode = mode
-        print(f"\n=== mode: {mode} (pruning_ratio={args.pruning_ratio}, "
-              f"global={args.global_prune}, normalizer={args.normalizer}) ===")
+        log(f"mode {mode}: pruning (ratio={args.pruning_ratio}, "
+            f"global={args.global_prune}, normalizer={args.normalizer}) ...")
         row = prune_and_eval(model, example_inputs, prunable_names, mod2name[first_conv],
                              mod2name[classifier], scores_named.get(mode), args,
                              train_loader, val_loader, device)
@@ -582,6 +612,7 @@ def main():
         print(f"{r['mode']:<8}{r['params']:>11.2f}{r['params_drop']:>7.1f}"
               f"{r['macs']:>10.1f}{r['macs_drop']:>7.1f}{r['acc_pre_ft']:>11.2f}{r['acc_ft']:>10.2f}")
     print("=" * 78)
+    log(f"ALL DONE: {len(rows)} modes dumped -> {args.save_dir}")
 
 
 if __name__ == "__main__":
