@@ -48,9 +48,9 @@ VAL_RESIZE = int(os.environ.get("CD_VAL_RESIZE", "232"))
 MODES = "magnitude,nci,rel,nonrel"
 
 COMMON = (
-    f"--dataset imagenet --data_path {DATA} --val_resize {VAL_RESIZE} "
-    f"--batch_size 128 --epochs 0 --epochs_ft 0 --dump_scores --limit_batches 2 "
-    f"--calib_batches {CALIB} --pruning_ratio {RATIO} --modes {MODES}"
+    f"--data_path {DATA} --val_resize {VAL_RESIZE} --batch_size 128 --epochs_ft 0 "
+    f"--dump_scores --limit_batches 2 --calib_batches {CALIB} "
+    f"--pruning_ratio {RATIO} --modes {MODES}"
 )
 
 SH_TEMPLATE = (

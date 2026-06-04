@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """
-Normalized-Net pruning — SELF-CONTAINED demo (single GPU).
+Normalized-Net pruning — SELF-CONTAINED, ImageNet-1k, single GPU.
 
-One file, end to end:
-    train  ->  normalize/reparam (calibrate sigma, fold)  ->  score (NCI / rel / nonrel)
-           ->  prune (torch_pruning)  ->  fine-tune  ->  report.
+One file, end to end (weights from --ckpt; NO hub download):
+    load ckpt  ->  normalize/reparam (calibrate sigma, fold)  ->  score (magnitude / NCI /
+    rel / nonrel)  ->  prune (torch_pruning)  ->  [optional fine-tune]  ->  dump + report.
 
 ------------------------------------------------------------------------------
 THE THREE SCORES (per INPUT channel of each prunable layer l)
@@ -85,97 +85,76 @@ class _FastImageNet(torch.utils.data.Dataset):
 
 
 def build_data(args):
-    """ImageNet-1k (cached-pickle FastImageNet, ImageFolder fallback — matches
-    vbp_common.build_dataloaders), CIFAR-10, or FakeData (offline)."""
+    """ImageNet-1k only. Cached-pickle FastImageNet (<data_path>/{train,val}_samples.pkl,
+    matches vbp_common.build_dataloaders), ImageFolder (<data_path>/val) fallback. The val
+    pipeline (resize <val_resize> / center-crop 224) serves both eval and sigma calibration
+    (= build_calib_loader: val transform on TRAIN samples, no aug)."""
     norm = torchvision.transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-    if args.dataset == "imagenet":
-        # val pipeline (resize <val_resize> / center-crop 224) for BOTH eval and sigma
-        # calibration (= build_calib_loader: val transform on TRAIN samples, no aug).
-        tf = torchvision.transforms.Compose([
-            torchvision.transforms.Resize(args.val_resize),
-            torchvision.transforms.CenterCrop(224),
-            torchvision.transforms.ToTensor(), norm])
-        train_pkl = os.path.join(args.data_path, "train_samples.pkl")
-        val_pkl   = os.path.join(args.data_path, "val_samples.pkl")
-        if os.path.isfile(val_pkl):                       # cluster fast path (cached pickle)
-            import pickle
-            log(f"data: loading cached pickle val={val_pkl}")
-            with open(val_pkl, "rb") as f:
-                val_set = _FastImageNet(pickle.load(f), tf)
-            calib_pkl = train_pkl if os.path.isfile(train_pkl) else val_pkl
-            log(f"data: loading cached pickle calib={calib_pkl}")
-            with open(calib_pkl, "rb") as f:
-                train_set = _FastImageNet(pickle.load(f), tf)
-        elif os.path.isdir(os.path.join(args.data_path, "val")):   # ImageFolder fallback
-            log(f"data: ImageFolder scan {args.data_path}/val (slow; no pkl found)")
-            val_set = torchvision.datasets.ImageFolder(os.path.join(args.data_path, "val"), tf)
-            cdir = "train" if os.path.isdir(os.path.join(args.data_path, "train")) else "val"
-            train_set = torchvision.datasets.ImageFolder(os.path.join(args.data_path, cdir), tf)
-        else:
-            raise SystemExit(f"[data] no imagenet data at {args.data_path}: expected "
-                             f"val_samples.pkl (cached) or val/ (ImageFolder)")
-        n_classes = 1000
-        log(f"data: imagenet ready (calib {len(train_set)} / val {len(val_set)})")
-        pin = args.device.type == "cuda"
-        train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                                                   num_workers=args.workers, pin_memory=pin, drop_last=True)
-        val_loader   = torch.utils.data.DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
-                                                   num_workers=args.workers, pin_memory=pin)
-        return train_loader, val_loader, n_classes
-
     tf = torchvision.transforms.Compose([
-        torchvision.transforms.Resize(args.img_size),
-        torchvision.transforms.ToTensor(), norm,
-    ])
-    train_set = val_set = None
-    if args.dataset == "cifar10":
-        try:
-            train_set = torchvision.datasets.CIFAR10(args.data_path, train=True,  download=True, transform=tf)
-            val_set   = torchvision.datasets.CIFAR10(args.data_path, train=False, download=True, transform=tf)
-            n_classes = 10
-        except Exception as e:                              # offline cluster -> fake
-            print(f"[data] CIFAR-10 unavailable ({e}); using FakeData.")
-            args.dataset = "fake"
-    if args.dataset == "fake":
-        n_classes = args.num_classes
-        train_set = torchvision.datasets.FakeData(2000, (3, args.img_size, args.img_size), n_classes, tf)
-        val_set   = torchvision.datasets.FakeData(500,  (3, args.img_size, args.img_size), n_classes, tf)
+        torchvision.transforms.Resize(args.val_resize),
+        torchvision.transforms.CenterCrop(224),
+        torchvision.transforms.ToTensor(), norm])
+    train_pkl = os.path.join(args.data_path, "train_samples.pkl")
+    val_pkl   = os.path.join(args.data_path, "val_samples.pkl")
+    if os.path.isfile(val_pkl):                       # cluster fast path (cached pickle)
+        import pickle
+        log(f"data: loading cached pickle val={val_pkl}")
+        with open(val_pkl, "rb") as f:
+            val_set = _FastImageNet(pickle.load(f), tf)
+        calib_pkl = train_pkl if os.path.isfile(train_pkl) else val_pkl
+        log(f"data: loading cached pickle calib={calib_pkl}")
+        with open(calib_pkl, "rb") as f:
+            train_set = _FastImageNet(pickle.load(f), tf)
+    elif os.path.isdir(os.path.join(args.data_path, "val")):   # ImageFolder fallback
+        log(f"data: ImageFolder scan {args.data_path}/val (slow; no pkl found)")
+        val_set = torchvision.datasets.ImageFolder(os.path.join(args.data_path, "val"), tf)
+        cdir = "train" if os.path.isdir(os.path.join(args.data_path, "train")) else "val"
+        train_set = torchvision.datasets.ImageFolder(os.path.join(args.data_path, cdir), tf)
+    else:
+        raise SystemExit(f"[data] no imagenet data at {args.data_path}: expected "
+                         f"val_samples.pkl (cached) or val/ (ImageFolder)")
+    log(f"data: imagenet ready (calib {len(train_set)} / val {len(val_set)})")
     pin = args.device.type == "cuda"
-    nw  = args.workers if args.device.type == "cuda" else 0   # MPS/CPU: keep 0
     train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                                               num_workers=nw, pin_memory=pin, drop_last=True)
-    val_loader   = torch.utils.data.DataLoader(val_set,   batch_size=args.batch_size, shuffle=False,
-                                               num_workers=nw, pin_memory=pin)
-    return train_loader, val_loader, n_classes
+                                               num_workers=args.workers, pin_memory=pin, drop_last=True)
+    val_loader   = torch.utils.data.DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
+                                               num_workers=args.workers, pin_memory=pin)
+    return train_loader, val_loader
 
 
-def build_model(args, n_classes):
+def build_model(args):
     name = args.model
-    weights = "DEFAULT" if args.pretrained else None
-    try:
-        model = getattr(torchvision.models, name)(weights=weights)
-    except Exception as e:
-        print(f"[model] pretrained weights unavailable ({e}); random init.")
-        model = getattr(torchvision.models, name)(weights=None)
-    # swap classifier head ONLY if class count differs (keep pretrained head for imagenet-1k)
+    # NEVER download from the hub (offline cluster -> hangs). Build the imagenet-1k arch
+    # (1000-way head, no swap) with random weights; real weights come from --ckpt. Same as
+    # vbp_common.load_model (model_fn(pretrained=False) then load checkpoint).
+    model = getattr(torchvision.models, name)(weights=None)
     if name.startswith("resnet"):
-        if model.fc.out_features != n_classes:
-            model.fc = nn.Linear(model.fc.in_features, n_classes)
         first_conv, classifier = model.conv1, model.fc
     elif name.startswith("convnext"):
-        if model.classifier[2].out_features != n_classes:
-            model.classifier[2] = nn.Linear(model.classifier[2].in_features, n_classes)
         first_conv, classifier = model.features[0][0], model.classifier[2]
     else:
         raise ValueError(f"unsupported model {name}")
-    # optional: load a state_dict checkpoint over the model (cluster ckpt). strict=False to
-    # tolerate head / wrapper key differences; strips a leading 'module.' if present.
+    # load weights from --ckpt (the only source). Handles {state_dict|model} wrappers and a
+    # leading 'module.'; strict=False tolerates head differences.
     if getattr(args, "ckpt", None):
-        sd = torch.load(args.ckpt, map_location="cpu")
-        sd = sd.get("state_dict", sd) if isinstance(sd, dict) else sd
+        if not os.path.isfile(args.ckpt):
+            raise SystemExit(f"[ckpt] not found: {args.ckpt}")
+        try:
+            sd = torch.load(args.ckpt, map_location="cpu", weights_only=True)
+        except Exception:
+            sd = torch.load(args.ckpt, map_location="cpu")
+        if isinstance(sd, dict):
+            sd = sd.get("state_dict", sd.get("model", sd))
         sd = {k.replace("module.", "", 1): v for k, v in sd.items()}
+        # drop shape-mismatched keys (e.g. a swapped classifier head) so load doesn't raise
+        msd = model.state_dict()
+        sd = {k: v for k, v in sd.items() if k in msd and v.shape == msd[k].shape}
         missing, unexpected = model.load_state_dict(sd, strict=False)
-        log(f"ckpt loaded {args.ckpt} (missing {len(missing)}, unexpected {len(unexpected)})")
+        log(f"ckpt loaded {args.ckpt} ({len(sd)} tensors; missing {len(missing)}, "
+            f"unexpected {len(unexpected)})")
+    else:
+        log(f"WARNING: no --ckpt -> RANDOM weights for {name}; scores are meaningless. "
+            f"Provide an imagenet checkpoint.")
     return model, first_conv, classifier
 
 
@@ -494,19 +473,13 @@ def prune_and_eval(base_model, example_inputs, prunable_names, first_conv_name, 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="resnet50", choices=["resnet18", "resnet50", "convnext_tiny"])
-    ap.add_argument("--dataset", default="cifar10", choices=["cifar10", "fake", "imagenet"])
-    ap.add_argument("--data_path", default="./data", help="imagenet: ImageFolder root with val/ (and train/)")
-    ap.add_argument("--ckpt", default=None, help="optional state_dict to load over the model")
+    ap.add_argument("--data_path", required=True, help="imagenet root with {train,val}_samples.pkl (or val/)")
+    ap.add_argument("--ckpt", default=None, help="imagenet-1k state_dict (no hub download). "
+                                                 "None -> random weights (scores meaningless)")
     ap.add_argument("--val_resize", type=int, default=256, help="imagenet val resize (v2 used 232)")
-    ap.add_argument("--num_classes", type=int, default=10)        # used by fake
-    ap.add_argument("--img_size", type=int, default=64)
     ap.add_argument("--batch_size", type=int, default=128)
     ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--pretrained", action="store_true", default=True)
-    ap.add_argument("--no_pretrained", dest="pretrained", action="store_false")
-    ap.add_argument("--epochs", type=int, default=2, help="base train epochs (0 = skip)")
-    ap.add_argument("--epochs_ft", type=int, default=2, help="post-prune fine-tune epochs")
-    ap.add_argument("--lr", type=float, default=0.01)
+    ap.add_argument("--epochs_ft", type=int, default=0, help="post-prune fine-tune epochs (0 = dumps only)")
     ap.add_argument("--lr_ft", type=float, default=0.005)
     ap.add_argument("--pruning_ratio", type=float, default=0.5)
     ap.add_argument("--normalizer", default="mean",
@@ -525,38 +498,36 @@ def main():
     ap.add_argument("--dump_scores", action="store_true", default=False,
                     help="write per-criterion channel_scores JSON (ExpHandler 'Channels' viz)")
     ap.add_argument("--save_dir", default="./channel_dumps")
-    ap.add_argument("--tag", default=None, help="dump filename prefix (default model_dataset)")
+    ap.add_argument("--tag", default=None, help="dump filename prefix (default = model name)")
     args = ap.parse_args()
     if args.normalizer == "none":
         args.normalizer = None      # raw scores -> true cross-layer (no per-layer equalize)
     if args.tag is None:
-        args.tag = f"{args.model}_{args.dataset}"
+        args.tag = args.model
 
     global _LOG_FH
     os.makedirs(args.save_dir, exist_ok=True)
     _LOG_FH = open(os.path.join(args.save_dir, f"{args.tag}_progress.log"), "a")
 
     args.device = device = pick_device()
-    log(f"== START tag={args.tag} model={args.model} dataset={args.dataset} "
+    log(f"== START tag={args.tag} model={args.model} imagenet "
         f"device={device} cuda_avail={torch.cuda.is_available()} ==")
     if device.type != "cuda":
         log("WARNING: not on CUDA — GPU will look idle and resnet50 calibration will be slow")
 
     log("loading data ...")
-    train_loader, val_loader, n_classes = build_data(args)
-    args.num_classes = n_classes
-    log(f"building model {args.model} (pretrained={args.pretrained}, ckpt={args.ckpt}) ...")
-    model, first_conv, classifier = build_model(args, n_classes)
+    train_loader, val_loader = build_data(args)
+    log(f"building model {args.model} (ckpt={args.ckpt}) ...")
+    model, first_conv, classifier = build_model(args)
     model = model.to(device)
     log("model ready")
-    img = 224 if args.dataset == "imagenet" else args.img_size
-    example_inputs = torch.randn(1, 3, img, img, device=device)
+    example_inputs = torch.randn(1, 3, 224, 224, device=device)
 
-    # 1) train base
-    train_model(model, train_loader, device, args.epochs, args.lr, args.limit_batches, tag="base")
+    # base = loaded checkpoint (no training; weights come from --ckpt)
     _, acc0 = run_epoch(model, val_loader, device, limit=args.limit_batches)
     macs0, params0 = tp.utils.count_ops_and_params(model, example_inputs)
-    print(f"[base] acc {acc0:.2f} | {params0/1e6:.2f}M params | {macs0/1e6:.1f}M MACs")
+    log(f"base acc {acc0:.2f} (limit_batches={args.limit_batches}) | "
+        f"{params0/1e6:.2f}M params | {macs0/1e6:.1f}M MACs")
 
     # 2) normalize / calibrate
     prunable = select_prunable(model, first_conv, classifier)
@@ -603,7 +574,7 @@ def main():
 
     # 6) report
     print("\n" + "=" * 78)
-    print(f"RESULTS  {args.model} / {args.dataset}  | base acc {acc0:.2f} | "
+    print(f"RESULTS  {args.model} / imagenet  | base acc {acc0:.2f} | "
           f"{params0/1e6:.2f}M params {macs0/1e6:.1f}M MACs")
     print("-" * 78)
     print(f"{'mode':<8}{'params(M)':>11}{'-%':>7}{'MACs(M)':>10}{'-%':>7}"
