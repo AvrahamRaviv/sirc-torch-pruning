@@ -310,20 +310,23 @@ class BNResidualConv2d(nn.Module):
 # =====================================================================
 
 def fold_all_conv_bn(model: nn.Module):
-    """Fold each BatchNorm that immediately follows a Conv2d/Linear in a Sequential
-    into that layer's weights. Replaces the BN with nn.Identity.
+    """Fold each BatchNorm that immediately follows a Conv2d/Linear into that layer's
+    weights. Replaces the BN with nn.Identity.
 
-    Walks all nn.Sequential modules looking for Conv/Linear → BN2d/BN1d pairs.
-    Returns (num_folded, folded_locations) where folded_locations is a list of
-    (parent_name, bn_key, bn_type) tuples for later re-insertion via reinsert_bn.
+    Walks the consecutive children of EVERY module (not just nn.Sequential) for
+    Conv/Linear → BN2d/BN1d pairs, where child-definition order = forward order (holds for
+    ResNet/ConvNeXt/VGG/MobileNet). The old Sequential-only walk MISSED ResNet bottleneck
+    main-path BNs (conv1→bn1, conv2→bn2, conv3→bn3 and the stem conv1→bn1 are sibling block
+    ATTRIBUTES, not in a Sequential) — only the downsample Sequential folded, so most BN
+    scales never entered the scored weights. A num_features==out-channels guard rejects
+    accidental non-adjacent pairs. conv_key/bn_key are siblings under one parent, so the
+    (parent_name, conv_key, bn_key, bn_type) records stay valid for reinsert_bn.
     """
     folded = 0
     folded_locations = []
     named_modules = {id(m): n for n, m in model.named_modules()}
 
-    for parent_module in model.modules():
-        if not isinstance(parent_module, nn.Sequential):
-            continue
+    for parent_module in list(model.modules()):
         parent_name = named_modules.get(id(parent_module), "")
         children = list(parent_module.named_children())
         for i in range(len(children) - 1):
@@ -332,6 +335,10 @@ def fold_all_conv_bn(model: nn.Module):
             if not isinstance(mod_a, (nn.Conv2d, nn.Linear)):
                 continue
             if not isinstance(mod_b, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                continue
+            # adjacency guard: BN channels must match the layer's output channels
+            out_ch = mod_a.out_channels if isinstance(mod_a, nn.Conv2d) else mod_a.out_features
+            if mod_b.num_features != out_ch:
                 continue
 
             bn = mod_b
