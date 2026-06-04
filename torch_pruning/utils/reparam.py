@@ -1272,20 +1272,20 @@ class MeanResidualManager(BaseReparamManager):
                 w_red = w                                          # [out, in]
             return w_red.t().abs()                                 # [in, out]
 
-        def _post_act_std(rp, consumer):
-            """Post-activation output std of rp = the PDF inter-layer transfer Σ^{l+1}.
-            Best source: the downstream consumer's input std (sigma_x — measured AFTER the
-            nonlinearity, so it IS rp's post-act output std). Falls back to rp's own
-            sigma_out_x (pre-act) or ones when unavailable / dim-mismatched."""
+        def _post_act_std(rp):
+            """The PDF inter-layer transfer Σ^{l+1} = the layer's OWN per-output-channel std
+            (sigma_out_x), a consumer-INDEPENDENT quantity. (Earlier used the first DAG
+            consumer's sigma_x, but in residual nets that consumer is often an off-path reader
+            — e.g. a downsample on the residual stream — whose std is unrepresentative and
+            poisons the transfer by orders of magnitude.) In the fully normalized net every
+            σ→1, so this transfer →1 and non-relative collapses to relative (PDF: variance
+            propagation gives the same relative criterion for p=2)."""
             od = _out_dim(rp)
-            for obj, attr in ((consumer, "sigma_x"), (rp, "sigma_out_x")):
-                s = getattr(obj, attr, None) if obj is not None else None
-                if s is not None and s.numel() == od:
-                    return s.detach()
-            ref = getattr(rp, "sigma_out_x", None)
-            dev = ref.device if ref is not None else next(rp.parameters()).device
-            dt = ref.dtype if ref is not None else next(rp.parameters()).dtype
-            return torch.ones(od, device=dev, dtype=dt)
+            s = getattr(rp, "sigma_out_x", None)
+            if s is not None and s.numel() == od:
+                return s.detach()
+            dev = next(rp.parameters()).device
+            return torch.ones(od, device=dev, dtype=next(rp.parameters()).dtype)
 
         layers = list(self._reparam_modules.items())  # forward order
         Ms = {name: _layer_M(rp) for name, rp in layers}
@@ -1310,13 +1310,8 @@ class MeanResidualManager(BaseReparamManager):
                 raise ValueError(f"I_out has {I_next.numel()} entries, "
                                  f"expected {last_out_dim} (last layer's out_dim)")
 
-        # Post-activation output std per layer = the PDF transfer Σ^{l+1} (= consumer input
-        # std after the nonlinearity). Sequential: consumer = the next layer; its sigma_x is
-        # this layer's post-act output std. Terminal → own sigma_out_x (pre-act) fallback.
-        sigma_post = {}
-        for idx, (name, rp) in enumerate(layers):
-            cons = layers[idx + 1][1] if idx + 1 < len(layers) else None
-            sigma_post[name] = _post_act_std(rp, cons)
+        # Per-layer inter-layer transfer Σ^{l+1} = each layer's own per-output-channel std.
+        sigma_post = {name: _post_act_std(rp) for name, rp in layers}
 
         results = []  # reverse-collected, flipped at end
         for idx in range(len(layers) - 1, -1, -1):
@@ -1418,15 +1413,12 @@ class MeanResidualManager(BaseReparamManager):
             order.extend(ready); done.update(ready)
             remaining = [n for n in remaining if n not in done]
 
-        # Non-relative inter-layer transfer Σ^{l+1} = post-act output std per layer = a
-        # downstream consumer's input std (sigma_x). All consumers share the same activation,
-        # so any one gives the channel's post-act std; terminals fall back to own sigma_out_x.
+        # Non-relative inter-layer transfer Σ^{l+1} = each layer's own per-output-channel std
+        # (consumer-independent; see _post_act_std — using an off-path residual-stream consumer
+        # poisoned this by orders of magnitude).
         sigma_post = {}
         if not relative and post_act_std is not None:
-            for name, rp in layers:
-                dsts = topology.get(name, [])
-                cons = rp_by_name.get(dsts[0][0]) if dsts else None
-                sigma_post[name] = post_act_std(rp, cons)
+            sigma_post = {name: post_act_std(rp) for name, rp in layers}
         for name in order:
             rp = rp_by_name[name]
             M = Ms[name]
