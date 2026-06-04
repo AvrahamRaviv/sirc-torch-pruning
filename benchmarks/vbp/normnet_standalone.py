@@ -141,7 +141,7 @@ def train_model(model, loader, device, epochs, lr, limit=0, tag="train"):
         t = time.time()
         loss, acc = run_epoch(model, loader, device, opt, limit)
         sched.step()
-        print(f"[{tag}] epoch {ep+1}/{epochs}  loss {loss:.3f}  acc {acc:5.2f}  "
+        print(f"[{tag}] epoch {ep+1}/{epochs}  loss {loss:.3f}  train_acc {acc:5.2f}  "
               f"lr {sched.get_last_lr()[0]:.4f}  ({time.time()-t:.1f}s)")
 
 
