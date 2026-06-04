@@ -58,11 +58,33 @@ def pick_device():
 
 
 def build_data(args):
-    """CIFAR-10 (downloaded, resized) or FakeData fallback (always runs offline)."""
+    """ImageNet-1k (ImageFolder), CIFAR-10 (downloaded), or FakeData (offline fallback)."""
+    norm = torchvision.transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+    if args.dataset == "imagenet":
+        # standard val pipeline (resize 256 / center-crop 224); used for both calibration and
+        # eval. Point --data_path at the ImageFolder root holding val/ (and optionally train/).
+        tf = torchvision.transforms.Compose([
+            torchvision.transforms.Resize(256), torchvision.transforms.CenterCrop(224),
+            torchvision.transforms.ToTensor(), norm])
+        val_dir = os.path.join(args.data_path, "val")
+        train_dir = os.path.join(args.data_path, "train")
+        if not os.path.isdir(val_dir):
+            raise SystemExit(f"[data] imagenet val dir not found: {val_dir} "
+                             f"(expect ImageFolder layout <data_path>/val/<wnid>/*.JPEG)")
+        calib_dir = train_dir if os.path.isdir(train_dir) else val_dir   # train for calib if present
+        train_set = torchvision.datasets.ImageFolder(calib_dir, tf)
+        val_set   = torchvision.datasets.ImageFolder(val_dir, tf)
+        n_classes = 1000
+        pin = args.device.type == "cuda"
+        train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
+                                                   num_workers=args.workers, pin_memory=pin, drop_last=True)
+        val_loader   = torch.utils.data.DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
+                                                   num_workers=args.workers, pin_memory=pin)
+        return train_loader, val_loader, n_classes
+
     tf = torchvision.transforms.Compose([
         torchvision.transforms.Resize(args.img_size),
-        torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        torchvision.transforms.ToTensor(), norm,
     ])
     train_set = val_set = None
     if args.dataset == "cifar10":
@@ -94,16 +116,25 @@ def build_model(args, n_classes):
     except Exception as e:
         print(f"[model] pretrained weights unavailable ({e}); random init.")
         model = getattr(torchvision.models, name)(weights=None)
-    # swap classifier head to n_classes
+    # swap classifier head ONLY if class count differs (keep pretrained head for imagenet-1k)
     if name.startswith("resnet"):
-        model.fc = nn.Linear(model.fc.in_features, n_classes)
+        if model.fc.out_features != n_classes:
+            model.fc = nn.Linear(model.fc.in_features, n_classes)
         first_conv, classifier = model.conv1, model.fc
     elif name.startswith("convnext"):
-        in_f = model.classifier[2].in_features
-        model.classifier[2] = nn.Linear(in_f, n_classes)
+        if model.classifier[2].out_features != n_classes:
+            model.classifier[2] = nn.Linear(model.classifier[2].in_features, n_classes)
         first_conv, classifier = model.features[0][0], model.classifier[2]
     else:
         raise ValueError(f"unsupported model {name}")
+    # optional: load a state_dict checkpoint over the model (cluster ckpt). strict=False to
+    # tolerate head / wrapper key differences; strips a leading 'module.' if present.
+    if getattr(args, "ckpt", None):
+        sd = torch.load(args.ckpt, map_location="cpu")
+        sd = sd.get("state_dict", sd) if isinstance(sd, dict) else sd
+        sd = {k.replace("module.", "", 1): v for k, v in sd.items()}
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        print(f"[ckpt] loaded {args.ckpt} (missing {len(missing)}, unexpected {len(unexpected)})")
     return model, first_conv, classifier
 
 
@@ -418,8 +449,9 @@ def prune_and_eval(base_model, example_inputs, prunable_names, first_conv_name, 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="resnet50", choices=["resnet18", "resnet50", "convnext_tiny"])
-    ap.add_argument("--dataset", default="cifar10", choices=["cifar10", "fake"])
-    ap.add_argument("--data_path", default="./data")
+    ap.add_argument("--dataset", default="cifar10", choices=["cifar10", "fake", "imagenet"])
+    ap.add_argument("--data_path", default="./data", help="imagenet: ImageFolder root with val/ (and train/)")
+    ap.add_argument("--ckpt", default=None, help="optional state_dict to load over the model")
     ap.add_argument("--num_classes", type=int, default=10)        # used by fake
     ap.add_argument("--img_size", type=int, default=64)
     ap.add_argument("--batch_size", type=int, default=128)
@@ -461,7 +493,8 @@ def main():
     args.num_classes = n_classes
     model, first_conv, classifier = build_model(args, n_classes)
     model = model.to(device)
-    example_inputs = torch.randn(1, 3, args.img_size, args.img_size, device=device)
+    img = 224 if args.dataset == "imagenet" else args.img_size
+    example_inputs = torch.randn(1, 3, img, img, device=device)
 
     # 1) train base
     train_model(model, train_loader, device, args.epochs, args.lr, args.limit_batches, tag="base")

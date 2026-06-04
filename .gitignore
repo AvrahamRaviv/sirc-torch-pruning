@@ -51,4 +51,4 @@ img.png
 # Local project management (not pushed to remote)
 CLAUDE.md
 STATUS.md
-.claude/
+.claude/channel_dumps/
