@@ -57,23 +57,47 @@ def pick_device():
     return torch.device("cpu")
 
 
+class _FastImageNet(torch.utils.data.Dataset):
+    """Mirror of vbp_common.FastImageNet: samples = list[(path, label)], PIL default_loader."""
+    def __init__(self, samples, transform):
+        from torchvision.datasets.folder import default_loader
+        self.samples, self.transform, self.loader = samples, transform, default_loader
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, i):
+        path, label = self.samples[i]
+        return self.transform(self.loader(path)), label
+
+
 def build_data(args):
-    """ImageNet-1k (ImageFolder), CIFAR-10 (downloaded), or FakeData (offline fallback)."""
+    """ImageNet-1k (cached-pickle FastImageNet, ImageFolder fallback — matches
+    vbp_common.build_dataloaders), CIFAR-10, or FakeData (offline)."""
     norm = torchvision.transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
     if args.dataset == "imagenet":
-        # standard val pipeline (resize 256 / center-crop 224); used for both calibration and
-        # eval. Point --data_path at the ImageFolder root holding val/ (and optionally train/).
+        # val pipeline (resize <val_resize> / center-crop 224) for BOTH eval and sigma
+        # calibration (= build_calib_loader: val transform on TRAIN samples, no aug).
         tf = torchvision.transforms.Compose([
-            torchvision.transforms.Resize(256), torchvision.transforms.CenterCrop(224),
+            torchvision.transforms.Resize(args.val_resize),
+            torchvision.transforms.CenterCrop(224),
             torchvision.transforms.ToTensor(), norm])
-        val_dir = os.path.join(args.data_path, "val")
-        train_dir = os.path.join(args.data_path, "train")
-        if not os.path.isdir(val_dir):
-            raise SystemExit(f"[data] imagenet val dir not found: {val_dir} "
-                             f"(expect ImageFolder layout <data_path>/val/<wnid>/*.JPEG)")
-        calib_dir = train_dir if os.path.isdir(train_dir) else val_dir   # train for calib if present
-        train_set = torchvision.datasets.ImageFolder(calib_dir, tf)
-        val_set   = torchvision.datasets.ImageFolder(val_dir, tf)
+        train_pkl = os.path.join(args.data_path, "train_samples.pkl")
+        val_pkl   = os.path.join(args.data_path, "val_samples.pkl")
+        if os.path.isfile(val_pkl):                       # cluster fast path (cached pickle)
+            import pickle
+            with open(val_pkl, "rb") as f:
+                val_set = _FastImageNet(pickle.load(f), tf)
+            calib_pkl = train_pkl if os.path.isfile(train_pkl) else val_pkl
+            with open(calib_pkl, "rb") as f:
+                train_set = _FastImageNet(pickle.load(f), tf)
+        elif os.path.isdir(os.path.join(args.data_path, "val")):   # ImageFolder fallback
+            val_set = torchvision.datasets.ImageFolder(os.path.join(args.data_path, "val"), tf)
+            cdir = "train" if os.path.isdir(os.path.join(args.data_path, "train")) else "val"
+            train_set = torchvision.datasets.ImageFolder(os.path.join(args.data_path, cdir), tf)
+        else:
+            raise SystemExit(f"[data] no imagenet data at {args.data_path}: expected "
+                             f"val_samples.pkl (cached) or val/ (ImageFolder)")
         n_classes = 1000
         pin = args.device.type == "cuda"
         train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
@@ -452,6 +476,7 @@ def main():
     ap.add_argument("--dataset", default="cifar10", choices=["cifar10", "fake", "imagenet"])
     ap.add_argument("--data_path", default="./data", help="imagenet: ImageFolder root with val/ (and train/)")
     ap.add_argument("--ckpt", default=None, help="optional state_dict to load over the model")
+    ap.add_argument("--val_resize", type=int, default=256, help="imagenet val resize (v2 used 232)")
     ap.add_argument("--num_classes", type=int, default=10)        # used by fake
     ap.add_argument("--img_size", type=int, default=64)
     ap.add_argument("--batch_size", type=int, default=128)
