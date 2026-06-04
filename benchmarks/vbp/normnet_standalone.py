@@ -356,11 +356,16 @@ def prune_and_eval(base_model, example_inputs, prunable_names, first_conv_name, 
                    mode_scores, args, train_loader, val_loader, device):
     model = copy.deepcopy(base_model).to(device)
     name2mod = dict(model.named_modules())
-    in_scores = {name2mod[n]: mode_scores[n] for n in prunable_names if n in mode_scores}
     ignored = [name2mod[first_conv_name], name2mod[classifier_name]]
-    # rel is LOCAL -> per-layer ratio; nci/nonrel may be global
-    global_pruning = args.global_prune and args.mode != "rel"
-    imp = NormScoreImportance(in_scores, normalizer="mean")
+    if args.mode == "magnitude":
+        # stock tp baseline: plain group weight-magnitude (output-side, no normalization)
+        imp = tp.importance.MagnitudeImportance(p=2)
+        global_pruning = args.global_prune
+    else:
+        in_scores = {name2mod[n]: mode_scores[n] for n in prunable_names if n in mode_scores}
+        # rel is LOCAL -> per-layer ratio; nci/nonrel may be global
+        global_pruning = args.global_prune and args.mode != "rel"
+        imp = NormScoreImportance(in_scores, normalizer="mean")
 
     macs0, params0 = tp.utils.count_ops_and_params(model, example_inputs)
     pruner = tp.pruner.MetaPruner(model, example_inputs, importance=imp,
@@ -398,7 +403,7 @@ def main():
     ap.add_argument("--global_prune", action="store_true", default=False)
     ap.add_argument("--calib_batches", type=int, default=10)
     ap.add_argument("--p", type=int, default=2, choices=[1, 2])
-    ap.add_argument("--modes", default="nci,rel,nonrel")
+    ap.add_argument("--modes", default="magnitude,nci,rel,nonrel")
     ap.add_argument("--limit_batches", type=int, default=0, help="cap batches/epoch (smoke test)")
     args = ap.parse_args()
 
@@ -451,10 +456,10 @@ def main():
     rows = []
     for mode in [m.strip() for m in args.modes.split(",") if m.strip()]:
         args.mode = mode
-        print(f"\n=== mode: {mode} (pruning_ratio={args.pruning_ratio}, "
-              f"global={args.global_prune and mode != 'rel'}) ===")
+        glob = args.global_prune if mode == "magnitude" else (args.global_prune and mode != "rel")
+        print(f"\n=== mode: {mode} (pruning_ratio={args.pruning_ratio}, global={glob}) ===")
         row = prune_and_eval(model, example_inputs, prunable_names, mod2name[first_conv],
-                             mod2name[classifier], scores_named[mode], args,
+                             mod2name[classifier], scores_named.get(mode), args,
                              train_loader, val_loader, device)
         rows.append(row)
 
