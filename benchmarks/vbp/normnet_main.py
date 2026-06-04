@@ -282,6 +282,17 @@ def main(argv):
         acc, _ = validate(model, val_loader, device, args.model_type)
         log_info(f"post-train acc={acc:.4f}")
 
+    # -- fold native Conv->BN into the conv (BEFORE reparameterize) so the BN scale lands in
+    # M and sigma_out is measured POST-BN. Function-preserving (teacher copied above keeps its
+    # own BN; identical logits either way). Fresh BN reinserted after prune, before FT.
+    folded_bn_locations = None
+    if args.fold_native_bn:
+        from torch_pruning.utils.reparam import fold_all_conv_bn
+        n_fold, folded_bn_locations = fold_all_conv_bn(model)
+        a_pre, _ = validate(model, val_loader, device, args.model_type)
+        log_info(f"fold_native_bn: folded {n_fold} Conv->BN | post-fold acc={a_pre:.4f} "
+                 f"(function-preserving — should match pre-fold)")
+
     # -- 2. NORMALIZE (one-shot transform) ----------------------------------------------
     names = build_whole_net_reparam_layers(
         model, exclude_classifier=True, exclude_stem=args.exclude_stem)
@@ -389,6 +400,13 @@ def main(argv):
             pruning_ratio=ratio, max_pruning_ratio=mpr, ignored_layers=_ignored(model)).step()
         model.to(device)
         per_layer_dist, global_kept = log_prune_distribution(pre_w, _layer_widths(model))
+        # reinsert fresh BN at the PRUNED widths (the native BN we folded is gone) so FT has
+        # working normalization; _recalibrate_bn below then populates its running stats.
+        if folded_bn_locations is not None:
+            from torch_pruning.utils.reparam import reinsert_bn
+            n_re = reinsert_bn(model, folded_bn_locations)
+            model.to(device)
+            log_info(f"fold_native_bn: reinserted {n_re} fresh BN at pruned widths (pre-FT)")
         if not args.no_bn_recalib:
             _recalibrate_bn(model, train_loader, device, max_batches=args.calib_batches)
         pr_macs, pr_params = _count(model, ex)
@@ -411,6 +429,14 @@ def main(argv):
                             "per_layer": per_layer_dist}, f, indent=2)
     else:
         mgr.merge_back()
+        # no prune: still must restore the folded BN before FT (else FT runs BN-less).
+        if folded_bn_locations is not None:
+            from torch_pruning.utils.reparam import reinsert_bn
+            n_re = reinsert_bn(model, folded_bn_locations)
+            model.to(device)
+            if not args.no_bn_recalib:
+                _recalibrate_bn(model, train_loader, device, max_batches=args.calib_batches)
+            log_info(f"fold_native_bn: reinserted {n_re} fresh BN (no-prune path, pre-FT)")
 
     # -- 4. FINE-TUNE (plain post-prune / post-normalize recovery) ----------------------
     best = _run_phase(model, None, loaders, args, device, use_ddp,
@@ -462,6 +488,12 @@ def parse_args(argv):
     p.add_argument("--epochs_norm_ft", type=int, default=0, help="FT in normalized coords (0=skip)")
     p.add_argument("--lr_norm_ft", type=float, default=0.01)
     p.add_argument("--calib_batches", type=int, default=50)
+    p.add_argument("--fold_native_bn", action="store_true",
+                   help="fold each native Conv->BN into the conv weight BEFORE reparameterize, "
+                        "so the BN scale (gamma/sigma_run) enters M and the propagation transfer "
+                        "(sigma_out) is measured POST-BN. Without it the native post-conv BN is "
+                        "absent from the score (it only shows up as the NEXT layer's input sigma). "
+                        "Fresh BN is reinserted after prune (recalibrated + FT'd).")
     # 3. prune
     p.add_argument("--no_prune", action="store_true")
     p.add_argument("--scorer", default="per_layer",

@@ -77,12 +77,18 @@ RN_CKPTS = {
 # per-layer uniform throws away the propagation's cross-layer information — and non-relative
 # I, whose only effect is depth-compounding of cross-layer order, becomes meaningless). The
 # mac_target search then finds the global ratio whose globally-bottom channels hit the budget.
+# Fold native Conv->BN before reparameterize (default ON): bakes the BN scale into M and
+# makes the propagation transfer sigma_out POST-BN. Applied to EVERY arm (incl. magnitude)
+# so the comparison stays apples-to-apples. Set FOLD_NATIVE_BN=0 to reproduce the old
+# (BN-unfolded) scores.
+FOLD_BN = os.environ.get("FOLD_NATIVE_BN", "1") != "0"
 SHARED = (
     f"--model_type cnn --cnn_arch resnet50 --data_path {DATA} --reparam_variant mean "
     f"--scorer propagation --global_pruning --mac_target_g {MAC_TARGET_G} --max_prune_ratio 0.8 "
     f"--calib_batches 50 "
     f"--epochs_ft {FT} --lr_ft 2e-2 --wd 1e-4 --momentum 0.9 --use_kd --kd_alpha 0.5 "
     f"--kd_T 2.0 --train_batch_size 128 --val_resize 232"
+    + (" --fold_native_bn" if FOLD_BN else "")
 )
 # Option B: load vnr, no reg recompute (already 30-ep trained).
 B_EXTRA = "--epochs_train 0 --epochs_norm_ft 0"
