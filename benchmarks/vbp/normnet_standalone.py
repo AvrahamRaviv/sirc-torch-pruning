@@ -357,17 +357,17 @@ def prune_and_eval(base_model, example_inputs, prunable_names, first_conv_name, 
     model = copy.deepcopy(base_model).to(device)
     name2mod = dict(model.named_modules())
     ignored = [name2mod[first_conv_name], name2mod[classifier_name]]
+    # GLOBAL pruning for every criterion (common best practice; matches tp's own recipe
+    # global_pruning=True + normalizer="mean"). The per-layer normalizer ("mean" -> each
+    # layer rescaled to mean-1, or "lamp") deliberately erases native cross-layer scale and
+    # equalizes layer ordering -- the trick that makes global pruning actually work, even
+    # though it discards NCI's honest cross-layer magnitude.
+    global_pruning = True
     if args.mode == "magnitude":
-        # stock tp baseline: plain group weight-magnitude (output-side, no normalization).
-        # Magnitude is meaningful cross-layer -> GLOBAL ranking (the standard, fair baseline;
-        # local fixed-ratio magnitude is a strawman).
-        imp = tp.importance.MagnitudeImportance(p=2)
-        global_pruning = True
+        imp = tp.importance.MagnitudeImportance(p=2, normalizer=args.normalizer)
     else:
         in_scores = {name2mod[n]: mode_scores[n] for n in prunable_names if n in mode_scores}
-        # rel is LOCAL -> per-layer ratio; nci/nonrel may be global
-        global_pruning = args.global_prune and args.mode != "rel"
-        imp = NormScoreImportance(in_scores, normalizer="mean")
+        imp = NormScoreImportance(in_scores, normalizer=args.normalizer)
 
     macs0, params0 = tp.utils.count_ops_and_params(model, example_inputs)
     pruner = tp.pruner.MetaPruner(model, example_inputs, importance=imp,
@@ -402,12 +402,18 @@ def main():
     ap.add_argument("--lr", type=float, default=0.01)
     ap.add_argument("--lr_ft", type=float, default=0.005)
     ap.add_argument("--pruning_ratio", type=float, default=0.5)
-    ap.add_argument("--global_prune", action="store_true", default=False)
+    ap.add_argument("--normalizer", default="mean",
+                    choices=["mean", "lamp", "max", "sum", "standarization", "gaussian", "none"],
+                    help="per-layer score normalizer for GLOBAL pruning. 'mean' (tp default, "
+                         "each layer->mean-1) or 'lamp' (SOTA) equalize layer ordering; 'none' "
+                         "keeps raw cross-layer scale (true-global NCI).")
     ap.add_argument("--calib_batches", type=int, default=10)
     ap.add_argument("--p", type=int, default=2, choices=[1, 2])
     ap.add_argument("--modes", default="magnitude,nci,rel,nonrel")
     ap.add_argument("--limit_batches", type=int, default=0, help="cap batches/epoch (smoke test)")
     args = ap.parse_args()
+    if args.normalizer == "none":
+        args.normalizer = None      # raw scores -> true cross-layer (no per-layer equalize)
 
     args.device = device = pick_device()
     print(f"== device {device} | model {args.model} | dataset {args.dataset} | img {args.img_size} ==")
@@ -458,8 +464,8 @@ def main():
     rows = []
     for mode in [m.strip() for m in args.modes.split(",") if m.strip()]:
         args.mode = mode
-        glob = True if mode == "magnitude" else (args.global_prune and mode != "rel")
-        print(f"\n=== mode: {mode} (pruning_ratio={args.pruning_ratio}, global={glob}) ===")
+        print(f"\n=== mode: {mode} (pruning_ratio={args.pruning_ratio}, global=True, "
+              f"normalizer={args.normalizer}) ===")
         row = prune_and_eval(model, example_inputs, prunable_names, mod2name[first_conv],
                              mod2name[classifier], scores_named.get(mode), args,
                              train_loader, val_loader, device)
