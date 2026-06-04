@@ -669,15 +669,17 @@ def test_propagation_relative_vs_non_relative():
     assert torch.allclose(rel["fc1"], _wbar_reference(M_fc1, p) @ I_fc2_rel, atol=1e-6)
 
     # non-relative = column-stochastic M^p × Σ^{l+1} transfer ⊙ I_next, where the transfer is
-    # each layer's OWN per-output-channel std sigma_out_x (consumer-independent).
-    sig_fc2 = rp2.sigma_out_x.detach()
-    sig_fc1 = rp1.sigma_out_x.detach()
+    # the POST-activation std = the on-path CONSUMER's input std sigma_x (NOT the layer's own
+    # sigma_out_x, which is PRE-activation = the D denominator and would cancel D → raw M^p).
+    # fc1's consumer is fc2 → transfer = fc2's sigma_x. fc2 is terminal → fallback own sigma_out_x.
+    sig_fc2 = rp2.sigma_out_x.detach()   # fc2 terminal → fallback (no downstream consumer)
+    sig_fc1 = rp2.sigma_x.detach()       # fc1's consumer fc2: transfer = fc2 input std (= σ_post[fc1])
     nonrel = mgr.propagation_importance(I_out=I_out, p=p, relative=False)
     I_fc2_nr = _wbar_reference(M_fc2, p) @ (sig_fc2.pow(p) * I_out)
     assert torch.allclose(nonrel["fc2"], I_fc2_nr, atol=1e-6), \
-        "non-rel fc2 = W̄·(σ_out^p ⊙ I_out)"
+        "non-rel fc2 = W̄·(σ_out^p ⊙ I_out)  [terminal fallback]"
     assert torch.allclose(nonrel["fc1"], _wbar_reference(M_fc1, p) @ (sig_fc1.pow(p) * I_fc2_nr),
-                          atol=1e-6), "non-rel fc1 = W̄·(σ_fc1^p ⊙ I_fc2)"
+                          atol=1e-6), "non-rel fc1 = W̄·(sigma_x[fc2]^p ⊙ I_fc2)"
 
     # the two derivations must disagree (the Σ transfer changes the ranking)
     assert not torch.allclose(rel["fc1"], nonrel["fc1"], atol=1e-4), \

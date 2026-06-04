@@ -1280,13 +1280,13 @@ class MeanResidualManager(BaseReparamManager):
             return w_red.t().abs()                                 # [in, out]
 
         def _post_act_std(rp):
-            """The PDF inter-layer transfer Σ^{l+1} = the layer's OWN per-output-channel std
-            (sigma_out_x), a consumer-INDEPENDENT quantity. (Earlier used the first DAG
-            consumer's sigma_x, but in residual nets that consumer is often an off-path reader
-            — e.g. a downsample on the residual stream — whose std is unrepresentative and
-            poisons the transfer by orders of magnitude.) In the fully normalized net every
-            σ→1, so this transfer →1 and non-relative collapses to relative (PDF: variance
-            propagation gives the same relative criterion for p=2)."""
+            """FALLBACK transfer (terminal / channel-mismatch only): the layer's own
+            sigma_out_x. NOTE this is the PRE-activation std (= σ_pre = the D denominator);
+            the real PDF transfer Σ^{l+1} is the POST-activation std, taken from the immediate
+            on-path consumer's sigma_x in the caller. sigma_out_x is used ONLY when no aligned
+            downstream exists. In a fully normalized net every σ→1 so the transfer →1 and
+            non-relative collapses to relative (PDF: variance prop gives the same criterion
+            for p=2)."""
             od = _out_dim(rp)
             s = getattr(rp, "sigma_out_x", None)
             if s is not None and s.numel() == od:
@@ -1317,8 +1317,16 @@ class MeanResidualManager(BaseReparamManager):
                 raise ValueError(f"I_out has {I_next.numel()} entries, "
                                  f"expected {last_out_dim} (last layer's out_dim)")
 
-        # Per-layer inter-layer transfer Σ^{l+1} = each layer's own per-output-channel std.
-        sigma_post = {name: _post_act_std(rp) for name, rp in layers}
+        # Per-layer inter-layer transfer Σ^{l+1} = POST-activation std = the NEXT layer's
+        # input std sigma_x (a^l feeds straight into it). NOT the layer's own sigma_out_x
+        # (= PRE-activation = σ_pre = the D denominator → would cancel D → raw M^p). Fallback
+        # to post_act_std at the terminal / channel-mismatch boundary.
+        sigma_post = {}
+        for _i, (name, rp) in enumerate(layers):
+            od = _out_dim(rp)
+            nxt_sx = getattr(layers[_i + 1][1], "sigma_x", None) if _i + 1 < len(layers) else None
+            sigma_post[name] = (nxt_sx.detach() if (nxt_sx is not None and nxt_sx.numel() == od)
+                                else _post_act_std(rp))
 
         results = []  # reverse-collected, flipped at end
         for idx in range(len(layers) - 1, -1, -1):
@@ -1420,12 +1428,25 @@ class MeanResidualManager(BaseReparamManager):
             order.extend(ready); done.update(ready)
             remaining = [n for n in remaining if n not in done]
 
-        # Non-relative inter-layer transfer Σ^{l+1} = each layer's own per-output-channel std
-        # (consumer-independent; see _post_act_std — using an off-path residual-stream consumer
-        # poisoned this by orders of magnitude).
+        # Non-relative inter-layer transfer Σ^{l+1} = POST-activation output std (PDF steps
+        # 3-4: f = σ_post/σ_pre, the activation std-gain). This is the IMMEDIATE on-path
+        # consumer's INPUT std sigma_x (a^l feeds straight into it), NOT the layer's own
+        # sigma_out_x — which is the PRE-activation (= σ_pre = the colsum/D denominator), so
+        # using it CANCELS D and collapses non-relative to the raw M^p product (the ~1e9
+        # compound). To dodge off-path residual readers, pick the consumer EARLIEST in
+        # forward order (the main path); fall back to post_act_std only when no channel-
+        # aligned downstream exists (terminal / reshape boundary).
         sigma_post = {}
         if not relative and post_act_std is not None:
-            sigma_post = {name: post_act_std(rp) for name, rp in layers}
+            fwd_idx = {nm: i for i, (nm, _) in enumerate(layers)}
+            sigma_x_of = {nm: getattr(rp, "sigma_x", None) for nm, rp in layers}
+            for name, rp in layers:
+                od = _out_dim(rp)
+                cands = [(fwd_idx[d], d) for d, _w in topology.get(name, [])
+                         if d in fwd_idx and fwd_idx[d] > fwd_idx[name]
+                         and sigma_x_of[d] is not None and sigma_x_of[d].numel() == od]
+                sigma_post[name] = (sigma_x_of[min(cands)[1]].detach() if cands
+                                    else post_act_std(rp))
         for name in order:
             rp = rp_by_name[name]
             M = Ms[name]

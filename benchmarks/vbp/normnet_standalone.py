@@ -408,10 +408,22 @@ def compute_scores(prunable, sigma, sigma_out, mu, edges, fire_order, p=2):
     def n_out(L): return L.out_channels if isinstance(L, nn.Conv2d) else L.out_features
 
     M = {L: layer_M(L, sigma[L]) for L in prunable.values()}
-    # Σ^{l+1} transfer = layer's own per-output-channel std (fallback: ones if shape off).
-    sigma_post = {L: (sigma_out[L] if sigma_out[L].numel() == n_out(L)
-                      else torch.ones(n_out(L), device=M[L].device))
-                  for L in prunable.values()}
+    # Σ^{l+1} transfer = POST-activation output std (PDF steps 3-4: f = σ_post/σ_pre, the
+    # activation std-gain). The layer's OWN output (sigma_out) is PRE-activation (= σ_pre =
+    # the colsum/D denominator) → using it makes D and the transfer CANCEL, collapsing
+    # nonrel to the raw M^p product (the 1e9 compound). The post-activation std equals the
+    # IMMEDIATE on-path consumer's input std (a_L feeds straight into it). Pick the consumer
+    # earliest in fire_order (the main path), NOT an average over off-path residual consumers.
+    order_idx = {L: k for k, L in enumerate(fire_order)}
+    sigma_post = {}
+    for L in prunable.values():
+        cands = [C for C in edges[L]
+                 if sigma[C].numel() == n_out(L) and order_idx.get(C, 1 << 30) > order_idx.get(L, -1)]
+        if cands:
+            C = min(cands, key=lambda c: order_idx[c])
+            sigma_post[L] = sigma[C]                       # consumer input std = σ_post[L]
+        else:
+            sigma_post[L] = torch.ones(n_out(L), device=M[L].device)   # terminal → no transfer
 
     nci = {L: (M[L].pow(2)).sum(dim=1) for L in prunable.values()}   # one hop = sigma_i^2||W_i||^2
     # plain magnitude on the SAME input axis (no sigma): mag_i = ||W[:,i]||.  nci = sigma^2 mag^2
