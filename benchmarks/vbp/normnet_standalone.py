@@ -6,19 +6,15 @@ One file, end to end:
     train  ->  normalize/reparam (calibrate sigma, fold)  ->  score (NCI / rel / nonrel)
            ->  prune (torch_pruning)  ->  fine-tune  ->  report.
 
-Imports ONLY: torch, torchvision, torch_pruning (the published package) + stdlib.
-No project-internal imports — give this to anyone, they can run + debug it alone.
-
 ------------------------------------------------------------------------------
 THE THREE SCORES (per INPUT channel of each prunable layer l)
 ------------------------------------------------------------------------------
 Normalized net: before each target layer, input is normalized to zero-mean/unit-var
-by its measured (mu, sigma); the weight is re-expressed as  v~ = sigma * W  (fold).
+by its measured (mu, sigma); the weight is re-expressed as  W' = sigma * W  (fold).
 The fold is function-preserving (asserted below). On the normalized net the weight
 magnitude IS the contribution score.
 
   M[i,j] = sigma_in[i] * || reduce_kernel(W[j,i,:]) ||           (in x out)
-
   NCI    : one hop, no propagation.    NCI[i] = sum_j M[i,j]^2   ( = sigma_i^2 ||W_i||^2 )
   rel    : I^l = Wbar @ I^{l+1},  Wbar = M^p / colsum(M^p)       (column-stochastic)
            -> mass-preserving, LOCAL (compare channels within a layer only)
@@ -37,7 +33,7 @@ group's IN-side member (prune_*_in_channels) -> tp maps it to the right physical
 channels via root_idxs. Attaching an input-score to an output dim would prune the
 WRONG layer (off by one). assert_alignment() checks we got it right.
 """
-import argparse, copy, time
+import argparse, copy, json, os, time
 from collections import OrderedDict
 
 import torch
@@ -208,7 +204,7 @@ def calibrate(model, prunable, loader, device, n_batches, save_input_for):
 
 
 def assert_fold_preserving(layer, mu, sigma, x):
-    """v~ = sigma*W, m = b + W@mu  reproduces  W x + b  on normalized input. Function-preserving."""
+    """W' = sigma*W, m = b + W@mu  reproduces  W x + b  on normalized input. Function-preserving."""
     W = layer.weight.data
     b = layer.bias.data if layer.bias is not None else torch.zeros(W.size(0), device=W.device)
     if isinstance(layer, nn.Linear):
@@ -290,7 +286,9 @@ def compute_scores(prunable, sigma, mu, edges, fire_order, p=2):
                 s = sigma[C] if s is None else s + sigma[C]
         sigma_post[L] = (s / len(cons)) if (s is not None and cons) else torch.ones(n_out(L), device=M[L].device)
 
-    nci = {L: (M[L].pow(2)).sum(dim=1) for L in prunable.values()}   # one hop
+    nci = {L: (M[L].pow(2)).sum(dim=1) for L in prunable.values()}   # one hop = sigma_i^2||W_i||^2
+    # plain magnitude on the SAME input axis (no sigma): mag_i = ||W[:,i]||.  nci = sigma^2 mag^2
+    mag = {L: (M[L] / sigma[L][:, None]).pow(2).sum(dim=1).sqrt() for L in prunable.values()}
 
     def propagate(nonrel):
         I_in = {}
@@ -311,7 +309,7 @@ def compute_scores(prunable, sigma, mu, edges, fire_order, p=2):
             I_in[L] = Wbar @ I_next                           # [in]
         return I_in
 
-    return {"nci": nci, "rel": propagate(False), "nonrel": propagate(True)}
+    return {"magnitude": mag, "nci": nci, "rel": propagate(False), "nonrel": propagate(True)}
 
 
 # ----------------------------------------------------------------------------- importance adapter
@@ -351,31 +349,62 @@ def assert_alignment(model, example_inputs, prunable, scores):
     return imp is not None and imp.numel() == n_in and int(imp.argmin()) == int(s.argmin())
 
 
+# ----------------------------------------------------------------------------- ExpHandler dump
+def dump_channel_scores(path, model, scorer, layer_scores, stage=None, kept=None,
+                        higher_is_better=True):
+    """Write one channel_scores/v1 JSON for the ExpHandler 'Channels' viz.
+    layer_scores: dict[name -> 1-D iterable of RAW per-channel scores] (no normalization;
+    the app does per-layer / per-network normalization). kept: dict[name -> bool iterable]."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    layers = [{"name": n, "scores": [float(x) for x in s],
+               **({"kept": [bool(x) for x in kept[n]]} if kept and n in kept else {})}
+              for n, s in layer_scores.items()]
+    with open(path, "w") as f:
+        json.dump({"schema": "channel_scores/v1", "model": model, "scorer": scorer,
+                   "stage": stage, "higher_is_better": higher_is_better, "layers": layers}, f)
+    return path
+
+
 # ----------------------------------------------------------------------------- prune one config
 def prune_and_eval(base_model, example_inputs, prunable_names, first_conv_name, classifier_name,
                    mode_scores, args, train_loader, val_loader, device):
     model = copy.deepcopy(base_model).to(device)
     name2mod = dict(model.named_modules())
+    mod2name = {m: n for n, m in name2mod.items()}
     ignored = [name2mod[first_conv_name], name2mod[classifier_name]]
-    # GLOBAL pruning for every criterion (common best practice; matches tp's own recipe
-    # global_pruning=True + normalizer="mean"). The per-layer normalizer ("mean" -> each
-    # layer rescaled to mean-1, or "lamp") deliberately erases native cross-layer scale and
-    # equalizes layer ordering -- the trick that makes global pruning actually work, even
-    # though it discards NCI's honest cross-layer magnitude.
-    global_pruning = True
-    if args.mode == "magnitude":
-        imp = tp.importance.MagnitudeImportance(p=2, normalizer=args.normalizer)
-    else:
-        in_scores = {name2mod[n]: mode_scores[n] for n in prunable_names if n in mode_scores}
-        imp = NormScoreImportance(in_scores, normalizer=args.normalizer)
+    # Every criterion (incl. magnitude) goes through the SAME input-side path so the dumped
+    # scores match the prune decision exactly. The per-layer normalizer ("mean"->each layer
+    # mean-1, or "lamp") erases native cross-layer scale and equalizes layer ordering -- the
+    # trick that makes GLOBAL pruning work in practice; "none" keeps raw scale.
+    in_scores = {name2mod[n]: mode_scores[n] for n in prunable_names if n in mode_scores}
+    orig_in = {name2mod[n]: len(mode_scores[n]) for n in prunable_names if n in mode_scores}
+    imp = NormScoreImportance(in_scores, normalizer=args.normalizer)
 
     macs0, params0 = tp.utils.count_ops_and_params(model, example_inputs)
     pruner = tp.pruner.MetaPruner(model, example_inputs, importance=imp,
-                                  global_pruning=global_pruning,
+                                  global_pruning=args.global_prune,
                                   pruning_ratio=args.pruning_ratio,
                                   ignored_layers=ignored)
-    pruner.step()
+    # interactive step -> record which INPUT channels each layer lost (the kept mask)
+    pruned_in = {}
+    for group in pruner.step(interactive=True):
+        for dep, idxs in group:
+            lay, fn = dep.layer, dep.pruning_fn
+            if fn in IN_FNS and lay in in_scores:
+                pruned_in.setdefault(lay, set()).update(int(i) for i in idxs)
+        group.prune()
     macs1, params1 = tp.utils.count_ops_and_params(model, example_inputs)
+
+    if args.dump_scores:
+        kept = {mod2name[lay]: [i not in pruned_in.get(lay, set()) for i in range(n_in)]
+                for lay, n_in in orig_in.items()}
+        layer_scores = {n: mode_scores[n] for n in prunable_names if n in mode_scores}
+        norm = args.normalizer if args.normalizer else "raw"
+        cfg = f"g{int(args.global_prune)}_{norm}"
+        fp = dump_channel_scores(
+            os.path.join(args.save_dir, f"{args.tag}_{args.mode}_{cfg}_channel_scores.json"),
+            args.model, args.mode, layer_scores, stage="pre_prune", kept=kept)
+        print(f"[dump] {fp}")
 
     _, acc_pre = run_epoch(model, val_loader, device, limit=args.limit_batches)
     train_model(model, train_loader, device, args.epochs_ft, args.lr_ft, args.limit_batches, tag=f"ft-{args.mode}")
@@ -407,13 +436,23 @@ def main():
                     help="per-layer score normalizer for GLOBAL pruning. 'mean' (tp default, "
                          "each layer->mean-1) or 'lamp' (SOTA) equalize layer ordering; 'none' "
                          "keeps raw cross-layer scale (true-global NCI).")
+    ap.add_argument("--global_prune", action="store_true", default=True,
+                    help="global ranking across layers (default, best practice)")
+    ap.add_argument("--local", dest="global_prune", action="store_false",
+                    help="per-layer fixed-ratio pruning instead of global")
     ap.add_argument("--calib_batches", type=int, default=10)
     ap.add_argument("--p", type=int, default=2, choices=[1, 2])
     ap.add_argument("--modes", default="magnitude,nci,rel,nonrel")
     ap.add_argument("--limit_batches", type=int, default=0, help="cap batches/epoch (smoke test)")
+    ap.add_argument("--dump_scores", action="store_true", default=False,
+                    help="write per-criterion channel_scores JSON (ExpHandler 'Channels' viz)")
+    ap.add_argument("--save_dir", default="./channel_dumps")
+    ap.add_argument("--tag", default=None, help="dump filename prefix (default model_dataset)")
     args = ap.parse_args()
     if args.normalizer == "none":
         args.normalizer = None      # raw scores -> true cross-layer (no per-layer equalize)
+    if args.tag is None:
+        args.tag = f"{args.model}_{args.dataset}"
 
     args.device = device = pick_device()
     print(f"== device {device} | model {args.model} | dataset {args.dataset} | img {args.img_size} ==")
@@ -464,8 +503,8 @@ def main():
     rows = []
     for mode in [m.strip() for m in args.modes.split(",") if m.strip()]:
         args.mode = mode
-        print(f"\n=== mode: {mode} (pruning_ratio={args.pruning_ratio}, global=True, "
-              f"normalizer={args.normalizer}) ===")
+        print(f"\n=== mode: {mode} (pruning_ratio={args.pruning_ratio}, "
+              f"global={args.global_prune}, normalizer={args.normalizer}) ===")
         row = prune_and_eval(model, example_inputs, prunable_names, mod2name[first_conv],
                              mod2name[classifier], scores_named.get(mode), args,
                              train_loader, val_loader, device)
