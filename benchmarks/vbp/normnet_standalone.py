@@ -358,9 +358,11 @@ def prune_and_eval(base_model, example_inputs, prunable_names, first_conv_name, 
     name2mod = dict(model.named_modules())
     ignored = [name2mod[first_conv_name], name2mod[classifier_name]]
     if args.mode == "magnitude":
-        # stock tp baseline: plain group weight-magnitude (output-side, no normalization)
+        # stock tp baseline: plain group weight-magnitude (output-side, no normalization).
+        # Magnitude is meaningful cross-layer -> GLOBAL ranking (the standard, fair baseline;
+        # local fixed-ratio magnitude is a strawman).
         imp = tp.importance.MagnitudeImportance(p=2)
-        global_pruning = args.global_prune
+        global_pruning = True
     else:
         in_scores = {name2mod[n]: mode_scores[n] for n in prunable_names if n in mode_scores}
         # rel is LOCAL -> per-layer ratio; nci/nonrel may be global
@@ -456,7 +458,7 @@ def main():
     rows = []
     for mode in [m.strip() for m in args.modes.split(",") if m.strip()]:
         args.mode = mode
-        glob = args.global_prune if mode == "magnitude" else (args.global_prune and mode != "rel")
+        glob = True if mode == "magnitude" else (args.global_prune and mode != "rel")
         print(f"\n=== mode: {mode} (pruning_ratio={args.pruning_ratio}, global={glob}) ===")
         row = prune_and_eval(model, example_inputs, prunable_names, mod2name[first_conv],
                              mod2name[classifier], scores_named.get(mode), args,
