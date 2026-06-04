@@ -33,7 +33,7 @@ group's IN-side member (prune_*_in_channels) -> tp maps it to the right physical
 channels via root_idxs. Attaching an input-score to an output dim would prune the
 WRONG layer (off by one). assert_alignment() checks we got it right.
 """
-import argparse, copy, json, os, time
+import argparse, copy, json, os, sys, time
 from collections import OrderedDict
 
 import torch
@@ -41,6 +41,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
+# repo root on sys.path so the in-repo torch_pruning/ package imports even when this file is
+# run directly (python adds only the script dir, not cwd; run_ddp gets cwd via `python -m`).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 import torch_pruning as tp
 from torch_pruning.pruner import function as tp_fn
 
