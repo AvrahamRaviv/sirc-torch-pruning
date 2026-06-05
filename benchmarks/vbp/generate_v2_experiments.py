@@ -1,33 +1,32 @@
 """
-Generate the v2-recipe from-scratch experiments (100 epochs each), run_ddp.py fashion.
-v2_baseline is KEPT (already run, EMA 78.1) — not regenerated. Four switch arms test §7:
-does moving to normalized coords mid-training beat the plain protocol?
+Generate the v2-recipe normalize-switch experiments (100 epochs each), run_ddp.py fashion.
 
-Round-1 (switch@30 + frozen-σ precond) underperformed baseline by ~2.6% — a frozen-σ
-LR throttle, NOT a real §7 verdict. Now fixed (live-σ precond + train-calib). The four
-arms separate the precond control from the actual §7 test:
+ROUND-1 (already run / running, dirs exist): v2_baseline (EMA 78.1), v2_switch_e30_precond,
+v2_switch_e30_lr025, v2_switch_e30_lr050, v2_switch_e15_lr025. Readout @e35: live-σ precond
+ties baseline (frozen-σ throttle fixed); the lr_scale switch arms lead early but run at 4×/2×
+LOWER effective LR (0.25×scale) than baseline → the lead is confounded with low-LR noise drop,
+NOT yet a proven normalization gain.
 
-  v2_switch_e30_precond  live-σ precond ON. Reverts v_tilde-SGD to plain-W dynamics, so
-                         this is the CONTROL: should now TIE baseline (~78). If it still
-                         lags, the deficit is EMA/momentum reset, not normalized coords.
-  v2_switch_e30_lr025    precond OFF, --switch_lr_scale 0.25. The §7 test: true
-                         normalized-coords dynamics, 1/σ² overshoot tamed by one factor.
-  v2_switch_e30_lr050    same, scale 0.50 — brackets the normalized-LR sweet spot.
-  v2_switch_e15_lr025    earlier switch → more epochs in normalized coords. If §7 helps,
-                         an earlier switch should amplify it.
+ROUND-2 (this file, 3 weekend arms) isolates §7 from the LR confound:
 
-All four: --calib_transform train (σ_cal matches σ_run), bn variant, norm_bn_momentum 0.01.
-Each switch dumps a σ sidecar (<tag>_preswitch_e{X}_meta.pt) + pre-switch weights.
+  v2_ctrl_e30_lr025_plain  PLAIN training (no normalize), resume e30, --lr 0.0625. lr_at is
+                           linear in --lr, so this reproduces the EXACT e30→100 LR of the
+                           lr025 switch arm. §7 effect at this LR = lr025_switch − this ctrl.
+  v2_ctrl_e30_lr050_plain  PLAIN, --lr 0.125 → matched control for the lr050 switch arm.
+  v2_switch_e30_lr015      normalize switch, --switch_lr_scale 0.15. Lower §7 point; with
+                           lr025/lr050 makes a 3-point sweep + mirage check.
 
-Compare per-epoch val_acc (raw + EMA) in <tag>_metrics.jsonl vs v2_baseline. Read raw-vs-raw
-to drop the EMA-reset confound.
+§7 is real iff a switch arm beats its matched plain control at the SAME LR. Otherwise the
+early lead was just the lower LR. All arms resume from the round-1 pre-switch checkpoint
+(RESUME30) → 70 epochs each. Recipe held identical: --calib_transform train, bn variant,
+norm_bn_momentum 0.01.
 
-lr is scaled for the effective batch: official used 0.5 @ batch 1024 (8×128); here 4 GPUs
-× 128 = 512 → lr 0.25 (linear scaling). Adjust if you change GPUs/batch.
+Compare per-epoch val_acc (raw + EMA) in <tag>_metrics.jsonl. lr is scaled for the effective
+batch: official 0.5 @ batch 1024 (8×128); here 4 GPUs × 128 = 512 → base lr 0.25.
 
 Run (one at a time, 4 GPUs each):
     python benchmarks/vbp/generate_v2_experiments.py
-    python run_ddp.py --out_dir_name v2_switch_e30_lr025
+    python run_ddp.py --out_dir_name v2_ctrl_e30_lr025_plain
 """
 import os
 import stat
@@ -55,13 +54,23 @@ COMMON = (
     f"--reparam_variant bn --norm_bn_momentum 0.01 --calib_batches 50 --calib_transform train"
 )
 
-# 4 GPU-budget arms. v2_baseline kept from the prior run. The 3 e30 arms resume from the
-# round-1 pre-switch checkpoint (RESUME30) → only 70 epochs each; e15 runs the full 100.
+# ROUND-1 arms (already run / running — dirs exist, not regenerated here):
+#   v2_baseline, v2_switch_e30_precond, v2_switch_e30_lr025, v2_switch_e30_lr050,
+#   v2_switch_e15_lr025.
+# Round-1 readout: live-σ precond ties baseline (drift artifact fixed). The lr_scale switch
+# arms lead early BUT run at 4×/2× lower effective LR than baseline (0.25×scale) → the early
+# val boost is confounded with low-LR noise reduction, not proven to be a normalization gain.
+#
+# ROUND-2 (this file, 3 weekend arms) isolates §7 from the LR confound:
+#   - 2 PLAIN controls at the SAME tail-LR trajectory as the lr025/lr050 switch arms (no
+#     normalize). lr_at scales linearly with --lr, so --lr 0.0625 / 0.125 reproduce exactly
+#     the e30→100 LR of switch_lr_scale 0.25 / 0.50. §7 effect = switch − matched plain ctrl.
+#   - 1 lower §7 point (scale 0.15) → lr015/025/050 is a 3-point sweep + a mirage check
+#     (if even-lower LR only delays the fade, the lead is LR not coords).
 ARMS = [
-    ("v2_switch_e30_precond", f"--reparam_at_epoch 30 --switch_precond {RESUME30}"),
-    ("v2_switch_e30_lr025",   f"--reparam_at_epoch 30 --switch_lr_scale 0.25 {RESUME30}"),
-    ("v2_switch_e30_lr050",   f"--reparam_at_epoch 30 --switch_lr_scale 0.50 {RESUME30}"),
-    ("v2_switch_e15_lr025",   "--reparam_at_epoch 15 --switch_lr_scale 0.25"),
+    ("v2_ctrl_e30_lr025_plain", f"--reparam_at_epoch -1 --lr 0.0625 {RESUME30}"),
+    ("v2_ctrl_e30_lr050_plain", f"--reparam_at_epoch -1 --lr 0.125 {RESUME30}"),
+    ("v2_switch_e30_lr015",     f"--reparam_at_epoch 30 --switch_lr_scale 0.15 {RESUME30}"),
 ]
 
 SH = (
