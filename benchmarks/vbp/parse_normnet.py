@@ -2,13 +2,14 @@
 Summarize normalize_net.py runs into a compact, analyzable table.
 
 Reads the machine artifacts each run writes (<tag>_run.json + <tag>_metrics.jsonl)
-and prints (1) a one-row-per-run summary and (2) a per-epoch val_acc matrix.
-Accepts run dirs, parent dirs (recurses one level), or explicit *_run.json paths.
+and prints (1) a one-row-per-run summary (best raw + best EMA) and (2) per-epoch
+matrices. Accepts run dirs, parent dirs (recurses one level), or *_run.json paths.
 
 Usage:
     python benchmarks/vbp/parse_normnet.py /path/to/NORMNET/ResNet50
     python benchmarks/vbp/parse_normnet.py v1_dir v2_dir v3_dir
     python benchmarks/vbp/parse_normnet.py --pct out/*/  # accuracies as %
+    python benchmarks/vbp/parse_normnet.py --pct --show acc,ema,loss out/*/  # raw+EMA+loss
 """
 import argparse
 import glob
@@ -110,7 +111,7 @@ def main(argv):
     # ---- Summary table ----
     # λ / ema = reparam regularization knobs; reg/ce = final-epoch loss split;
     # <.1 = fraction of channels with ‖σ·v‖<0.1 (induced sparsity, the E4 signal).
-    hdr = ["tag", "arm", "lr", "sched", "kd", "λ", "ema", "pre", "best", "Δpre",
+    hdr = ["tag", "arm", "lr", "sched", "kd", "λ", "ema", "pre", "best", "ebest", "Δpre",
            "trn", "reg", "ce", "<.1", "vmin", "st"]
     rows = []
     for tag, run, epochs, records in runs:
@@ -119,6 +120,10 @@ def main(argv):
         best = run.get("best_val_acc")
         if best is None and epochs:
             best = max(v for k, v in epochs.items() if k >= 1) if any(k >= 1 for k in epochs) else None
+        # best EMA val_acc over real epochs (≥1); train_v2 logs ema_val_acc per epoch.
+        ema_vals = [r["ema_val_acc"] for k, r in records.items()
+                    if k >= 1 and r.get("ema_val_acc") is not None]
+        ebest = max(ema_vals) if ema_vals else None
         d_pre = (best - pre) if (best is not None and pre is not None) else None
         last = _last_real_epoch(records) or {}
         lam = cfg.get("reparam_lambda")
@@ -130,7 +135,7 @@ def main(argv):
             "y" if cfg.get("use_kd") else "n",
             f"{lam:g}" if lam is not None else "-",
             f"{ema:g}" if ema is not None else "-",
-            f(pre), f(best),
+            f(pre), f(best), f(ebest),
             ("+" + f(d_pre)) if (d_pre is not None and d_pre >= 0) else f(d_pre),
             g(last.get("train_loss"), 3), g(last.get("reg_loss"), 4),
             g(last.get("ce_kd_loss"), 3),
@@ -150,6 +155,7 @@ def main(argv):
     # spec: key → (title, record-field, formatter, start-epoch)
     matrices = {
         "acc":   ("VAL_ACC PER EPOCH (e0=init)", "val_acc", f, 0),
+        "ema":   ("EMA_VAL_ACC PER EPOCH", "ema_val_acc", f, 1),
         "reg":   ("REG_LOSS (λ‖σ·v‖) PER EPOCH", "reg_loss", lambda x: g(x, 4), 1),
         "loss":  ("TRAIN_LOSS PER EPOCH", "train_loss", lambda x: g(x, 3), 1),
         "spars": ("FRAC ‖σ·v‖<0.1 PER EPOCH", "frac_below_0.1", lambda x: g(x, 3), 1),
