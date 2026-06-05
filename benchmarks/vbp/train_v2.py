@@ -91,11 +91,18 @@ def build_loaders(args, use_ddp):
         T.Resize(args.val_resize, interpolation=T.InterpolationMode.BILINEAR),
         T.CenterCrop(224), T.ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
-    # Clean transform (no TA / erase) for σ,μ calibration at the reparam switch.
-    calib_tf = T.Compose([
-        T.Resize(args.val_resize, interpolation=T.InterpolationMode.BILINEAR),
-        T.CenterCrop(224), T.ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
+    # σ,μ calibration transform at the reparam switch. 'train' (default) reuses the FULL
+    # train pipeline (RandomResizedCrop 176 + TrivialAug + RandomErasing) so the calibrated
+    # σ matches the training-forward σ the BN then EMA-tracks — otherwise σ_cal (clean 224)
+    # diverges from σ_run and mis-scales the precond / perturbs w_eff=v_tilde/σ_run. 'clean'
+    # keeps the old eval-style transform (legacy / deploy-stat calibration).
+    if args.calib_transform == "train":
+        calib_tf = train_tf
+    else:
+        calib_tf = T.Compose([
+            T.Resize(args.val_resize, interpolation=T.InterpolationMode.BILINEAR),
+            T.CenterCrop(224), T.ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
     # Match vbp_common.build_dataloaders: cached pickle sample-lists (FastImageNet) fast
     # path, ImageFolder only as fallback. The cluster has <data_path>/{train,val}_samples.pkl,
     # NOT a {train,val}/ ImageFolder tree.
@@ -196,9 +203,19 @@ def _install_switch_precond(mgr):
     overshoots ~50× (×∞ for dead channels) and destroys the net in one epoch. Multiplying
     grad_vtilde by σ² restores the plain-coords relative step exactly:
         lr·(σ²·grad_vtilde)/v_tilde = lr·(σ²·grad_W/σ)/(σW) = lr·grad_W/W   (plain).
-    σ² is FROZEN at switch from bn.running_var (already broadcast → identical across DDP ranks,
-    so every rank scales identically). Dead channels (σ²→0) get a ~0 factor → frozen at their
-    function-preserving value (they contribute ~nothing, so freezing is safe, not a collapse).
+
+    σ² is read LIVE from bn.running_var at every backward, NOT frozen at switch. The BN keeps
+    EMA-updating its running stats each train batch (BNResidual.forward), and the calibration
+    σ (clean 224) differs from the training-forward σ (augmented, 176-crop). A frozen σ_cal²
+    factor then mis-scales by σ_cal²/σ_run²: once σ_run drifts UP, effective LR = lr·σ_cal²/σ_run²
+    throttles below plain for the whole post-switch phase (higher train loss, ~3% acc deficit).
+    The live factor cancels the 1/σ² inflation exactly regardless of drift. bn.running_var is
+    updated in the forward (before backward) and broadcast at switch → identical across DDP ranks.
+    Dead channels (σ²→0) get ~0 factor → frozen at their function-preserving value (safe).
+
+    NOTE: by design this reverts v_tilde-SGD to plain-W dynamics, so it CANNOT show a §7
+    normalized-coords training benefit — best case it ties baseline. Use --switch_lr_scale
+    (precond OFF) to keep normalized dynamics and actually test §7.
     Returns the hook handles (kept alive by the caller)."""
     handles = []
     for rp in mgr._reparam_modules.values():
@@ -206,10 +223,10 @@ def _install_switch_precond(mgr):
         vt = getattr(rp, "v_tilde", None)
         if bn is None or vt is None or not hasattr(bn, "running_var"):
             continue
-        sig2 = bn.running_var.detach().clone()                  # [in] frozen σ² at switch
-        shape = [1, sig2.numel()] + [1] * (vt.dim() - 2)        # broadcast on in-dim
-        factor = sig2.view(*shape)
-        handles.append(vt.register_hook(lambda g, f=factor: g * f))
+        shape = [1, bn.running_var.numel()] + [1] * (vt.dim() - 2)   # broadcast on in-dim
+        # live σ²: bn.running_var at backward time (forward already EMA-updated it this batch)
+        handles.append(vt.register_hook(
+            lambda g, b=bn, s=tuple(shape): g * b.running_var.detach().view(*s)))
     return handles
 
 
@@ -354,8 +371,13 @@ def main(argv):
             log_info(f"SWITCHED to normalized coords at epoch {epoch} "
                      f"({len(names)} layers; optimizer + EMA rebuilt)")
 
+        # In normalized coords scale the cosine LR by --switch_lr_scale. This is the §7
+        # knob: with precond OFF it keeps the true normalized-coords v_tilde dynamics but
+        # tames the 1/σ² overshoot via a single global factor (e.g. 0.25), instead of the
+        # precond which reverts to plain-W dynamics and so can't show a §7 benefit.
+        eff_lr = lr_at(epoch, args) * (args.switch_lr_scale if mgr is not None else 1.0)
         for g in optimizer.param_groups:
-            g["lr"] = lr_at(epoch, args)
+            g["lr"] = eff_lr
         train_loss = train_one_epoch(train_model, train_loader, train_sampler,
                                      optimizer, device, epoch, args, criterion, ema=ema)
 
@@ -365,12 +387,12 @@ def main(argv):
                        if ema is not None else None)
             log_info(f"[{arm}] Epoch {epoch+1}/{args.epochs}: train_loss={train_loss:.4f} "
                      f"val_acc={acc:.4f}" + (f" ema_acc={ema_acc:.4f}" if ema_acc else "")
-                     + f" lr={lr_at(epoch, args):.4f}"
+                     + f" lr={eff_lr:.4f}"
                      + (" [normalized]" if mgr is not None else ""))
             append_metrics(args, {"arm": arm, "epoch": epoch + 1, "epochs": args.epochs,
                                   "train_loss": round(train_loss, 6), "val_acc": round(acc, 6),
                                   "ema_val_acc": (round(ema_acc, 6) if ema_acc else None),
-                                  "lr": lr_at(epoch, args),
+                                  "lr": eff_lr,
                                   "normalized": mgr is not None})
         if use_ddp:
             torch.distributed.barrier()
@@ -439,8 +461,16 @@ def parse_args(argv):
     p.add_argument("--mu_ema_momentum", type=float, default=0.0)
     p.add_argument("--exclude_stem", action="store_true")
     p.add_argument("--switch_precond", action="store_true",
-                   help="S1 fix: scale post-switch v_tilde grads by σ² to cancel the 1/σ² LR "
-                        "inflation that otherwise collapses the net the epoch after the switch.")
+                   help="S1 fix: scale post-switch v_tilde grads by LIVE σ² to cancel the 1/σ² "
+                        "LR inflation. Reverts to plain-W dynamics → ties baseline, no §7 gain. "
+                        "Use --switch_lr_scale for the actual §7 test.")
+    p.add_argument("--switch_lr_scale", type=float, default=1.0,
+                   help="§7 knob: global LR multiplier in the normalized phase (precond OFF). "
+                        "Keeps true normalized-coords dynamics; tames the 1/σ² overshoot with "
+                        "one factor (e.g. 0.25). 1.0 = no scaling.")
+    p.add_argument("--calib_transform", default="train", choices=["train", "clean"],
+                   help="σ,μ calibration transform at switch. 'train' (default) = full train "
+                        "pipeline so σ_cal matches σ_run; 'clean' = eval-style 224 (legacy).")
     p.add_argument("--calib_batches", type=int, default=50)
     # io / ddp
     p.add_argument("--save_dir", required=True); p.add_argument("--save_tag", default="v2")
