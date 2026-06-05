@@ -320,7 +320,18 @@ def main(argv):
     mgr = None
     write_run(args, {"status": "running", "arm": arm, "config": vars(args)})
 
-    for epoch in range(args.epochs):
+    # Resume the 100-epoch cosine at --start_epoch (skip the already-trained plain phase by
+    # loading its pre-switch checkpoint via --checkpoint). lr_at(epoch, args) keys off the
+    # TRUE epoch index, so epochs start_epoch..epochs-1 reproduce the original schedule — NOT
+    # a fresh short cosine. Pair with --reparam_at_epoch start_epoch to switch on the 1st iter.
+    if args.start_epoch > 0:
+        if not args.checkpoint:
+            log_info("WARNING: --start_epoch>0 without --checkpoint → starting from RANDOM "
+                     "weights at a late-cosine LR. Pass the pre-switch checkpoint.")
+        log_info(f"resuming at epoch {args.start_epoch}/{args.epochs} "
+                 f"(skipped plain phase; weights from --checkpoint)")
+
+    for epoch in range(args.start_epoch, args.epochs):
         # ---- continuous switch to normalized coordinates ----
         if mgr is None and args.reparam_at_epoch >= 0 and epoch == args.reparam_at_epoch:
             raw = _unwrap(train_model)
@@ -432,7 +443,11 @@ def parse_args(argv):
     p = argparse.ArgumentParser(description="official v2 recipe + optional normalize switch")
     p.add_argument("--model_type", default="cnn"); p.add_argument("--model_name", default="resnet50")
     p.add_argument("--cnn_arch", default="resnet50")
-    p.add_argument("--checkpoint", default=None, help="None → from scratch")
+    p.add_argument("--checkpoint", default=None, help="None → from scratch; or a pre-switch "
+                   "plain state_dict to resume from (pair with --start_epoch)")
+    p.add_argument("--start_epoch", type=int, default=0, help="resume the cosine here (skip the "
+                   "plain phase). Load its pre-switch ckpt via --checkpoint; set "
+                   "--reparam_at_epoch to this value to switch on the first iteration.")
     p.add_argument("--data_path", required=True)
     p.add_argument("--epochs", type=int, default=100)
     # official recipe knobs

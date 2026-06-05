@@ -39,6 +39,12 @@ DATA = "/algo/NetOptimization/outputs/VBP/"
 NPROC = int(os.environ.get("V2_NPROC", "4"))
 EPOCHS = int(os.environ.get("V2_EPOCHS", "100"))
 LR = os.environ.get("V2_LR", "0.25")                         # 0.5 @ batch1024 → 0.25 @ 4×128
+# Pre-switch plain checkpoint from the round-1 run (saved at the e30 switch). The 3 e30 arms
+# load it and resume the 100-epoch cosine at e30 (--start_epoch 30), skipping the identical
+# plain 0–30 phase → saves 90 GPU-epochs. The e15 arm has no e15 ckpt, runs full.
+PRESWITCH = os.environ.get(
+    "V2_PRESWITCH", f"{BASE_OUT}/v2_switch_e30/v2_switch_e30_preswitch_e30.pth")
+RESUME30 = f"--checkpoint {PRESWITCH} --start_epoch 30"
 
 # official v2 recipe held identical across all arms (from-scratch: no --checkpoint).
 COMMON = (
@@ -49,11 +55,12 @@ COMMON = (
     f"--reparam_variant bn --norm_bn_momentum 0.01 --calib_batches 50 --calib_transform train"
 )
 
-# 4 GPU-budget arms. v2_baseline kept from the prior run.
+# 4 GPU-budget arms. v2_baseline kept from the prior run. The 3 e30 arms resume from the
+# round-1 pre-switch checkpoint (RESUME30) → only 70 epochs each; e15 runs the full 100.
 ARMS = [
-    ("v2_switch_e30_precond", "--reparam_at_epoch 30 --switch_precond"),
-    ("v2_switch_e30_lr025",   "--reparam_at_epoch 30 --switch_lr_scale 0.25"),
-    ("v2_switch_e30_lr050",   "--reparam_at_epoch 30 --switch_lr_scale 0.50"),
+    ("v2_switch_e30_precond", f"--reparam_at_epoch 30 --switch_precond {RESUME30}"),
+    ("v2_switch_e30_lr025",   f"--reparam_at_epoch 30 --switch_lr_scale 0.25 {RESUME30}"),
+    ("v2_switch_e30_lr050",   f"--reparam_at_epoch 30 --switch_lr_scale 0.50 {RESUME30}"),
     ("v2_switch_e15_lr025",   "--reparam_at_epoch 15 --switch_lr_scale 0.25"),
 ]
 
