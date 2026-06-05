@@ -1064,13 +1064,11 @@ class MeanResidualManager(BaseReparamManager):
         Returns OrderedDict[name → list of (downstream_name, weight)]:
           - sequential: single downstream, weight 1.0;
           - residual join: each branch's single downstream is the merged consumer,
-            with weight σ_branch^p / Σ σ_branches^p (paper's σ_c^p/(σ_a^p+σ_b^p));
+            with weight σ_branch^p / Σ σ_branches^p (paper's σ_c^p/(σ_a^p+σ_b^p)),
+            computed PER-CHANNEL (a tensor over the merged channel axis);
           - fan-out (no add, layer feeds multiple consumers): each downstream weight = 1.0
             (importance accumulates additively across consumers);
           - terminal (no reparam'd consumer downstream): empty list — uses I_out seed.
-
-        σ_branch is the per-branch mean of `sigma_out_x` (scalar). Per-channel branch
-        weights are out of M3 scope.
 
         Args:
             p: skip-connection exponent — MUST match the `p` passed to
@@ -1172,21 +1170,21 @@ class MeanResidualManager(BaseReparamManager):
             for d in dsts:
                 upstream_map.setdefault(d, []).append(src)
 
-        # Branch weights via σ_out^p (scalar per branch = mean over channels).
-        # p=2 → σ_c²/(σ_a²+σ_b²) variance split; p=1 → σ_c/(σ_a+σ_b) std split.
-        weights = {}  # (src, dst) → float
+        # Branch weights via σ_out^p, PER-CHANNEL (PDF σ_c^p/(σ_a^p+σ_b^p), the variance share
+        # of each branch at the add — p=2 variance, p=1 std). Each branch's σ_out_x is per
+        # output-channel and the branches share the merged channel axis, so the split is a
+        # per-channel vector (NOT a scalar channel-mean — that was an approximation).
+        weights = {}  # (src, dst) → float 1.0 (sequential/fan-out) or per-channel tensor (join)
         for dst, branches in upstream_map.items():
             unique_branches = list(dict.fromkeys(branches))  # de-dup, preserve order
             if len(unique_branches) == 1:
                 weights[(unique_branches[0], dst)] = 1.0
             else:
-                sigma_per_branch = {}
+                sig_p = {b: self._reparam_modules[b].sigma_out_x.detach().pow(p)
+                         for b in unique_branches}
+                total = sum(sig_p.values()) + 1e-8
                 for b in unique_branches:
-                    rp_b = self._reparam_modules[b]
-                    sigma_per_branch[b] = float(rp_b.sigma_out_x.detach().mean().item()) ** p
-                total = sum(sigma_per_branch.values()) + 1e-8
-                for b in unique_branches:
-                    weights[(b, dst)] = sigma_per_branch[b] / total
+                    weights[(b, dst)] = sig_p[b] / total      # per-channel tensor
 
         # Assemble final topology with weights
         topology = OrderedDict()
@@ -1470,7 +1468,10 @@ class MeanResidualManager(BaseReparamManager):
                                            f"layers chain but their channel counts disagree "
                                            f"— check for asymmetric fan-out / channel reshape "
                                            f"between them.")
-                    I_next = I_next + float(w) * I_d
+                    # w is 1.0 (sequential/fan-out) or a per-channel σ^p-share tensor (residual
+                    # join) aligned to this layer's out / d's in axis.
+                    w_t = w if torch.is_tensor(w) else float(w)
+                    I_next = I_next + w_t * I_d
 
             # SCORE RECURSION I^l = W̄^l·I^{l+1} (normalized_nets_pruning.pdf steps 7-8). BOTH
             # forms use column-stochastic W̄ = M^p·D, D=1/col-sum=1/σ^l_j^p (divides out the

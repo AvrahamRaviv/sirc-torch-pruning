@@ -839,14 +839,17 @@ def test_build_topology_residual():
     assert len(topo["shortcut"]) == 1 and topo["shortcut"][0][0] == "tail"
     w_main = topo["main"][0][1]
     w_short = topo["shortcut"][0][1]
-    assert abs((w_main + w_short) - 1.0) < 1e-5, "branch weights at join must sum to 1"
+    # PER-CHANNEL σ^p share now (tensor over the merged channel axis), summing to 1 per channel
+    assert torch.is_tensor(w_main) and torch.is_tensor(w_short), "join weights are per-channel tensors"
+    assert torch.allclose(w_main + w_short, torch.ones_like(w_main), atol=1e-5), \
+        "branch weights at join must sum to 1 per channel"
 
-    # Default p=2 → variance split σ²/(σ_a²+σ_b²)
-    sigma_main = mgr._reparam_modules["main"].sigma_out_x.mean().item() ** 2
-    sigma_short = mgr._reparam_modules["shortcut"].sigma_out_x.mean().item() ** 2
-    expected_w_main = sigma_main / (sigma_main + sigma_short + 1e-8)
-    assert abs(w_main - expected_w_main) < 1e-4, \
-        f"w_main={w_main}, expected ~{expected_w_main}"
+    # Default p=2 → per-channel variance split σ²/(σ_a²+σ_b²)
+    sm = mgr._reparam_modules["main"].sigma_out_x.pow(2)
+    ss = mgr._reparam_modules["shortcut"].sigma_out_x.pow(2)
+    expected_w_main = sm / (sm + ss + 1e-8)
+    assert torch.allclose(w_main, expected_w_main, atol=1e-4), \
+        f"w_main={w_main}, expected per-channel σ²-share ~{expected_w_main}"
 
     # tail terminal
     assert topo["tail"] == []
