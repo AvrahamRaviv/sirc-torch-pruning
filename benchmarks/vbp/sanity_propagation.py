@@ -70,7 +70,7 @@ sin, spre, spost = empirical_sigmas(m, fcs, X, acts)
 # component checks (standalone internals) — p independent
 prunable = {f"fc{k}": fc for k, fc in zip("ABC", fcs)}
 loader = [(X[i:i+40], torch.zeros(40, dtype=torch.long)) for i in range(0, 400, 40)]
-mu, sigma, sigma_out, fire, _ = nns.calibrate(m, prunable, loader, CPU, len(loader), save_input_for=[])
+mu, sigma, fire, _ = nns.calibrate(m, prunable, loader, CPU, len(loader), save_input_for=[])
 ex = torch.randn(1, DIMS[0])
 edges = nns.discover_edges(m, ex, prunable)
 # A) M construction (step 1)
@@ -102,7 +102,7 @@ check("transfer != PRE-act std (fcA: sigma[consumer] FAR from sigma_pre)",
 # D) RECURSION exactness: hand oracle uses the CODE's OWN sigma as transfer -> isolates the
 #    recursion math from sigma-measurement. Expect EXACT match (rel + nonrel, p=1 and p=2).
 for p in (1, 2):
-    sc = nns.compute_scores(prunable, sigma, sigma_out, mu, edges, fire, p=p)
+    sc = nns.compute_scores(prunable, sigma, edges, fire, p=p)
     T = {m.fcA: sa_sigma_post(m.fcA).pow(p), m.fcB: sa_sigma_post(m.fcB).pow(p), m.fcC: sa_sigma_post(m.fcC).pow(p)}
     def seq(nonrel):
         I = {}; seed = torch.full((DIMS[3],), 1.0/DIMS[3])
@@ -194,9 +194,9 @@ except Exception as e:
 ms = ResToy(); ms.load_state_dict(base.state_dict()); ms.eval()
 prunR = {"fcA": ms.fcA, "fcB": ms.fcB, "fcS": ms.fcS, "fcC": ms.fcC}
 loaderR = [(Xr[i:i+40], torch.zeros(40, dtype=torch.long)) for i in range(0, 400, 40)]
-muR, sigR, soR, fireR, _ = nns.calibrate(ms, prunR, loaderR, CPU, len(loaderR), save_input_for=[])
+muR, sigR, fireR, _ = nns.calibrate(ms, prunR, loaderR, CPU, len(loaderR), save_input_for=[])
 edgesR = nns.discover_edges(ms, exr, prunR)
-scR = nns.compute_scores(prunR, sigR, soR, muR, edgesR, fireR, p=2)
+scR = nns.compute_scores(prunR, sigR, edgesR, fireR, p=2)
 print("  -- standalone residual: PLAIN-SUM fan-in (KNOWN: skips the sigma^2 share at the add) --")
 check("standalone residual runs finite", all(torch.isfinite(v).all() for v in scR['rel'].values()), "ran")
 # document the gap quantitatively (not a pass/fail on alignment — a known scope limit)

@@ -266,44 +266,36 @@ def fold_bn(model, example_inputs):
 
 @torch.no_grad()
 def calibrate(model, prunable, loader, device, n_batches, save_input_for):
-    """One pass: per prunable layer capture input mean/std (mu_in, sigma_in) per INPUT
-    channel AND output std (sigma_out) per OUTPUT channel, plus forward FIRING ORDER (a
-    valid topo sort of the prunable DAG). `save_input_for` modules also stash one input
-    batch (for the fold sanity check).
+    """One pass: per prunable layer capture INPUT mean/std (mu_in, sigma_in) per input
+    channel, plus forward FIRING ORDER (a valid topo sort of the prunable DAG).
+    `save_input_for` modules also stash one input batch (for the fold sanity check).
 
-    sigma_out is the layer's OWN per-output-channel activation std = the non-relative
-    inter-layer transfer Σ^{l+1}. Measured directly (consumer-INDEPENDENT) — NOT borrowed
-    from a downstream consumer's input σ, which double-counts the σ already inside that
-    consumer's M and gets poisoned by off-path residual-stream consumers (the drift bug)."""
-    stats     = {m: {"sum": None, "sqsum": None, "n": 0} for m in prunable.values()}
-    out_stats = {m: {"sum": None, "sqsum": None, "n": 0} for m in prunable.values()}
+    The non-relative transfer Σ^{l+1} is the POST-activation std = the immediate on-path
+    CONSUMER's input σ (built in compute_scores from sigma_in), NOT a layer's own output
+    std — that own-output std is PRE-activation (= the D denominator) and would cancel D,
+    collapsing nonrel to the raw M^p product. So we calibrate only the input σ here."""
+    stats = {m: {"sum": None, "sqsum": None, "n": 0} for m in prunable.values()}
     fire_order = []
     seen = set()
     saved_inputs = {}
-
-    def _accum(st, t, conv):
-        # conv-type -> NCHW reduce (dim 1 channels); else channels-LAST (dim -1)
-        if conv:
-            s = t.sum(dim=(0, 2, 3)); sq = (t * t).sum(dim=(0, 2, 3)); cnt = t.numel() // t.size(1)
-        else:
-            tf = t.reshape(-1, t.size(-1)); s = tf.sum(0); sq = (tf * tf).sum(0); cnt = tf.size(0)
-        st["sum"]   = s  if st["sum"]   is None else st["sum"]   + s
-        st["sqsum"] = sq if st["sqsum"] is None else st["sqsum"] + sq
-        st["n"]    += cnt
 
     def pre_hook(mod, inp):
         x = inp[0].detach()
         if mod not in seen:
             fire_order.append(mod); seen.add(mod)
-        _accum(stats[mod], x, isinstance(mod, nn.Conv2d))
+        # conv-type -> NCHW reduce (dim 1 channels); else channels-LAST (dim -1)
+        if isinstance(mod, nn.Conv2d):
+            s = x.sum(dim=(0, 2, 3)); sq = (x * x).sum(dim=(0, 2, 3)); cnt = x.numel() // x.size(1)
+        else:
+            xf = x.reshape(-1, x.size(-1)); s = xf.sum(0); sq = (xf * xf).sum(0); cnt = xf.size(0)
+        st = stats[mod]
+        st["sum"]   = s  if st["sum"]   is None else st["sum"]   + s
+        st["sqsum"] = sq if st["sqsum"] is None else st["sqsum"] + sq
+        st["n"]    += cnt
         if mod in save_input_for and mod not in saved_inputs:
             saved_inputs[mod] = x[:4].clone()       # tiny slice for the assert
 
-    def post_hook(mod, inp, out):
-        _accum(out_stats[mod], out.detach(), isinstance(mod, nn.Conv2d))
-
-    handles  = [m.register_forward_pre_hook(pre_hook) for m in prunable.values()]
-    handles += [m.register_forward_hook(post_hook)    for m in prunable.values()]
+    handles = [m.register_forward_pre_hook(pre_hook) for m in prunable.values()]
     model.eval()
     log(f"calib: starting {n_batches} batches on {device} ...")
     bi = 0
@@ -317,16 +309,13 @@ def calibrate(model, prunable, loader, device, n_batches, save_input_for):
     for h in handles:
         h.remove()
 
-    def _finalize(st):
+    mu, sigma = {}, {}
+    for m, st in stats.items():
         mean = st["sum"] / st["n"]
         var  = st["sqsum"] / st["n"] - mean * mean
-        return mean, var.clamp_min(1e-8).sqrt()
-
-    mu, sigma, sigma_out = {}, {}, {}
-    for m in prunable.values():
-        mu[m], sigma[m]    = _finalize(stats[m])
-        _,     sigma_out[m] = _finalize(out_stats[m])
-    return mu, sigma, sigma_out, fire_order, saved_inputs
+        mu[m]    = mean
+        sigma[m] = var.clamp_min(1e-8).sqrt()
+    return mu, sigma, fire_order, saved_inputs
 
 
 def assert_fold_preserving(layer, mu, sigma, x):
@@ -389,7 +378,7 @@ def discover_edges(model, example_inputs, prunable):
 
 
 @torch.no_grad()
-def compute_scores(prunable, sigma, sigma_out, mu, edges, fire_order, p=2):
+def compute_scores(prunable, sigma, edges, fire_order, p=2):
     """Returns dict mode -> {layer: per-input-channel score}.
 
     nonrel spectral caveat: propagation is an inhomogeneous product of per-layer
@@ -399,11 +388,6 @@ def compute_scores(prunable, sigma, sigma_out, mu, edges, fire_order, p=2):
     dist}[sigma_post^p] != 1 in general -> geometric drift over depth. So nonrel is
     cross-layer in intent; verify its dynamic range before trusting it globally
     (a within-layer ranker via 'mean' normalization is the safe use).
-
-    sigma_post = each layer's OWN measured output std (consumer-INDEPENDENT). NOT the
-    downstream consumer's input σ: that borrow double-counts the σ already inside the
-    consumer's M and averages in off-path residual-stream consumers — production
-    (reparam._propagate_dag) warns this "poisoned ... by orders of magnitude".
     """
     def n_out(L): return L.out_channels if isinstance(L, nn.Conv2d) else L.out_features
 
@@ -425,6 +409,9 @@ def compute_scores(prunable, sigma, sigma_out, mu, edges, fire_order, p=2):
         else:
             sigma_post[L] = torch.ones(n_out(L), device=M[L].device)   # terminal → no transfer
 
+    # nci/mag are VARIANCE/L2 BY DEFINITION (the paper's NCI = σ_i²‖W_i‖²) — fixed exponent 2,
+    # independent of `p`. `p` only flavors the PROPAGATION (rel/nonrel: p=2 variance / p=1 std).
+    # So a `--p 1` dump pairs L1 propagation with the (unchanged) L2 nci/mag baselines on purpose.
     nci = {L: (M[L].pow(2)).sum(dim=1) for L in prunable.values()}   # one hop = sigma_i^2||W_i||^2
     # plain magnitude on the SAME input axis (no sigma): mag_i = ||W[:,i]||.  nci = sigma^2 mag^2
     mag = {L: (M[L] / sigma[L][:, None]).pow(2).sum(dim=1).sqrt() for L in prunable.values()}
@@ -629,8 +616,8 @@ def main():
     name2mod = dict(model.named_modules())
     mod2name = {m: n for n, m in name2mod.items()}
     fold_check = list(prunable.values())[:2]
-    mu, sigma, sigma_out, fire_order, saved = calibrate(model, prunable, train_loader, device,
-                                                        args.calib_batches, save_input_for=fold_check)
+    mu, sigma, fire_order, saved = calibrate(model, prunable, train_loader, device,
+                                             args.calib_batches, save_input_for=fold_check)
     log(f"calib done: {len(prunable)} prunable layers | fire-order len {len(fire_order)}")
 
     # 3) fold function-preservation check
@@ -644,7 +631,7 @@ def main():
     log("discovering layer graph (dependency) ...")
     edges = discover_edges(model, example_inputs, prunable)
     log("computing scores (magnitude/nci/rel/nonrel) ...")
-    scores_by_mode = compute_scores(prunable, sigma, sigma_out, mu, edges, fire_order, p=args.p)
+    scores_by_mode = compute_scores(prunable, sigma, edges, fire_order, p=args.p)
     align_ok = assert_alignment(model, example_inputs, prunable, scores_by_mode["nci"])
     print(f"[align] input-score -> physical channel mapping: {'OK' if align_ok else 'CHECK'}")
     for mode, sc in scores_by_mode.items():
