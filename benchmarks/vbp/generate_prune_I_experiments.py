@@ -59,6 +59,9 @@ A_MU_EMA = os.environ.get("A_MU_EMA", "0.1")                  # σ/μ EMA moment
 # no reg) already characterized. Flip these on to regenerate them.
 INCLUDE_NONREL = os.environ.get("INCLUDE_NONREL", "0") != "0"
 INCLUDE_A0 = os.environ.get("INCLUDE_A0", "0") != "0"
+# NCI = the bounded cross-layer one-hop scorer (‖σv‖=√NCI = --scorer per_layer): σ folded
+# once, NO propagation, NO depth compound. The honest cross-layer baseline vs prop rel/nonrel.
+INCLUDE_NCI = os.environ.get("INCLUDE_NCI", "0") != "0"
 
 # Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
@@ -134,6 +137,10 @@ def main():
     if INCLUDE_A0:
         for rname, rflag in REL_VARIANTS:
             made.append(_write(f"A0_prop_{rname}", DENSE_8086, A0_EXTRA, rflag))
+    # A0 NCI — cold prune by ‖σv‖=√NCI (--scorer per_layer overrides SHARED's propagation).
+    # The bounded cross-layer one-hop baseline against A0_prop_rel/nonrel; same harness.
+    if INCLUDE_NCI:
+        made.append(_write("A0_nci", DENSE_8086, A0_EXTRA, " --scorer per_layer"))
     # CLASSICAL baselines (same harness: 80.86, mac 2G global, KD, no sparse phase). The
     # --scorer override (last-wins over SHARED's propagation) swaps the criterion. These are
     # the controls that should recover — magnitude/bn_scale lack the propagation gutting.
