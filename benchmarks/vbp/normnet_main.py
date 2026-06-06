@@ -109,10 +109,16 @@ def _classifier(model):
     return None
 
 
-def _ignored_layers(model, model_type):
+def _ignored_layers(model, model_type, interior_only=False):
     """Layers the global pruner must NOT touch.
 
     cnn (resnet): only the classifier (.fc) — interior convs are all prunable.
+        interior_only=True reproduces the old vbp_imagenet_pat scope: ALSO ignore the
+        residual-stream width — the stem conv1, every block's conv3 (bottleneck output),
+        and every downsample conv. Leaves only conv1/conv2 of each bottleneck prunable
+        (the 32-group scope). Use this to match the proven NCI runs; full scope additionally
+        cuts the wide 2048/1024/512 residual dims (param-dense, MAC-cheap → strips params at
+        fixed MAC, wrecks pre-FT acc).
     convnext: MLP-only, exactly like ViT. Prune ONLY pwconv1's output (= the block's
         4×dim intermediate, = pwconv2's input). Ignore the head, every downsample/stem
         conv (their out-channels are the residual stream width), the depthwise dwconv, and
@@ -128,6 +134,13 @@ def _ignored_layers(model, model_type):
         for stage in model.stages:
             for block in stage:
                 ig += [block.dwconv, block.pwconv2]
+    elif model_type == "cnn" and interior_only:
+        # residual-stream out-channels = stem conv1 + every blockX.Y.conv3 + downsample conv.
+        for name, m in model.named_modules():
+            if not isinstance(m, torch.nn.Conv2d):
+                continue
+            if name == "conv1" or name.endswith(".conv3") or ".downsample." in name:
+                ig.append(m)
     return ig
 
 
@@ -379,7 +392,7 @@ def main(argv):
             return NormalizedNetImportance(mdl, scores, group_reduction="mean", normalizer=norm)
 
         def _ignored(mdl):
-            return _ignored_layers(mdl, args.model_type)
+            return _ignored_layers(mdl, args.model_type, interior_only=args.interior_only)
 
         # MAC target overrides the raw channel ratio: 2G on RN50 (4.1G) ≈ 30% channels,
         # not 50% — channel-ratio ≠ MAC-ratio. Binary-search the global ratio whose
@@ -478,6 +491,11 @@ def parse_args(argv):
                         "model instead of the EMA (default: EMA, the deployable one)")
     p.add_argument("--data_path", required=True)
     p.add_argument("--exclude_stem", action="store_true")
+    p.add_argument("--interior_only", action="store_true",
+                   help="resnet: prune ONLY conv1/conv2 of each bottleneck (ignore stem conv1, "
+                        "every conv3, every downsample = the residual-stream width). Reproduces "
+                        "the old vbp_imagenet_pat 32-group scope / proven NCI runs. Without it the "
+                        "global pruner also cuts the wide residual dims.")
     # 1. train
     p.add_argument("--epochs_train", type=int, default=0, help="plain training epochs (0=skip)")
     p.add_argument("--lr_train", type=float, default=0.1)
