@@ -57,11 +57,14 @@ A_MU_EMA = os.environ.get("A_MU_EMA", "0.1")                  # σ/μ EMA moment
 # Which arms to emit. Default: Option A relative only (the viable global criterion). nonrel is
 # parked (raw M^p compounds ~1e9 by depth → global sort ≈ by depth, not contribution). A0 (cold,
 # no reg) already characterized. Flip these on to regenerate them.
-INCLUDE_NONREL = os.environ.get("INCLUDE_NONREL", "0") != "0"
-INCLUDE_A0 = os.environ.get("INCLUDE_A0", "0") != "0"
+INCLUDE_NONREL = os.environ.get("INCLUDE_NONREL", "1") != "0"
+INCLUDE_A0 = os.environ.get("INCLUDE_A0", "1") != "0"
 # NCI = the bounded cross-layer one-hop scorer (‖σv‖=√NCI = --scorer per_layer): σ folded
 # once, NO propagation, NO depth compound. The honest cross-layer baseline vs prop rel/nonrel.
-INCLUDE_NCI = os.environ.get("INCLUDE_NCI", "0") != "0"
+INCLUDE_NCI = os.environ.get("INCLUDE_NCI", "1") != "0"
+# Magnitude = the classical GroupMagnitudeImportance (L2) baseline, same harness (--scorer
+# magnitude). The known-good control NCI/prop must beat.
+INCLUDE_MAGNITUDE = os.environ.get("INCLUDE_MAGNITUDE", "1") != "0"
 
 # Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
@@ -147,6 +150,9 @@ def main():
     # The bounded cross-layer one-hop baseline against A0_prop_rel/nonrel; same harness.
     if INCLUDE_NCI:
         made.append(_write("A0_nci", DENSE_8086, A0_EXTRA, " --scorer per_layer"))
+    # A0 magnitude — cold prune by L2 weight magnitude (--scorer magnitude). Classical control.
+    if INCLUDE_MAGNITUDE:
+        made.append(_write("A0_magnitude", DENSE_8086, A0_EXTRA, " --scorer magnitude"))
     # CLASSICAL baselines (same harness: 80.86, mac 2G global, KD, no sparse phase). The
     # --scorer override (last-wins over SHARED's propagation) swaps the criterion. These are
     # the controls that should recover — magnitude/bn_scale lack the propagation gutting.
