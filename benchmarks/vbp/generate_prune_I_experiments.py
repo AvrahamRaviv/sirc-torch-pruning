@@ -78,6 +78,9 @@ INCLUDE_TP_VARIANCE = os.environ.get("INCLUDE_TP_VARIANCE", "0") != "0"
 INCLUDE_NCI_FBN_FULL = os.environ.get("INCLUDE_NCI_FBN_FULL", "0") != "0"
 # nci_fbn + bias compensation (add W[:,c]·μ_c to consumer bias before removal). Default off.
 INCLUDE_NCI_FBN_BC = os.environ.get("INCLUDE_NCI_FBN_BC", "0") != "0"
+# nci_fbn + bias_comp + --no_bn_recalib — the CLEAN bias-comp test: with recalib on, BN
+# re-centers and absorbs the correction; off, the compensation actually stands in for it.
+INCLUDE_NCI_FBN_BC_NOBN = os.environ.get("INCLUDE_NCI_FBN_BC_NOBN", "0") != "0"
 
 # Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
@@ -193,6 +196,11 @@ def main():
     if INCLUDE_NCI_FBN_BC:
         made.append(_write("A0_nci_fbn_bc", DENSE_8086, A0_EXTRA,
                            " --scorer per_layer --imp_normalizer mean --bias_comp", shared=SHARED_NOFOLD))
+    # A0 nci_fbn + bias_comp + NO bn recalib — clean bias-comp isolation (recalib would absorb it).
+    if INCLUDE_NCI_FBN_BC_NOBN:
+        made.append(_write("A0_nci_fbn_bc_nobn", DENSE_8086, A0_EXTRA,
+                           " --scorer per_layer --imp_normalizer mean --bias_comp --no_bn_recalib",
+                           shared=SHARED_NOFOLD))
     # CLASSICAL baselines (same harness: 80.86, mac 2G global, KD, no sparse phase). The
     # --scorer override (last-wins over SHARED's propagation) swaps the criterion. These are
     # the controls that should recover — magnitude/bn_scale lack the propagation gutting.
