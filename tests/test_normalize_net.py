@@ -600,9 +600,17 @@ def _layer_M_reference(rp, conv_reduction="frobenius"):
 
 
 def _wbar_reference(M, p):
-    """Column-normalized W̄ = M^p / Σ_i M^p (matches propagation_importance)."""
+    """Relative W̄ = M^p / Σ_i M^p (column-stochastic; matches propagation_importance)."""
     Mp = M.pow(p)
     return Mp / Mp.sum(dim=0).clamp(min=1e-8)[None, :]
+
+
+def _wbar_nonrel_reference(M, p):
+    """Non-relative W̄ = M^p / σ_pre^p, σ_pre = (Σ_i M^2)^{1/2} (std/L2 col-norm).
+    No σ transfer (σ already in M). For p=2 this equals _wbar_reference."""
+    Mp = M.pow(p)
+    denom = M.pow(2).sum(dim=0).clamp(min=1e-8).pow(p / 2.0)
+    return Mp / denom[None, :]
 
 
 def test_propagation_two_layer_mlp():
@@ -647,11 +655,11 @@ def test_propagation_two_layer_mlp():
 
 
 def test_propagation_relative_vs_non_relative():
-    """PDF (normalized_nets_pruning.pdf steps 7-8): BOTH forms use the column-stochastic
-    W̄ = M^p·D (D=1/col-sum). They differ ONLY by the inter-layer transfer Σ^{l+1} = post-act
-    output std^p (= consumer input std sigma_x; terminal → own sigma_out_x): relative DROPS it
-    (within-layer); non-relative KEEPS it (cross-layer). Raw M^p (no D) was a bug. Lock both
-    vs hand-derived refs."""
+    """PDF (normalized_nets_pruning.pdf steps 7-10): σ is folded into M (=σ·W) ONCE, no
+    separate transfer. relative → W̄=M^p/Σ_iM^p (column-stochastic). non-relative →
+    W̄=M^p/σ_pre^p, σ_pre=(Σ_iM^2)^{1/2} (std/L2 col-norm). For p=2 they are IDENTICAL
+    ("variance propagation yields the same relative criterion for p=2"); they differ at p=1.
+    Lock both vs hand-derived refs."""
     model = TinyMLP()
     mgr = MeanResidualManager(model, ["fc1", "fc2"], CPU, lambda_reg=0.0, max_batches=4)
     mgr.reparameterize(_vec_loader(16))
@@ -660,30 +668,31 @@ def test_propagation_relative_vs_non_relative():
     rp1, rp2 = mgr._reparam_modules["fc1"], mgr._reparam_modules["fc2"]
     M_fc1 = _layer_M_reference(rp1)
     M_fc2 = _layer_M_reference(rp2)
-    p = 2
 
-    # relative = column-stochastic M^p (the D form), no transfer
-    rel = mgr.propagation_importance(I_out=I_out, p=p, relative=True)
-    I_fc2_rel = _wbar_reference(M_fc2, p) @ I_out
-    assert torch.allclose(rel["fc2"], I_fc2_rel, atol=1e-6)
-    assert torch.allclose(rel["fc1"], _wbar_reference(M_fc1, p) @ I_fc2_rel, atol=1e-6)
+    # relative (column-stochastic), both p
+    for p in (2, 1):
+        rel = mgr.propagation_importance(I_out=I_out, p=p, relative=True)
+        I_fc2_rel = _wbar_reference(M_fc2, p) @ I_out
+        assert torch.allclose(rel["fc2"], I_fc2_rel, atol=1e-6)
+        assert torch.allclose(rel["fc1"], _wbar_reference(M_fc1, p) @ I_fc2_rel, atol=1e-6)
 
-    # non-relative = column-stochastic M^p × Σ^{l+1} transfer ⊙ I_next, where the transfer is
-    # the POST-activation std = the on-path CONSUMER's input std sigma_x (NOT the layer's own
-    # sigma_out_x, which is PRE-activation = the D denominator and would cancel D → raw M^p).
-    # fc1's consumer is fc2 → transfer = fc2's sigma_x. fc2 is terminal → fallback own sigma_out_x.
-    sig_fc2 = rp2.sigma_out_x.detach()   # fc2 terminal → fallback (no downstream consumer)
-    sig_fc1 = rp2.sigma_x.detach()       # fc1's consumer fc2: transfer = fc2 input std (= σ_post[fc1])
-    nonrel = mgr.propagation_importance(I_out=I_out, p=p, relative=False)
-    I_fc2_nr = _wbar_reference(M_fc2, p) @ (sig_fc2.pow(p) * I_out)
-    assert torch.allclose(nonrel["fc2"], I_fc2_nr, atol=1e-6), \
-        "non-rel fc2 = W̄·(σ_out^p ⊙ I_out)  [terminal fallback]"
-    assert torch.allclose(nonrel["fc1"], _wbar_reference(M_fc1, p) @ (sig_fc1.pow(p) * I_fc2_nr),
-                          atol=1e-6), "non-rel fc1 = W̄·(sigma_x[fc2]^p ⊙ I_fc2)"
+        # non-relative (σ_pre/L2 norm), NO transfer
+        nonrel = mgr.propagation_importance(I_out=I_out, p=p, relative=False)
+        I_fc2_nr = _wbar_nonrel_reference(M_fc2, p) @ I_out
+        assert torch.allclose(nonrel["fc2"], I_fc2_nr, atol=1e-6)
+        assert torch.allclose(nonrel["fc1"], _wbar_nonrel_reference(M_fc1, p) @ I_fc2_nr, atol=1e-6)
 
-    # the two derivations must disagree (the Σ transfer changes the ranking)
-    assert not torch.allclose(rel["fc1"], nonrel["fc1"], atol=1e-4), \
-        "relative and non-relative should differ"
+    # p=2: relative ≡ non-relative (PDF identity)
+    rel2 = mgr.propagation_importance(I_out=I_out, p=2, relative=True)
+    nr2 = mgr.propagation_importance(I_out=I_out, p=2, relative=False)
+    assert torch.allclose(rel2["fc1"], nr2["fc1"], atol=1e-6), \
+        "p=2: variance propagation must equal the relative criterion"
+
+    # p=1: the two derivations differ (L1 vs L2 column norm)
+    rel1 = mgr.propagation_importance(I_out=I_out, p=1, relative=True)
+    nr1 = mgr.propagation_importance(I_out=I_out, p=1, relative=False)
+    assert not torch.allclose(rel1["fc1"], nr1["fc1"], atol=1e-4), \
+        "p=1: relative (L1) and non-relative (L2) should differ"
 
 
 def test_propagation_uniform_default_seed():

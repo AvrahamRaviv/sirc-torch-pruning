@@ -66,18 +66,27 @@ So step 3 is a thin penalty term, not a subsystem.
 **Step 4 (criterion).** The established score is the **per-layer** magnitude
 `‖ṽ‖ = ‖σW‖ = √NCI` (degenerate one-layer case). The new contribution is the **propagated**
 score — the recursive `Iˡ = W̄ˡ … W̄ᴸ Iᵒ` with the output seed `Iᵒ` handled explicitly.
-**BOTH toggles share the column-stochastic `W̄ = Mᵖ·D` (`D = 1/Σ_i Mᵖ`).** They differ ONLY by
-the per-hop **inter-layer transfer** `Σˡ⁺¹` (= post-activation output std`ᵖ`, the
-`Dˡ Σˡ⁺¹ = σˡ⁺¹/σˡ` measured activation gain of `normalized_nets_pruning.pdf` steps 7–8):
-**relative** DROPS it (within-layer / local metric) vs **non-relative** KEEPS it (cross-layer).
-`relative={True,False}`, `p∈{1,2}` (variance / std). The residual-join weighting `σᵖ/Σσᵖ` is a
-separate fan-in split (`build_propagation_topology`), distinct from the per-hop transfer.
+σ is folded into `M = σ·W = W'` **once**; there is **no separate per-hop σ transfer** — the
+PDF's interleaved `Σˡ⁺¹` is already absorbed into the next layer's `Mˡ⁺¹ = σ_inˡ⁺¹·W` (steps
+7–10). `relative` selects only the **column normalizer** `D`:
+- **relative** → `W̄ = Mᵖ / Σ_i Mᵖ` (column-stochastic, `ρ=1`) — within-layer / local.
+- **non-relative** → `W̄ = Mᵖ / σ_pre`ᵖ`, σ_pre = (Σ_i M²)^{1/2}` (std / L2 col-norm,
+  steps 7–8) — cross-layer in intent.
 
-*(Earlier drafts of this note stated non-relative `W̄ = Mᵖ` raw — that is WRONG; it drops both
-`D` and `Σ`, so the chain compounds the pre-activation variance `σˡ_j` it should divide out.
-Corrected to the PDF form. Empirically the non-relative chain still blows up on deep nets — its
-operator `T = diag(σ_post²)·W̄` has spectral radius ≠ 1 — so only `√NCI` (one hop) and the
-column-stochastic relative score (`ρ=1`) are bounded; cross-layer ranking uses `√NCI`.)*
+**For `p=2` the two normalizers COINCIDE** (`Σ_i M² = (Σ_i M²)^{2/2}`): the PDF states
+"variance propagation yields the same relative importance criterion for p=2." They differ only
+at `p=1`. The residual-join weighting `σᵖ/Σσᵖ` is a separate fan-in split
+(`build_propagation_topology`), orthogonal to `D`.
+
+*(Errata: earlier drafts stated non-relative `W̄ = Mᵖ` raw, then a column-stochastic
+`W̄ × σ_post`ᵖ`** transfer — **both WRONG**. The `σ_post` transfer **double-counts** σ: since
+`σ_post`ˡ` = σ_inˡ⁺¹` is already inside `Mˡ⁺¹`, re-multiplying applies σ twice per hop (an extra
+`σ²` per layer that compounds with depth). The PDF form has σ once and **no transfer**; the
+rel/nonrel split is the `D` norm (L1 vs L2). No-free-lunch: column-stochastic (rel, `p=2`) is
+bounded but conserves mass → every layer sums to the same total → cross-layer ranking is only
+`1/width`, i.e. local; non-stochastic (`p=1`) lets totals differ but `ρ≠1` → per-layer scale
+grows `ρ^depth` → a global sort degenerates to ranking-by-depth. Neither propagated form is a
+bounded global criterion — the bounded global score is `√NCI` (one hop, no iteration).)*
 
 ---
 
@@ -176,19 +185,22 @@ Same file, `propagation_importance` (sequential walk) + `_propagate_dag` (residu
 layer build `M[in,out] = |σ_i · reduce_kernel(ṽ[out,in,·])|`, then recurse `I^l = W̄^l I^{l+1}`:
 
 ```python
-# per-layer transfer matrix M[in, out] = |σ_i · reduce(ṽ[out, in, ·])|
+# per-layer matrix M[in, out] = |σ_i · reduce(ṽ[out, in, ·])| = |W'|  (σ folded in ONCE)
 w = _contribution_weight(rp).detach()          # ṽ = σ·W  ([out,in] or [out,in,kH,kW])
 w_red = w.flatten(2).norm(p=2, dim=2) if w.dim()==4 else w   # collapse kernel → [out,in]
 M = w_red.t().abs()                            # [in, out]
 
-# recursion:  I^l = W̄^l · (Σ^{l+1} ⊙ I^{l+1}),   W̄ = M^p · D  (PDF steps 7-8)
+# recursion:  I^l = W̄^l · I^{l+1}   (PDF steps 7-10; NO separate σ transfer)
 Mp = M.pow(p)                                  # p=2 variance / p=1 std
-Wbar = Mp / Mp.sum(dim=0).clamp(min=eps)[None, :]   # · D: column-stochastic (BOTH forms)
-if not relative:                               # non-relative: re-inject the Σ^{l+1} transfer
-    I_next = sigma_post.pow(p) * I_next        # post-act output std^p (consumer input std)
-I_l = Wbar @ I_next                            # propagate one layer back → [in]
+if relative:                                   # column-stochastic (L1) → within-layer
+    denom = Mp.sum(dim=0).clamp(min=eps)
+else:                                          # σ_pre^p (L2 col-norm) → cross-layer (steps 7-8)
+    denom = M.pow(2).sum(dim=0).clamp(min=eps).pow(p / 2.0)
+Wbar = Mp / denom[None, :]
+I_l = Wbar @ I_next                            # propagate one layer back → [in]   (σ once)
 ```
 
-Seed: `I_next = I_out` (uniform `1/out` by default) at the last/terminal layer; residual
-joins sum downstream `I` weighted by `σᵖ/Σσᵖ` (`build_propagation_topology`). The walk runs
-in reverse layer order and returns `OrderedDict[name → I^l]` in forward order.
+For `p=2` the two `denom` branches are equal → relative ≡ non-relative. Seed: `I_next = I_out`
+(uniform `1/out` by default) at the last/terminal layer; residual joins sum downstream `I`
+weighted by `σᵖ/Σσᵖ` (`build_propagation_topology`). The walk runs in reverse layer order and
+returns `OrderedDict[name → I^l]` in forward order.

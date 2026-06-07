@@ -1198,29 +1198,39 @@ class MeanResidualManager(BaseReparamManager):
                                relative=True):
         """Per-input-channel global importance via reverse-walk recursion.
 
-        Implements the paper's propagation criterion (Recap §3 — the best one):
+        Implements the paper's propagation criterion (normalized_nets_pruning.pdf
+        steps 7-10):
 
-            I^l = W̄^l · I^{l+1},   W̄ = (M)^p · D,
-              M[i, j] = |σ_i · reduce_kernel(v[j, i, :])|       (in × out)
-              D = Diag(1 / Σ_i M[i, j]^p)  clamp ε               (column-normalize per j)
+            I^l = W̄^l · I^{l+1},   W̄ = M^p · D,
+              M[i, j] = |σ_i · reduce_kernel(v[j, i, :])| = |W'[i,j]|   (in × out)
             I^{L+1} = I_out (default uniform 1/out_dim on the last layer's outputs)
 
-        `relative` selects the two PDF derivations of the SAME recursion:
-          relative=True  (default) → W̄ = M^p · D  — each column normalized to sum 1
-              (mass-preserving / probability redistribution per layer). Output importance
-              is split among inputs by relative contribution; magnitude does NOT compound
-              through depth.
-          relative=False → W̄ = M^p  (the D column-normalizer dropped) — the raw
-              normalized-weight product. The non-relative `I` of the PDF; magnitudes
-              compound through depth (deep-layer contributions scale by ∏ column masses).
-        Both share M, the kernel reduction, the DAG fan-in, and the I_out seed; they
-        differ ONLY in the per-layer D.
+        σ is folded into M ONCE (M = σ·W = W'); there is NO separate per-hop σ transfer
+        — the PDF's interleaved Σ^{l+1} is already absorbed into the next layer's
+        M^{l+1} = σ_in^{l+1}·W. `relative` selects the column normalizer D:
 
-        The exponent `p` selects the paper's two relative-contribution flavors
-        (relative-contribution section): p=2 = variance `σ²w²/Σσ²w²` (DEFAULT,
-        VBP-consistent, matches the L2 per-layer score), p=1 = std `σw/Σσw`. Both
-        normalize each column to sum 1. (The paper notes `σw/√Σσw` "cannot" be used —
-        it does not sum to 1 — so only p∈{1,2} are offered.)
+          relative=True  (default) → D = 1/Σ_i M[i,j]^p  — each column sums to 1
+              (column-stochastic, mass-preserving). ρ=1 → magnitude does NOT compound
+              with depth; a WITHIN-LAYER / local metric (PDF p.3).
+          relative=False → D = 1/σ_pre,j^p = 1/(Σ_i M[i,j]^2)^{p/2}  — the std/L2
+              column norm (PDF steps 7-8 non-relative). NOT column-stochastic for p=1
+              → ρ≠1 → magnitude compounds with depth (cross-layer in intent, but the
+              scale explodes as ρ^depth; see the no-free-lunch note below).
+
+        IMPORTANT — for p=2 the two normalizers COINCIDE: Σ_i M^2 = (Σ_i M^2)^{2/2}, so
+        relative and non-relative are IDENTICAL (PDF: "variance propagation yields the
+        same relative importance criterion for p=2"). The forms differ only at p=1.
+
+        The exponent `p` selects variance (p=2, DEFAULT, VBP-consistent, = the L2
+        per-layer score) vs std (p=1).
+
+        No-free-lunch: column-stochastic (relative / p=2) is bounded but conserves mass,
+        so every layer sums to the same total → cross-layer ranking is only 1/width, not
+        contribution → local. Non-stochastic (non-relative / p=1) lets totals differ
+        (cross-layer reach) but ρ≠1 → the per-layer scale grows ρ^depth → a global sort
+        degenerates to ranking-by-depth. Neither propagated form is a bounded global
+        criterion; the bounded global score is per-layer ‖σ·v‖ = √NCI (one hop, no
+        iteration), exposed via mode="per_layer".
 
         Walks self._reparam_modules in reverse forward order (sequential nets). Returns
         OrderedDict[name → I^l tensor of length in_features^l], in forward order.
@@ -1273,20 +1283,16 @@ class MeanResidualManager(BaseReparamManager):
                 w_red = w                                          # [out, in]
             return w_red.t().abs()                                 # [in, out]
 
-        def _post_act_std(rp):
-            """FALLBACK transfer (terminal / channel-mismatch only): the layer's own
-            sigma_out_x. NOTE this is the PRE-activation std (= σ_pre = the D denominator);
-            the real PDF transfer Σ^{l+1} is the POST-activation std, taken from the immediate
-            on-path consumer's sigma_x in the caller. sigma_out_x is used ONLY when no aligned
-            downstream exists. In a fully normalized net every σ→1 so the transfer →1 and
-            non-relative collapses to relative (PDF: variance prop gives the same criterion
-            for p=2)."""
-            od = _out_dim(rp)
-            s = getattr(rp, "sigma_out_x", None)
-            if s is not None and s.numel() == od:
-                return s.detach()
-            dev = next(rp.parameters()).device
-            return torch.ones(od, device=dev, dtype=next(rp.parameters()).dtype)
+        def _Wbar(M):
+            """Column-normalized W̄ = M^p · D (no σ transfer — σ is already in M).
+            relative → D = 1/Σ_i M^p (column-stochastic). non-relative → D = 1/σ_pre^p
+            = 1/(Σ_i M^2)^{p/2} (std/L2 norm). Identical for p=2."""
+            Mp = M.pow(p)
+            if relative:
+                denom = Mp.sum(dim=0).clamp(min=eps)                       # L1 of M^p
+            else:
+                denom = M.pow(2).sum(dim=0).clamp(min=eps).pow(p / 2.0)    # σ_pre^p (L2)
+            return Mp / denom[None, :]
 
         layers = list(self._reparam_modules.items())  # forward order
         Ms = {name: _layer_M(rp) for name, rp in layers}
@@ -1294,7 +1300,7 @@ class MeanResidualManager(BaseReparamManager):
         # ---- DAG walk path (M3): topology provided ----
         if topology is not None:
             return self._propagate_dag(layers, Ms, topology, I_out, eps, p, relative,
-                                       post_act_std=_post_act_std)
+                                       wbar_fn=_Wbar)
 
         # ---- Sequential path (M2): no topology ----
         # Seed I_out at last layer's output
@@ -1310,17 +1316,6 @@ class MeanResidualManager(BaseReparamManager):
             if I_next.numel() != last_out_dim:
                 raise ValueError(f"I_out has {I_next.numel()} entries, "
                                  f"expected {last_out_dim} (last layer's out_dim)")
-
-        # Per-layer inter-layer transfer Σ^{l+1} = POST-activation std = the NEXT layer's
-        # input std sigma_x (a^l feeds straight into it). NOT the layer's own sigma_out_x
-        # (= PRE-activation = σ_pre = the D denominator → would cancel D → raw M^p). Fallback
-        # to post_act_std at the terminal / channel-mismatch boundary.
-        sigma_post = {}
-        for _i, (name, rp) in enumerate(layers):
-            od = _out_dim(rp)
-            nxt_sx = getattr(layers[_i + 1][1], "sigma_x", None) if _i + 1 < len(layers) else None
-            sigma_post[name] = (nxt_sx.detach() if (nxt_sx is not None and nxt_sx.numel() == od)
-                                else _post_act_std(rp))
 
         results = []  # reverse-collected, flipped at end
         for idx in range(len(layers) - 1, -1, -1):
@@ -1340,19 +1335,10 @@ class MeanResidualManager(BaseReparamManager):
                 # variance-consistent, independent of p).
                 I_l = M.norm(p=2, dim=1)  # [in]
             else:
-                # SCORE RECURSION I^l = W̄^l·I^{l+1} (normalized_nets_pruning.pdf steps 7-8).
-                # BOTH forms use the column-stochastic W̄ = M^p·D, D=1/col-sum = 1/σ^l_j^p
-                # (cancels the pre-activation output variance). They differ ONLY by the
-                # inter-layer transfer Σ^{l+1} = post-act output std^p: relative DROPS it
-                # (within-layer/local — PDF p3); non-relative KEEPS it (D^lΣ^{l+1}=f_j the
-                # measured activation gain → cross-layer). Raw M^p (no D) is incorrect: it
-                # compounds the σ^l_j it should divide out (∏ col-sum ≪1 → vanish).
-                Mp = M.pow(p)
-                col_sums = Mp.sum(dim=0).clamp(min=eps)        # = σ^l_j^p (pre-act output)
-                Wbar = Mp / col_sums[None, :]                  # · D: column-stochastic
-                if not relative:
-                    I_next = sigma_post[name].pow(p) * I_next  # · Σ^{l+1}: post-act transfer
-                I_l = Wbar @ I_next                            # propagate one layer back → [in]
+                # SCORE RECURSION I^l = W̄^l·I^{l+1} (normalized_nets_pruning.pdf steps 7-10).
+                # σ is already in M (=σ·W); no separate transfer. relative → column-stochastic
+                # D=1/Σ_iM^p; non-relative → D=1/σ_pre^p (L2). Identical for p=2.
+                I_l = _Wbar(M) @ I_next                        # propagate one layer back → [in]
 
             results.append((name, I_l))
             I_next = I_l  # chains to layer l-1 (whose out_dim should equal in_l = I_next.numel())
@@ -1360,7 +1346,7 @@ class MeanResidualManager(BaseReparamManager):
         return OrderedDict(reversed(results))
 
     def _propagate_dag(self, layers, Ms, topology, I_out, eps, p=2, relative=True,
-                       post_act_std=None):
+                       wbar_fn=None):
         """DAG reverse-walk using a downstream+weight topology (M3).
 
         For each layer L (visited in reverse forward order — assumes named_modules order
@@ -1368,8 +1354,8 @@ class MeanResidualManager(BaseReparamManager):
         and other standard architectures), gather:
             I_next = Σ_{(d, w) in topology[L]} w · I[d]
         with I[d] already computed. Terminal layers (empty downstream list) seed from I_out.
-        Then I[L] = W̄^L · I_next. `post_act_std(rp, consumer)` supplies the non-relative
-        inter-layer transfer Σ^{l+1} (= consumer input std).
+        Then I[L] = W̄^L · I_next, with W̄ built by `wbar_fn` (column-stochastic for
+        relative, σ_pre/L2 for non-relative; σ already folded into M, no transfer).
         """
         def _out_dim(rp):
             return rp.out_features if hasattr(rp, "out_features") else rp.out_channels
@@ -1422,25 +1408,6 @@ class MeanResidualManager(BaseReparamManager):
             order.extend(ready); done.update(ready)
             remaining = [n for n in remaining if n not in done]
 
-        # Non-relative inter-layer transfer Σ^{l+1} = POST-activation output std (PDF steps
-        # 3-4: f = σ_post/σ_pre, the activation std-gain). This is the IMMEDIATE on-path
-        # consumer's INPUT std sigma_x (a^l feeds straight into it), NOT the layer's own
-        # sigma_out_x — which is the PRE-activation (= σ_pre = the colsum/D denominator), so
-        # using it CANCELS D and collapses non-relative to the raw M^p product (the ~1e9
-        # compound). To dodge off-path residual readers, pick the consumer EARLIEST in
-        # forward order (the main path); fall back to post_act_std only when no channel-
-        # aligned downstream exists (terminal / reshape boundary).
-        sigma_post = {}
-        if not relative and post_act_std is not None:
-            fwd_idx = {nm: i for i, (nm, _) in enumerate(layers)}
-            sigma_x_of = {nm: getattr(rp, "sigma_x", None) for nm, rp in layers}
-            for name, rp in layers:
-                od = _out_dim(rp)
-                cands = [(fwd_idx[d], d) for d, _w in topology.get(name, [])
-                         if d in fwd_idx and fwd_idx[d] > fwd_idx[name]
-                         and sigma_x_of[d] is not None and sigma_x_of[d].numel() == od]
-                sigma_post[name] = (sigma_x_of[min(cands)[1]].detach() if cands
-                                    else post_act_std(rp))
         for name in order:
             rp = rp_by_name[name]
             M = Ms[name]
@@ -1469,19 +1436,11 @@ class MeanResidualManager(BaseReparamManager):
                     w_t = w if torch.is_tensor(w) else float(w)
                     I_next = I_next + w_t * I_d
 
-            # SCORE RECURSION I^l = W̄^l·I^{l+1} (normalized_nets_pruning.pdf steps 7-8). BOTH
-            # forms use column-stochastic W̄ = M^p·D, D=1/col-sum=1/σ^l_j^p (divides out the
-            # pre-act output variance). They differ ONLY by the inter-layer transfer Σ^{l+1} =
-            # post-act output std^p: relative DROPS it (within-layer/local); non-relative KEEPS
-            # it (D^lΣ^{l+1}=f_j the measured activation gain → cross-layer comparison, PDF p3).
-            # This is distinct from the residual-JOIN weights `w` above (σ^p/Σσ^p fan-in split):
-            # `w` mixes branches into I_next; Σ^{l+1} is THIS layer's per-channel output gain.
-            Mp = M.pow(p)
-            col_sums = Mp.sum(dim=0).clamp(min=eps)     # = σ^l_j^p (pre-act output)
-            Wbar = Mp / col_sums[None, :]               # · D: column-stochastic
-            if not relative:
-                I_next = sigma_post[name].pow(p) * I_next   # · Σ^{l+1}: post-act transfer
-            I_by_name[name] = Wbar @ I_next
+            # SCORE RECURSION I^l = W̄^l·I^{l+1} (normalized_nets_pruning.pdf steps 7-10).
+            # σ already in M (=σ·W); no separate transfer. relative → column-stochastic
+            # (D=1/Σ_iM^p); non-relative → D=1/σ_pre^p (L2). Identical for p=2. The residual
+            # fan-in weights `w` above (σ^p/Σσ^p branch split) are a separate, orthogonal mix.
+            I_by_name[name] = wbar_fn(M) @ I_next
 
         # Return in forward order
         return OrderedDict((name, I_by_name[name]) for name, _ in layers)
