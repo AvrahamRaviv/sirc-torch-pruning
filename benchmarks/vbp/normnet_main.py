@@ -466,7 +466,11 @@ def main(argv):
             model.to(device)
             log_info(f"fold_native_bn: reinserted {n_re} fresh BN at pruned widths (pre-FT)")
         if not args.no_bn_recalib:
+            log_info(f"recalibrating BN running stats ({args.calib_batches} batches)...")
             _recalibrate_bn(model, train_loader, device, max_batches=args.calib_batches)
+            log_info("BN recalibration done")
+        else:
+            log_info("BN recalibration SKIPPED (--no_bn_recalib)")
         pr_macs, pr_params = _count(model, ex)
         acc, _ = validate(model, val_loader, device, args.model_type)
         tgt = f"mac={args.mac_target_g}G" if args.mac_target_g > 0 else f"ratio={args.pruning_ratio}"
@@ -493,7 +497,9 @@ def main(argv):
             n_re = reinsert_bn(model, folded_bn_locations)
             model.to(device)
             if not args.no_bn_recalib:
+                log_info(f"recalibrating BN running stats ({args.calib_batches} batches)...")
                 _recalibrate_bn(model, train_loader, device, max_batches=args.calib_batches)
+                log_info("BN recalibration done")
             log_info(f"fold_native_bn: reinserted {n_re} fresh BN (no-prune path, pre-FT)")
 
     # -- 4. FINE-TUNE (plain post-prune / post-normalize recovery) ----------------------
