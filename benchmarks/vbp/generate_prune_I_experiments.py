@@ -69,18 +69,21 @@ INCLUDE_MAGNITUDE = os.environ.get("INCLUDE_MAGNITUDE", "0") != "0"
 # NCI with native BN-fold OFF — isolate whether BN-fold drives the depth-profile gap vs the
 # proven old tp_variance (which did NOT fold BN). Same as A0_nci otherwise (per_layer, mean
 # normalizer, interior_only). DEFAULT ON (the only arm emitted by a bare run).
-INCLUDE_NCI_FBN = os.environ.get("INCLUDE_NCI_FBN", "1") != "0"
+# ===================================================================================
+# WHICH ARMS TO EMIT — edit these True/False directly (env var still overrides if set).
+# Currently ON: tp_variance, nci_fbn_full, nci_fbn_bc, nci_fbn_bc_nobn.
+# ===================================================================================
+INCLUDE_NCI_FBN = os.environ.get("INCLUDE_NCI_FBN", "0") != "0"        # nci_fbn (already run)
 # tp_variance = the OLD vbp_imagenet_pat criterion (group-L2 both-sides × sqrt(conv-output
-# var), no fold, per-layer mean-1). ABLATION vs nci_fbn — same harness, fold OFF. Default off.
-INCLUDE_TP_VARIANCE = os.environ.get("INCLUDE_TP_VARIANCE", "0") != "0"
+# var), no fold, per-layer mean-1). ABLATION vs nci_fbn — same harness, fold OFF.
+INCLUDE_TP_VARIANCE = os.environ.get("INCLUDE_TP_VARIANCE", "1") != "0"
 # nci_fbn at FULL scope (no interior_only) — also prune the residual stream (conv3/downsample).
-# See how the dist looks when the wide dims are prunable. Default off.
-INCLUDE_NCI_FBN_FULL = os.environ.get("INCLUDE_NCI_FBN_FULL", "0") != "0"
-# nci_fbn + bias compensation (add W[:,c]·μ_c to consumer bias before removal). Default off.
-INCLUDE_NCI_FBN_BC = os.environ.get("INCLUDE_NCI_FBN_BC", "0") != "0"
+INCLUDE_NCI_FBN_FULL = os.environ.get("INCLUDE_NCI_FBN_FULL", "1") != "0"
+# nci_fbn + bias compensation (add W[:,c]·μ_c to consumer bias before removal).
+INCLUDE_NCI_FBN_BC = os.environ.get("INCLUDE_NCI_FBN_BC", "1") != "0"
 # nci_fbn + bias_comp + --no_bn_recalib — the CLEAN bias-comp test: with recalib on, BN
 # re-centers and absorbs the correction; off, the compensation actually stands in for it.
-INCLUDE_NCI_FBN_BC_NOBN = os.environ.get("INCLUDE_NCI_FBN_BC_NOBN", "0") != "0"
+INCLUDE_NCI_FBN_BC_NOBN = os.environ.get("INCLUDE_NCI_FBN_BC_NOBN", "1") != "0"
 
 # Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
