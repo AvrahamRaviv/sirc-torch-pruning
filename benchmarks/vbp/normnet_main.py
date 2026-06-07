@@ -381,7 +381,8 @@ def main(argv):
         # divergent masks/hang. Sync self.variance/means across ranks (all-reduce mean) so every
         # rank ranks identically. imp_normalizer=mean → norm_per_layer=True (the old setting).
         var_imp = None
-        if args.scorer == "tp_variance":
+        var_stats_by_name = None              # tp_variance: {name: (variance, means)} — rebind
+        if args.scorer == "tp_variance":      # per _imp call so it survives _ratio_for_mac's copies
             var_imp = tp.importance.VarianceImportance(
                 norm_per_layer=(args.imp_normalizer == "mean"), importance_mode="tp_variance")
             var_imp.collect_statistics(model, calib_loader, device, max_batches=args.calib_batches)
@@ -392,6 +393,11 @@ def main(argv):
                         t = d[k].detach().to(device).contiguous()   # NCCL needs CUDA tensors
                         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
                         d[k] = (t / ws).to(d[k].device)
+            # Re-key stats by module NAME (stable across deepcopy; module objects are not).
+            var_stats_by_name = {}
+            for nm, m in model.named_modules():
+                if m in var_imp.variance:
+                    var_stats_by_name[nm] = (var_imp.variance[m], var_imp.means.get(m))
             log_info(f"tp_variance: collected activation stats on {len(var_imp.variance)} layers "
                      f"({args.calib_batches} calib batches), norm_per_layer={var_imp.norm_per_layer}")
 
@@ -432,7 +438,18 @@ def main(argv):
             if args.scorer == "bn_scale":
                 return tp.importance.BNScaleImportance(normalizer=norm)
             if args.scorer == "tp_variance":
-                return var_imp                      # prebuilt + stats-collected (old criterion)
+                # Rebind the collected stats onto THIS model's modules (mdl may be a
+                # _ratio_for_mac deepcopy → different module objects, same names). Without this
+                # the lookup misses → uniform ones → degenerate global threshold → ratio≈0.
+                vi = tp.importance.VarianceImportance(
+                    norm_per_layer=var_imp.norm_per_layer, importance_mode="tp_variance")
+                for nm, m in mdl.named_modules():
+                    if nm in var_stats_by_name:
+                        var, mean = var_stats_by_name[nm]
+                        vi.variance[m] = var
+                        if mean is not None:
+                            vi.means[m] = mean
+                return vi
             return NormalizedNetImportance(mdl, scores, group_reduction="mean", normalizer=norm)
 
         def _ignored(mdl):
