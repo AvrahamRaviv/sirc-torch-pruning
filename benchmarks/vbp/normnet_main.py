@@ -155,6 +155,75 @@ def _layer_widths(model):
     return w
 
 
+@torch.no_grad()
+def compute_nci_cov_scores(model, loader, device, max_batches=50):
+    """Covariance-aware NCI per input channel of every Conv2d/Linear consumer.
+
+    Channel-removal cost = drop-one change in the consumer's total output variance:
+        ΔVar(c) = 2 Σ_k M_ck Σ_ck − M_cc Σ_cc
+    M = input-channel weight Gram (⟨W[:,c], W[:,k]⟩ over out + kernel), Σ = input-channel
+    covariance on calib data. Independent NCI = M_cc Σ_cc (only the diagonal of Σ). For conv,
+    M uses the kernel-aligned Frobenius inner product (channel-stationary approx); Σ pools batch
+    and space. Returns {consumer_name: per-input-channel score} for NormalizedNetImportance —
+    these score the consumer's INPUTS = the producer's pruned OUTPUT channels.
+    """
+    targets = {n: m for n, m in model.named_modules()
+               if isinstance(m, (torch.nn.Conv2d, torch.nn.Linear)) and
+               (m.in_channels if isinstance(m, torch.nn.Conv2d) else m.in_features) > 1}
+    acc = {n: None for n in targets}          # [sum_AtA (C×C), sum_A (C), count]
+    name_of = {m: n for n, m in targets.items()}
+
+    def hook(mod, inp):
+        x = inp[0].detach()
+        if x.dim() == 4:                      # conv (N,C,H,W) → (N*H*W, C)
+            a = x.permute(0, 2, 3, 1).reshape(-1, x.shape[1])
+        else:                                 # linear (N,...,C) → (-1, C)
+            a = x.reshape(-1, x.shape[-1])
+        a = a.float()
+        n = name_of[mod]
+        AtA = a.t() @ a
+        As = a.sum(0)
+        cnt = a.shape[0]
+        if acc[n] is None:
+            acc[n] = [AtA, As, cnt]
+        else:
+            acc[n][0] += AtA; acc[n][1] += As; acc[n][2] += cnt
+
+    handles = [m.register_forward_pre_hook(hook) for m in targets.values()]
+    model.eval()
+    for bi, batch in enumerate(loader):
+        if bi >= max_batches:
+            break
+        x = batch[0] if isinstance(batch, (list, tuple)) else batch
+        model(x.to(device))
+    for h in handles:
+        h.remove()
+
+    ddp = torch.distributed.is_available() and torch.distributed.is_initialized()
+    scores = {}
+    for n, m in targets.items():
+        if acc[n] is None:
+            continue
+        AtA, As, cnt = acc[n]
+        if ddp:                               # sync raw moments across ranks (CUDA tensors)
+            cnt_t = torch.tensor([float(cnt)], device=AtA.device)
+            torch.distributed.all_reduce(AtA, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(As, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(cnt_t, op=torch.distributed.ReduceOp.SUM)
+            cnt = float(cnt_t.item())
+        mean = As / cnt
+        cov = AtA / cnt - torch.outer(mean, mean)          # (C,C) input-channel covariance
+        W = m.weight.data
+        if W.dim() == 4:                                   # (out,in,kh,kw) → Gram over (out,kh,kw)
+            Wr = W.permute(1, 0, 2, 3).reshape(W.shape[1], -1)
+        else:
+            Wr = W.t()                                     # (in,out)
+        M = (Wr @ Wr.t()).to(cov.dtype)                    # (C,C) weight Gram over input channels
+        nci_cov = 2.0 * (M * cov).sum(1) - torch.diag(M) * torch.diag(cov)
+        scores[n] = nci_cov.clamp_min(0).detach().cpu()
+    return scores
+
+
 def log_prune_distribution(pre, post):
     """Log per-layer kept/removed channels + the global summary (ported from prune_e2).
     Returns (per_layer dict {name: {pre, post, kept_pct}}, global_kept_pct) for the
@@ -361,6 +430,8 @@ def main(argv):
                      f"({100.0 * n0 / max(ntot, 1):.1f}%), median per-layer CV={cv_med:.3f}")
             if is_main():
                 log_score_distribution(scores, args)
+        elif args.scorer == "nci_cov":
+            log_info("nci_cov: covariance-aware NCI — scores computed post-merge on plain model")
         else:
             log_info(f"classical scorer ({args.scorer}) — stock tp importance, no normnet scores")
 
@@ -400,6 +471,17 @@ def main(argv):
                     var_stats_by_name[nm] = (var_imp.variance[m], var_imp.means.get(m))
             log_info(f"tp_variance: collected activation stats on {len(var_imp.variance)} layers "
                      f"({args.calib_batches} calib batches), norm_per_layer={var_imp.norm_per_layer}")
+
+        # nci_cov: covariance-aware NCI. Hook every Conv2d/Linear, accumulate channel covariance
+        # of its INPUT activations on calib data, combine with the weight Gram → per-input-channel
+        # drop-one output-variance change. Keyed by consumer name; fed through NormalizedNetImportance
+        # (the per_layer/propagation path) so the global threshold + normalizer apply uniformly.
+        if args.scorer == "nci_cov":
+            scores = compute_nci_cov_scores(model, calib_loader, device, args.calib_batches)
+            n0 = sum(int((s < 0.1 * s.mean()).sum()) for s in scores.values() if s.numel())
+            ntot = sum(s.numel() for s in scores.values())
+            log_info(f"nci_cov: scored {len(scores)} layers, {ntot} channels "
+                     f"({args.calib_batches} calib batches)")
 
         # Bias compensation: removing input channel c shifts each consumer's output by
         # E[Δy]=W[:,c]·μ_c. Adding that to the consumer bias BEFORE pruning preserves the
@@ -583,11 +665,15 @@ def parse_args(argv):
     # 3. prune
     p.add_argument("--no_prune", action="store_true")
     p.add_argument("--scorer", default="per_layer",
-                   choices=["per_layer", "propagation", "magnitude", "bn_scale", "tp_variance"],
+                   choices=["per_layer", "propagation", "magnitude", "bn_scale", "tp_variance",
+                            "nci_cov"],
                    help="normnet: per_layer (‖σv‖=√NCI) / propagation (I). classical baselines "
                         "(same harness, no normnet scores): magnitude (group L2) / bn_scale "
                         "(network-slimming BN γ) / tp_variance (OLD vbp_imagenet_pat criterion: "
-                        "group-L2(both sides) × sqrt(conv-output activation var); ABLATION vs nci).")
+                        "group-L2(both sides) × sqrt(conv-output activation var); ABLATION vs nci). "
+                        "nci_cov: COVARIANCE-aware NCI — drop-one output-variance change "
+                        "2Σ_k M_ck Σ_ck − M_cc Σ_cc (M=weight Gram, Σ=channel cov); NCI is its "
+                        "independence approximation (off-diagonal Σ dropped).")
     p.add_argument("--prop_non_relative", action="store_true",
                    help="propagation: non-relative criterion W̄=M^p (raw product, no column-norm "
                         "→ cross-layer, compounds). Default = relative W̄=M^p·D (within-layer).")

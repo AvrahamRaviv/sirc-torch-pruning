@@ -91,6 +91,11 @@ INCLUDE_NCI_FBN_BC_NONORM = os.environ.get("INCLUDE_NCI_FBN_BC_NONORM", "1") != 
 # erases the σ_out^p cross-layer transfer → nonrel collapses toward rel (per-layer rank
 # identical). Tests whether nonrel's depth-compound matters once the scale is normalized away.
 INCLUDE_NONREL_NORM = os.environ.get("INCLUDE_NONREL_NORM", "1") != "0"
+# nci_cov = COVARIANCE-aware NCI (--scorer nci_cov). Drop-one output-variance change
+# 2Σ_k M_ck Σ_ck − M_cc Σ_cc accounts for the off-diagonal channel covariance the plain NCI
+# (independence) drops — boss's check showed 53-89% of Var(Z) lives there. Same recipe as the
+# winner nci_fbn (interior, fold off, mean norm) so it's a clean ablation of the cov term.
+INCLUDE_NCI_COV = os.environ.get("INCLUDE_NCI_COV", "1") != "0"
 
 # Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
@@ -221,6 +226,11 @@ def main():
     if INCLUDE_NONREL_NORM:
         made.append(_write("A0_nonrel_norm", DENSE_8086, A0_EXTRA,
                            " --prop_non_relative --imp_normalizer mean"))
+    # A0 nci_cov — covariance-aware NCI, same recipe as the winning nci_fbn (interior, fold off,
+    # mean norm). Ablation: does the off-diagonal covariance term beat plain (independent) NCI?
+    if INCLUDE_NCI_COV:
+        made.append(_write("A0_nci_cov", DENSE_8086, A0_EXTRA,
+                           " --scorer nci_cov --imp_normalizer mean", shared=SHARED_NOFOLD))
     # CLASSICAL baselines (same harness: 80.86, mac 2G global, KD, no sparse phase). The
     # --scorer override (last-wins over SHARED's propagation) swaps the criterion. These are
     # the controls that should recover — magnitude/bn_scale lack the propagation gutting.
