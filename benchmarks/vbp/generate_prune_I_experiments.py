@@ -61,7 +61,7 @@ INCLUDE_NONREL = os.environ.get("INCLUDE_NONREL", "0") != "0"
 INCLUDE_A = os.environ.get("INCLUDE_A", "0") != "0"   # Option A (λ-reg sparse phase) prop arms
 INCLUDE_A0 = os.environ.get("INCLUDE_A0", "0") != "0"
 # NCI = the bounded cross-layer one-hop scorer (‖σv‖=√NCI = --scorer per_layer): σ folded
-# once, NO propagation, NO depth compound. The honest cross-layer baseline vs prop rel/nonrel.
+# once, NO propagation, NO depth compound. The unbiased cross-layer baseline vs prop rel/nonrel.
 INCLUDE_NCI = os.environ.get("INCLUDE_NCI", "0") != "0"
 # Magnitude = the classical GroupMagnitudeImportance (L2) baseline, same harness (--scorer
 # magnitude). The known-good control NCI/prop must beat.

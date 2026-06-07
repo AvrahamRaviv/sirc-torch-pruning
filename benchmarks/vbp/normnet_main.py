@@ -398,7 +398,7 @@ def main(argv):
         # not 50% — channel-ratio ≠ MAC-ratio. Binary-search the global ratio whose
         # pruned MACs ≤ target_g, then prune the real model at it. Deterministic across
         # ranks (scores already broadcast), so DDP masks stay identical.
-        # per-layer floor: cap how much ANY layer may be pruned so global ranking can't gut a
+        # per-layer floor: cap how much ANY layer may be pruned so global ranking can't empty a
         # cheap-but-critical layer (e.g. the 64-ch stem → ~0 MAC saving, huge acc cost). 1.0=off.
         mpr = args.max_prune_ratio if args.max_prune_ratio > 0 else 1.0
         ratio = args.pruning_ratio

@@ -215,7 +215,7 @@ def fold_bn(model, example_inputs):
     BN is a real per-channel operator (γ/σ_run scale) in the forward chain. If it's NOT
     folded, the score either ignores it (raw-W magnitude) or smuggles it in via the
     calibrated activation σ — entangling weight scale with activation scale. Folding bakes
-    γ/σ_run into the weight so M is honest and the propagation chain is pure Conv/Linear.
+    γ/σ_run into the weight so M is exact and the propagation chain is pure Conv/Linear.
 
     Adjacency is found by TRACING (data_ptr match), not by walking nn.Sequential — so it
     also catches ResNet bottleneck BNs (conv1->bn1 ... are block attributes, NOT in a
@@ -596,7 +596,7 @@ def main():
     example_inputs = torch.randn(1, 3, 224, 224, device=device)
 
     # fold native BN into the preceding Conv/Linear BEFORE scoring: bakes γ/σ_run into the
-    # weight so M is honest and the chain is pure Conv/Linear (fold BN back).
+    # weight so M is exact and the chain is pure Conv/Linear (fold BN back).
     # Function-preserving -> logits must be unchanged.
     model.eval()
     ref = model(example_inputs).detach().clone()

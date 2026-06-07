@@ -46,7 +46,7 @@ def _classifier_seed(mgr, topology, classifier, p):
     uniform-over-features vector. The PDF chain runs to the NETWORK output (the classifier),
     seeded uniform over CLASSES; the terminal feature layer's importance is that uniform
     class-importance propagated back through the classifier. Seeding uniform-over-features
-    instead ties every final-stage channel uniformly, so global pruning guts that stage.
+    instead ties every final-stage channel uniformly, so global pruning empties that stage.
 
     M^fc[feature, class] = σ_feature · |W_fc[class, feature]|, with σ_feature = the terminal
     layer's per-output-channel std (sigma_out_x). Returns {terminal_name → seed[feat]} or
@@ -103,7 +103,7 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
             topo = mgr.build_propagation_topology(example_inputs, p=p)
         # PDF seed: I^o propagated back through the classifier (W̄^fc · 𝟙_classes), so the
         # final-stage features get REAL importance. Without it the terminal seeds uniform →
-        # ties → global pruning guts the last stage. None → uniform fallback.
+        # ties → global pruning empties the last stage. None → uniform fallback.
         seed = I_out
         if seed is None and classifier is not None and topo is not None:
             seed = _classifier_seed(mgr, topo, classifier, p)
