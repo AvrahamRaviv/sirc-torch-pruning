@@ -87,6 +87,10 @@ INCLUDE_NCI_FBN_BC_NOBN = os.environ.get("INCLUDE_NCI_FBN_BC_NOBN", "1") != "0"
 # nci_fbn + bias_comp but NO per-layer norm (--imp_normalizer none) — raw ‖σv‖ keeps the
 # cross-layer/kernel-size scale (3x3 vs 1x1) instead of mean-1 per layer.
 INCLUDE_NCI_FBN_BC_NONORM = os.environ.get("INCLUDE_NCI_FBN_BC_NONORM", "1") != "0"
+# nonrel propagation WITH per-layer norm (--prop_non_relative --imp_normalizer mean). mean-1
+# erases the σ_out^p cross-layer transfer → nonrel collapses toward rel (per-layer rank
+# identical). Tests whether nonrel's depth-compound matters once the scale is normalized away.
+INCLUDE_NONREL_NORM = os.environ.get("INCLUDE_NONREL_NORM", "1") != "0"
 
 # Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
@@ -212,6 +216,11 @@ def main():
         made.append(_write("A0_nci_fbn_bc_nonorm", DENSE_8086, A0_EXTRA,
                            " --scorer per_layer --imp_normalizer none --bias_comp",
                            shared=SHARED_NOFOLD))
+    # A0 nonrel + per-layer norm — propagation, non-relative, mean-1 (--imp_normalizer mean).
+    # Default SHARED (fold ON) like the other prop arms. mean kills the σ_out^p transfer → nonrel≈rel.
+    if INCLUDE_NONREL_NORM:
+        made.append(_write("A0_nonrel_norm", DENSE_8086, A0_EXTRA,
+                           " --prop_non_relative --imp_normalizer mean"))
     # CLASSICAL baselines (same harness: 80.86, mac 2G global, KD, no sparse phase). The
     # --scorer override (last-wins over SHARED's propagation) swaps the criterion. These are
     # the controls that should recover — magnitude/bn_scale lack the propagation gutting.
