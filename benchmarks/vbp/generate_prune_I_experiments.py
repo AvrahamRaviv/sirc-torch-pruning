@@ -57,14 +57,19 @@ A_MU_EMA = os.environ.get("A_MU_EMA", "0.1")                  # σ/μ EMA moment
 # Which arms to emit. Default: Option A relative only (the viable global criterion). nonrel is
 # parked (raw M^p compounds ~1e9 by depth → global sort ≈ by depth, not contribution). A0 (cold,
 # no reg) already characterized. Flip these on to regenerate them.
-INCLUDE_NONREL = os.environ.get("INCLUDE_NONREL", "1") != "0"
-INCLUDE_A0 = os.environ.get("INCLUDE_A0", "1") != "0"
+INCLUDE_NONREL = os.environ.get("INCLUDE_NONREL", "0") != "0"
+INCLUDE_A = os.environ.get("INCLUDE_A", "0") != "0"   # Option A (λ-reg sparse phase) prop arms
+INCLUDE_A0 = os.environ.get("INCLUDE_A0", "0") != "0"
 # NCI = the bounded cross-layer one-hop scorer (‖σv‖=√NCI = --scorer per_layer): σ folded
 # once, NO propagation, NO depth compound. The honest cross-layer baseline vs prop rel/nonrel.
-INCLUDE_NCI = os.environ.get("INCLUDE_NCI", "1") != "0"
+INCLUDE_NCI = os.environ.get("INCLUDE_NCI", "0") != "0"
 # Magnitude = the classical GroupMagnitudeImportance (L2) baseline, same harness (--scorer
 # magnitude). The known-good control NCI/prop must beat.
-INCLUDE_MAGNITUDE = os.environ.get("INCLUDE_MAGNITUDE", "1") != "0"
+INCLUDE_MAGNITUDE = os.environ.get("INCLUDE_MAGNITUDE", "0") != "0"
+# NCI with native BN-fold OFF — isolate whether BN-fold drives the depth-profile gap vs the
+# proven old tp_variance (which did NOT fold BN). Same as A0_nci otherwise (per_layer, mean
+# normalizer, interior_only). DEFAULT ON (the only arm emitted by a bare run).
+INCLUDE_NCI_FBN = os.environ.get("INCLUDE_NCI_FBN", "1") != "0"
 
 # Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
@@ -93,15 +98,17 @@ FOLD_BN = os.environ.get("FOLD_NATIVE_BN", "1") != "0"
 # interior_only=True, 32 groups). Full scope (INTERIOR_ONLY=0) also cuts the wide residual dims
 # → ~10M params @ 2G MAC, pre-FT acc ~0 (residual surgery).
 INTERIOR_ONLY = os.environ.get("INTERIOR_ONLY", "1") != "0"
-SHARED = (
+# SHARED_NOFOLD = everything except the BN-fold flag; SHARED adds it (when FOLD_BN). The fbn
+# arm uses SHARED_NOFOLD to force fold OFF regardless of the global FOLD_BN toggle.
+SHARED_NOFOLD = (
     f"--model_type cnn --cnn_arch resnet50 --data_path {DATA} --reparam_variant mean "
     f"--scorer propagation --global_pruning --mac_target_g {MAC_TARGET_G} --max_prune_ratio 0.8 "
     f"--calib_batches 50 "
     f"--epochs_ft {FT} --lr_ft 2e-2 --wd 1e-4 --momentum 0.9 --use_kd --kd_alpha 0.5 "
     f"--kd_T 2.0 --train_batch_size 128 --val_resize 232"
-    + (" --fold_native_bn" if FOLD_BN else "")
     + (" --interior_only" if INTERIOR_ONLY else "")
 )
+SHARED = SHARED_NOFOLD + (" --fold_native_bn" if FOLD_BN else "")
 # Option B: load vnr, no reg recompute (already 30-ep trained).
 B_EXTRA = "--epochs_train 0 --epochs_norm_ft 0"
 # Option A (THE thesis test): dense 80.86 → λ-reg norm-ft (push low-contribution ‖ṽ‖→0 so the
@@ -117,11 +124,11 @@ A0_EXTRA = "--epochs_train 0 --epochs_norm_ft 0"
 REL_VARIANTS = [("rel", "")] + ([("nonrel", " --prop_non_relative")] if INCLUDE_NONREL else [])
 
 
-def _write(tag, ckpt, extra, rflag):
+def _write(tag, ckpt, extra, rflag, shared=SHARED):
     out_dir = os.path.join(BASE_OUT, tag)
     os.makedirs(out_dir, exist_ok=True)
     line = (f"python3 -m torch.distributed.launch --nproc_per_node={NPROC} {NORMNET} "
-            f"{SHARED} {extra}{rflag} --checkpoint {ckpt} "
+            f"{shared} {extra}{rflag} --checkpoint {ckpt} "
             f"--save_tag {tag} --save_dir {out_dir}")
     sh_path = os.path.join(out_dir, "run_ddp.sh")
     with open(sh_path, "w") as f:
@@ -140,8 +147,9 @@ def main():
             for rname, rflag in REL_VARIANTS:
                 made.append(_write(f"B_prop_{rname}_{lam}", ckpt, B_EXTRA, rflag))
     # OPTION A — propagation from the dense 80.86, WITH λ-reg sparse phase (THE thesis test).
-    for rname, rflag in REL_VARIANTS:
-        made.append(_write(f"A_prop_{rname}", DENSE_8086, A_EXTRA, rflag))
+    if INCLUDE_A:
+        for rname, rflag in REL_VARIANTS:
+            made.append(_write(f"A_prop_{rname}", DENSE_8086, A_EXTRA, rflag))
     # OPTION A0 — same, NO sparse phase (cold). Off by default (already characterized).
     if INCLUDE_A0:
         for rname, rflag in REL_VARIANTS:
@@ -158,6 +166,11 @@ def main():
     # mean normalizer = tp DepGraph default (original config the user asked for).
     if INCLUDE_MAGNITUDE:
         made.append(_write("A0_magnitude", DENSE_8086, A0_EXTRA, " --scorer magnitude --imp_normalizer mean"))
+    # A0 NCI, BN-fold OFF — same as A0_nci but SHARED_NOFOLD (no --fold_native_bn). Isolates
+    # whether folding native BN into the score drives the depth-profile gap vs old tp_variance.
+    if INCLUDE_NCI_FBN:
+        made.append(_write("A0_nci_fbn", DENSE_8086, A0_EXTRA,
+                           " --scorer per_layer --imp_normalizer mean", shared=SHARED_NOFOLD))
     # CLASSICAL baselines (same harness: 80.86, mac 2G global, KD, no sparse phase). The
     # --scorer override (last-wins over SHARED's propagation) swaps the criterion. These are
     # the controls that should recover — magnitude/bn_scale lack the propagation gutting.
