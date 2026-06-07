@@ -1054,7 +1054,7 @@ class MeanResidualManager(BaseReparamManager):
                 loss = loss + norms.sum()
         return self.lambda_reg * loss
 
-    def build_propagation_topology(self, example_inputs, p=2):
+    def build_propagation_topology(self, example_inputs, p=2, use_measured_sigma_c=False):
         """Build the per-layer downstream + branch-weight topology via tp.DependencyGraph.
 
         Returns OrderedDict[name → list of (downstream_name, weight)]:
@@ -1120,15 +1120,19 @@ class MeanResidualManager(BaseReparamManager):
             plain_by_name = {n: _get_by_dotted(self.model, n) for n in saved.keys()}
             name_by_module = {plain_by_name[n]: n for n in saved.keys()}
 
-            return self._build_topology_from_dg(DG, name_by_module, saved, p=p)
+            return self._build_topology_from_dg(DG, name_by_module, saved, p=p,
+                                                use_measured_sigma_c=use_measured_sigma_c)
         finally:
             # Swap reparam'd modules back regardless of outcome.
             for name, original_rp in saved.items():
                 self._replace_module(name, original_rp)
 
-    def _build_topology_from_dg(self, DG, name_by_module, saved, p=2):
+    def _build_topology_from_dg(self, DG, name_by_module, saved, p=2,
+                                use_measured_sigma_c=False):
         """Walk the DepGraph forward to assemble the (downstream_name, weight) topology.
-        Branch weights at residual ADDs come from σ_out^p (mean per branch)."""
+        Branch weights at residual ADDs come from σ_out^p (mean per branch). When
+        use_measured_sigma_c, the join denominator is the measured post-add σ_c (PDF skip
+        factor) instead of the independence sum Σσ_branch^p."""
 
         def _walk_downstream(node, visited):
             """Forward BFS from node.outputs; collect reparam'd modules reached."""
@@ -1178,7 +1182,15 @@ class MeanResidualManager(BaseReparamManager):
             else:
                 sig_p = {b: self._reparam_modules[b].sigma_out_x.detach().pow(p)
                          for b in unique_branches}
-                total = sum(sig_p.values()) + 1e-8
+                # Denominator = node variance at the merged sum C = Σ branches. Default uses
+                # Σσ_branch^p, which ASSUMES Var(C)=ΣVar(branch) (independence). With
+                # use_measured_sigma_c, use the MEASURED post-add std σ_c (= the merged
+                # consumer's calibrated input std sigma_x, per merged channel) instead — the
+                # PDF's σ_c^p/(σ_a^p+σ_b^p) correction, which restores the dropped 2·Cov term.
+                if use_measured_sigma_c:
+                    total = self._reparam_modules[dst].sigma_x.detach().pow(p) + 1e-8
+                else:
+                    total = sum(sig_p.values()) + 1e-8
                 for b in unique_branches:
                     weights[(b, dst)] = sig_p[b] / total      # per-channel tensor
 

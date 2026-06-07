@@ -96,6 +96,15 @@ INCLUDE_NONREL_NORM = os.environ.get("INCLUDE_NONREL_NORM", "1") != "0"
 # (independence) drops — boss's check showed 53-89% of Var(Z) lives there. Same recipe as the
 # winner nci_fbn (interior, fold off, mean norm) so it's a clean ablation of the cov term.
 INCLUDE_NCI_COV = os.environ.get("INCLUDE_NCI_COV", "1") != "0"
+# nci_cov at FULL scope (residual stream prunable). nci_cov hooks each consumer's INPUT = the
+# post-add tensor, so its measured covariance ALREADY carries σ_c and the cross-branch term →
+# this is the EMPIRICAL "cov + σ_c (both)" cell. (Interior nci_cov never crosses a join, so the
+# σ_c correction only shows up at full scope.)
+INCLUDE_NCI_COV_FULL = os.environ.get("INCLUDE_NCI_COV_FULL", "1") != "0"
+# prop + σ_c = propagation criterion with the PDF skip factor (--skip_sigma_c): residual-join
+# denominator = MEASURED post-add σ_c instead of the independence sum Σσ_branch^p. The "no cov,
+# yes σ_c" cell (σ_c lives in propagation; cov lives in the one-hop nci_cov — different criteria).
+INCLUDE_PROP_SIGMAC = os.environ.get("INCLUDE_PROP_SIGMAC", "1") != "0"
 
 # Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
@@ -231,6 +240,15 @@ def main():
     if INCLUDE_NCI_COV:
         made.append(_write("A0_nci_cov", DENSE_8086, A0_EXTRA,
                            " --scorer nci_cov --imp_normalizer mean", shared=SHARED_NOFOLD))
+    # A0 nci_cov FULL scope — empirical "both" (cov + σ_c): hooking the post-add consumer input
+    # measures real Var(C) incl. cross-branch covariance. SHARED_BASE = no interior_only.
+    if INCLUDE_NCI_COV_FULL:
+        made.append(_write("A0_nci_cov_full", DENSE_8086, A0_EXTRA,
+                           " --scorer nci_cov --imp_normalizer mean", shared=SHARED_BASE))
+    # A0 prop + σ_c — propagation rel with the PDF measured-σ_c skip factor. "no cov, yes σ_c".
+    if INCLUDE_PROP_SIGMAC:
+        made.append(_write("A0_prop_sigmac", DENSE_8086, A0_EXTRA,
+                           " --skip_sigma_c --imp_normalizer mean", shared=SHARED_NOFOLD))
     # CLASSICAL baselines (same harness: 80.86, mac 2G global, KD, no sparse phase). The
     # --scorer override (last-wins over SHARED's propagation) swaps the criterion. These are
     # the controls that should recover — magnitude/bn_scale lack the propagation gutting.

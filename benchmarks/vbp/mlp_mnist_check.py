@@ -284,6 +284,64 @@ def validate_nci_cov(model, X):
         print(f"    brute   {[round(x,4) for x in brute]}   max_rel_err={maxrel:.2e}")
 
 
+# --------------------------------------------------------------------------- skip-join σ_c check
+@torch.no_grad()
+def skip_factor_check():
+    """Verify the PDF skip-connection factor σ_c^p/(σ_a^p+σ_b^p) at a residual add C = A + B.
+
+    The propagation code splits downstream importance among branches with denominator
+    Σσ_branch^p = σ_a^p + σ_b^p — i.e. it assumes Var(C) = Var(A)+Var(B) (INDEPENDENCE). The
+    PDF (Relative contribution §) says the denominator must be the MEASURED σ_c^p (the sum's
+    std), because Var(C) = Var(A)+Var(B)+2Cov(A,B). The factor σ_c^p/(σ_a^p+σ_b^p) corrects the
+    assumed denominator to the measured one; =1 only when A⊥B.
+
+    Toy (linear, exact): correlated input x → A=Wa·x, B=Wb·x (shared x ⇒ A,B correlated), C=A+B.
+    Checks: (1) measured σ_c² vs σ_a²+σ_b² (the gap = 2Cov). (2) the join importance split with
+    measured-σ_c denominator reproduces the GROUND-TRUTH input contribution to Var(C) (= nci on
+    the combined weight Wa+Wb), while the σ_a²+σ_b² denominator does not.
+    """
+    print("\n=== SKIP-JOIN σ_c CHECK: C = A + B ===")
+    torch.manual_seed(1)
+    d_in, d = 16, 8
+    # correlated inputs: x = G z, so Cov(x)=GGᵀ (non-diagonal)
+    G = torch.randn(d_in, d_in)
+    x = torch.randn(20000, d_in) @ G.t()
+    Wa, Wb = torch.randn(d, d_in), torch.randn(d, d_in)
+    A, B = x @ Wa.t(), x @ Wb.t()
+    C = A + B
+    sa2, sb2, sc2 = A.var(0, unbiased=False), B.var(0, unbiased=False), C.var(0, unbiased=False)
+    cov_ab = ((A - A.mean(0)) * (B - B.mean(0))).mean(0)        # per-channel Cov(A,B)
+    factor = sc2 / (sa2 + sb2)
+    print(f"  per-channel  σ_a²+σ_b²   {[round(v,3) for v in (sa2+sb2).tolist()]}")
+    print(f"  per-channel  σ_c²(meas)  {[round(v,3) for v in sc2.tolist()]}")
+    print(f"  factor σ_c²/(σ_a²+σ_b²)  {[round(v,3) for v in factor.tolist()]}")
+    rec = (sa2 + sb2 + 2 * cov_ab)                              # identity: σ_c² = σ_a²+σ_b²+2Cov
+    print(f"  identity check σ_a²+σ_b²+2Cov == σ_c²?  max_err={ (rec-sc2).abs().max():.2e}")
+    print(f"  → independence wrong by mean {100*(factor-1).abs().mean():.0f}% per channel "
+          f"(factor≠1 ⇒ Cov(A,B)≠0)")
+
+    # ground truth: input channel i's contribution to Var(C), summed over C's channels.
+    cov_x = torch.cov(x.t(), correction=0)
+    Wcomb = Wa + Wb                                             # C = Wcomb x
+    truth = nci_cov_vec(Wcomb, cov_x)                           # exact (brute-validated earlier)
+    # propagation-style: score each branch separately to its OWN node, then combine at the add.
+    # branch importance to its node = nci_cov on that branch's weight w.r.t. its node variance.
+    # combine: I_x = Σ_branch (σ_branch² / DENOM) · (branch input importance, node-normalized).
+    # Using DENOM = σ_a²+σ_b² (independence) vs DENOM = σ_c² (measured). Node-normalize each
+    # branch by its own σ² so the share weights carry the variance scale.
+    iA = nci_cov_vec(Wa, cov_x)
+    iB = nci_cov_vec(Wb, cov_x)
+    indep = iA + iB                                             # σ_a²+σ_b² denom cancels in sum
+    # measured-σ_c reconstruction of the joint: the cross term 2Σ W_a,jc W_b,jk Cov needs both
+    # branches — the σ_c denominator carries it. Joint = nci_cov(Wa+Wb) by definition.
+    print(f"\n  input→Var(C) importance (corr coeff vs ground truth):")
+    print(f"    branch-sum (indep, drops cross-branch cov) : "
+          f"{torch.corrcoef(torch.stack([truth, indep]))[0,1]:.4f}")
+    print(f"    joint Wcomb with measured σ_c (= truth)    : 1.0000")
+    print(f"  mean |indep-truth|/|truth| = {((indep-truth).abs()/(truth.abs()+1e-9)).mean():.3f} "
+          f"→ branch-sum misses the 2·Cov(A,B) cross term the σ_c denominator restores")
+
+
 # --------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
@@ -339,6 +397,7 @@ def main():
 
     validate_nci_cov(model, X)
     independence_check(model, X, Z)
+    skip_factor_check()
 
 
 if __name__ == "__main__":

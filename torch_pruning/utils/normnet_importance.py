@@ -79,7 +79,8 @@ def _classifier_seed(mgr, topology, classifier, p):
 
 def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
                                  I_out=None, p=2, conv_reduction="frobenius",
-                                 on_mismatch="warn", relative=True, classifier=None):
+                                 on_mismatch="warn", relative=True, classifier=None,
+                                 use_measured_sigma_c=False):
     """Pull per-input-channel scores from an ACTIVE reparam manager.
 
     mode="per_layer"   → mgr.input_channel_scores()  (‖σ·v‖ = √NCI, the §2 criterion).
@@ -100,7 +101,8 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
     if mode == "propagation":
         topo = None
         if example_inputs is not None:
-            topo = mgr.build_propagation_topology(example_inputs, p=p)
+            topo = mgr.build_propagation_topology(
+                example_inputs, p=p, use_measured_sigma_c=use_measured_sigma_c)
         # PDF seed: I^o propagated back through the classifier (W̄^fc · 𝟙_classes), so the
         # final-stage features get REAL importance. Without it the terminal seeds uniform →
         # ties → global pruning empties the last stage. None → uniform fallback.
@@ -115,7 +117,7 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
 
 def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
                            conv_reduction="frobenius", on_mismatch="warn",
-                           relative=True, classifier=None):
+                           relative=True, classifier=None, use_measured_sigma_c=False):
     """Score extraction with the propagation-needs-mean-variant guard, shared by the
     single-GPU (prune_e2) and DDP (pruning_utils) paths.
 
@@ -134,7 +136,7 @@ def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
     return extract_input_channel_scores(
         mgr, mode=mode, example_inputs=example_inputs, p=p,
         conv_reduction=conv_reduction, on_mismatch=on_mismatch, relative=relative,
-        classifier=classifier)
+        classifier=classifier, use_measured_sigma_c=use_measured_sigma_c)
 
 
 class NormalizedNetImportance(GroupMagnitudeImportance):
