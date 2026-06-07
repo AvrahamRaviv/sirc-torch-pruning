@@ -16,12 +16,13 @@ magnitude IS the contribution score.
 
   M[i,j] = sigma_in[i] * || reduce_kernel(W[j,i,:]) ||           (in x out)
   NCI    : one hop, no propagation.    NCI[i] = sum_j M[i,j]^2   ( = sigma_i^2 ||W_i||^2 )
-  rel    : I^l = Wbar @ I^{l+1},  Wbar = M^p / colsum(M^p)       (column-stochastic)
+  rel    : I^l = Wbar @ I^{l+1},  Wbar = M^p / colsum(M^p)       (L1 column-stochastic)
            -> mass-preserving, LOCAL (compare channels within a layer only)
-  nonrel : same Wbar, but first multiply downstream importance by the per-hop
-           transfer  sigma_post^p  (the measured activation gain Sigma^{l+1}).
-           -> tries to be GLOBAL (cross-layer); see the spectral caveat in the docstring
-              of compute_propagation() below.
+  nonrel : same recursion, Wbar = M^p / sigma_pre^p, sigma_pre = (colsum M^2)^(1/2)
+           (L2 / std column-norm, PDF steps 7-8). sigma is already in M (=sigma*W),
+           so there is NO separate per-hop transfer. For p=2 nonrel == rel (PDF:
+           "variance propagation yields the same relative criterion for p=2"); they
+           differ only at p=1. Neither is a bounded global score (see compute_scores).
 
 ------------------------------------------------------------------------------
 CHANNEL DIRECTION (the subtle part)
@@ -270,10 +271,8 @@ def calibrate(model, prunable, loader, device, n_batches, save_input_for):
     channel, plus forward FIRING ORDER (a valid topo sort of the prunable DAG).
     `save_input_for` modules also stash one input batch (for the fold sanity check).
 
-    The non-relative transfer Σ^{l+1} is the POST-activation std = the immediate on-path
-    CONSUMER's input σ (built in compute_scores from sigma_in), NOT a layer's own output
-    std — that own-output std is PRE-activation (= the D denominator) and would cancel D,
-    collapsing nonrel to the raw M^p product. So we calibrate only the input σ here."""
+    Only the input σ (sigma_in) is needed: it folds into M = σ·W once, and both rel and
+    nonrel are built from M alone (no separate per-hop σ transfer; see compute_scores)."""
     stats = {m: {"sum": None, "sqsum": None, "n": 0} for m in prunable.values()}
     fire_order = []
     seen = set()
@@ -381,33 +380,19 @@ def discover_edges(model, example_inputs, prunable):
 def compute_scores(prunable, sigma, edges, fire_order, p=2):
     """Returns dict mode -> {layer: per-input-channel score}.
 
-    nonrel spectral caveat: propagation is an inhomogeneous product of per-layer
-    operators. rel's Wbar is column-stochastic (total mass conserved -> bounded, but
-    cannot rank ACROSS layers -> local only). nonrel injects sigma_post^p to break that
-    stochasticity for cross-layer scale, but the per-hop mass-gain = E_{propagated
-    dist}[sigma_post^p] != 1 in general -> geometric drift over depth. So nonrel is
-    cross-layer in intent; verify its dynamic range before trusting it globally
-    (a within-layer ranker via 'mean' normalization is the safe use).
+    Propagation (PDF steps 7-10): sigma folded into M=sigma*W ONCE, no per-hop transfer.
+    rel  -> Wbar=M^p/colsum(M^p) (L1, column-stochastic): mass conserved -> bounded but
+            every layer sums to the same total -> cross-layer ranking is only 1/width ->
+            LOCAL.
+    nonrel -> Wbar=M^p/sigma_pre^p, sigma_pre=(colsum M^2)^(1/2) (L2/std, steps 7-8):
+            not stochastic -> for p=1 rho!=1 -> per-layer scale grows rho^depth -> a global
+            sort degenerates to rank-by-depth. For p=2 nonrel == rel.
+    Neither propagated form is a bounded global criterion; the bounded global score is
+    nci = sigma^2||W||^2 (one hop, no iteration).
     """
     def n_out(L): return L.out_channels if isinstance(L, nn.Conv2d) else L.out_features
 
     M = {L: layer_M(L, sigma[L]) for L in prunable.values()}
-    # Σ^{l+1} transfer = POST-activation output std (PDF steps 3-4: f = σ_post/σ_pre, the
-    # activation std-gain). The layer's OWN output (sigma_out) is PRE-activation (= σ_pre =
-    # the colsum/D denominator) → using it makes D and the transfer CANCEL, collapsing
-    # nonrel to the raw M^p product (the 1e9 compound). The post-activation std equals the
-    # IMMEDIATE on-path consumer's input std (a_L feeds straight into it). Pick the consumer
-    # earliest in fire_order (the main path), NOT an average over off-path residual consumers.
-    order_idx = {L: k for k, L in enumerate(fire_order)}
-    sigma_post = {}
-    for L in prunable.values():
-        cands = [C for C in edges[L]
-                 if sigma[C].numel() == n_out(L) and order_idx.get(C, 1 << 30) > order_idx.get(L, -1)]
-        if cands:
-            C = min(cands, key=lambda c: order_idx[c])
-            sigma_post[L] = sigma[C]                       # consumer input std = σ_post[L]
-        else:
-            sigma_post[L] = torch.ones(n_out(L), device=M[L].device)   # terminal → no transfer
 
     # nci/mag are VARIANCE/L2 BY DEFINITION (the paper's NCI = σ_i²‖W_i‖²) — fixed exponent 2,
     # independent of `p`. `p` only flavors the PROPAGATION (rel/nonrel: p=2 variance / p=1 std).
@@ -427,12 +412,13 @@ def compute_scores(prunable, sigma, edges, fire_order, p=2):
                     I_next = I_next + I_in[C]
             else:                                   # terminal -> uniform seed
                 I_next = torch.full((no,), 1.0 / no, device=M[L].device)
-            if nonrel:
-                I_next = I_next * sigma_post[L].pow(p)        # per-hop transfer
             Mp = M[L].pow(p)
-            colsum = Mp.sum(dim=0).clamp_min(1e-8)
-            Wbar = Mp / colsum[None, :]                       # column-stochastic
-            I_in[L] = Wbar @ I_next                           # [in]
+            if nonrel:                              # sigma_pre^p (L2/std col-norm), steps 7-8
+                denom = M[L].pow(2).sum(dim=0).clamp_min(1e-8).pow(p / 2.0)
+            else:                                   # L1 column-stochastic
+                denom = Mp.sum(dim=0).clamp_min(1e-8)
+            Wbar = Mp / denom[None, :]
+            I_in[L] = Wbar @ I_next                 # [in], sigma once, no transfer
         return I_in
 
     return {"magnitude": mag, "nci": nci, "rel": propagate(False), "nonrel": propagate(True)}
@@ -635,8 +621,10 @@ def main():
     align_ok = assert_alignment(model, example_inputs, prunable, scores_by_mode["nci"])
     print(f"[align] input-score -> physical channel mapping: {'OK' if align_ok else 'CHECK'}")
     for mode, sc in scores_by_mode.items():
-        # cross-LAYER drift = spread of per-layer MEAN score across depth (the nonrel
-        # concern). Per-channel min is dominated by dead channels -> uninformative.
+        # cross-LAYER drift = spread of per-layer MEAN score across depth. For nci this is
+        # real cross-layer contribution; for rel / nonrel-p2 it is the 1/width mass-conservation
+        # artifact; for nonrel-p1 it is the rho^depth scale. Per-channel min is dominated by
+        # dead channels -> uninformative, so use the per-layer mean.
         means = torch.tensor([v.float().mean().item() for v in sc.values()])
         drift = (means.max() / means.clamp_min(1e-20).min()).item()
         print(f"[score] {mode:<7s} cross-layer drift (max/min of per-layer mean) = {drift:.2e}")

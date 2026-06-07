@@ -4,13 +4,13 @@ Checks EVERY PDF element separately (not just drift), for p=1 AND p=2, on BOTH c
 (normnet_standalone.compute_scores + reparam.MeanResidualManager.propagation_importance),
 plus a RESIDUAL toy for the skip-join variance-share the sequential case can't exercise.
 
-PDF map:
+PDF map (steps 7-10): sigma folded into M=sigma*W ONCE, NO separate per-hop transfer.
   M[i,j] = sigma_in_i * |reduce(W[j,i,:])|                          (step 1)
-  sigma_pre_j = sqrt(Sum_i sigma_i^2 w_ij^2)  -> colsum(M^2)_j      (step 2)
-  transfer Sigma^{l+1} = POST-activation std = consumer input std   (steps 3-4)
-  relative   W_bar = M^p * D,  D = 1/Sum_i M^p_ij  (col-stochastic) (steps 9-10, rel opt 1/2)
-  nonrel     W_bar @ (sigma_post^p (.) I_next)                      (steps 7-8)
-  seed I^o normalizes Sigma^o -> terminal transfer = ones           (step 8)
+  sigma_pre_j = sqrt(Sum_i sigma_i^2 w_ij^2)  -> (colsum M^2)_j^0.5 (step 2)
+  relative   W_bar = M^p / Sum_i M^p_ij            (L1, col-stochastic, steps 9-10)
+  nonrel     W_bar = M^p / sigma_pre^p = M^p / (colsum M^2)^(p/2)   (L2/std, steps 7-8)
+  recursion  I^l = W_bar^l @ I^{l+1}               (no transfer; sigma once)
+  identity   for p=2 the two W_bar COINCIDE -> nonrel == rel (PDF p.3)
   skip add   back-prop splits by sigma_branch^2/(sigma_a^2+sigma_b^2)(relative section)
 """
 import sys, os, torch, torch.nn as nn
@@ -49,8 +49,11 @@ def hand_M(fc, sin, p):
     W = fc.weight.data
     return (W.abs().t() * sin[fc][:, None])  # [in,out]
 
-def wbar(M, p):
+def wbar(M, p):              # relative: L1 column-stochastic
     Mp = M.pow(p); return Mp / Mp.sum(0).clamp_min(1e-12)
+
+def wbar_nr(M, p):           # non-relative: sigma_pre^p (L2/std col-norm), no transfer
+    Mp = M.pow(p); return Mp / M.pow(2).sum(0).clamp_min(1e-12).pow(p / 2.0)
 
 # ============================================================ 1. SEQUENTIAL MLP
 print("=== 1. SEQUENTIAL MLP (fcA->ReLU->fcB->ReLU->fcC), p in {1,2} ===")
@@ -86,29 +89,29 @@ for p in (1, 2):
         hand = (sigma[fc][:, None] * fc.weight.data.abs().t()).pow(p).sum(0)
         check(f"colsum == Sum(sigma*w)^{p} (fc{keyof[fc]})", torch.allclose(cs, hand, atol=1e-6),
               f"max|d|={(cs-hand).abs().max():.1e}")
-# C) transfer SEMANTICS: standalone's sigma_post[fc] == empirical POST-activation std (loose:
-#    both are statistical estimates of the same a^l, biased vs unbiased std differ ~1/N)
-order_idx = {L: k for k, L in enumerate(fire)}
-def sa_sigma_post(fc):  # replicate the standalone's pick
-    cands = [C for C in edges[fc] if sigma[C].numel()==fc.out_features and order_idx.get(C,1<<30)>order_idx.get(fc,-1)]
-    return sigma[min(cands, key=lambda c: order_idx[c])] if cands else torch.ones(fc.out_features)
-check("transfer == POST-act std (fcA: sigma[consumer] ~ empirical spost)",
-      torch.allclose(sa_sigma_post(m.fcA), spost[m.fcA], rtol=0.03, atol=0.01),
-      f"maxrel={((sa_sigma_post(m.fcA)-spost[m.fcA]).abs()/spost[m.fcA].clamp_min(1e-6)).max():.3f}")
-check("transfer != PRE-act std (fcA: sigma[consumer] FAR from sigma_pre)",
-      not torch.allclose(sa_sigma_post(m.fcA), spre[m.fcA], rtol=0.1),
-      "confirms POST not PRE (the bug would make these equal)")
+# C) NONREL denominator == sigma_pre^p (L2/std col-norm), distinct from rel's L1 for p=1
+for p in (1, 2):
+    for fc in fcs:
+        M = nns.layer_M(fc, sigma[fc])
+        nr_denom = M.pow(2).sum(0).pow(p / 2.0)                  # sigma_pre^p
+        rel_denom = M.pow(p).sum(0)                              # L1 of M^p
+        same = torch.allclose(nr_denom, rel_denom, atol=1e-6)
+        check(f"nonrel denom == sigma_pre^{p} (fc{keyof[fc]})",
+              torch.allclose(nr_denom, M.pow(2).sum(0).sqrt().pow(p), atol=1e-6))
+        if p == 2:
+            check(f"p=2: nonrel denom == rel denom (fc{keyof[fc]})", same)
+        else:
+            check(f"p=1: nonrel denom != rel denom (fc{keyof[fc]})", not same)
 
-# D) RECURSION exactness: hand oracle uses the CODE's OWN sigma as transfer -> isolates the
-#    recursion math from sigma-measurement. Expect EXACT match (rel + nonrel, p=1 and p=2).
+# D) RECURSION exactness: hand oracle (no transfer; sigma once). rel=L1, nonrel=L2.
 for p in (1, 2):
     sc = nns.compute_scores(prunable, sigma, edges, fire, p=p)
-    T = {m.fcA: sa_sigma_post(m.fcA).pow(p), m.fcB: sa_sigma_post(m.fcB).pow(p), m.fcC: sa_sigma_post(m.fcC).pow(p)}
     def seq(nonrel):
+        wb = wbar_nr if nonrel else wbar
         I = {}; seed = torch.full((DIMS[3],), 1.0/DIMS[3])
-        Ic = wbar(hand_M(m.fcC, sigma, p), p) @ ((T[m.fcC] if nonrel else 1.0) * seed); I[m.fcC]=Ic
-        Ib = wbar(hand_M(m.fcB, sigma, p), p) @ ((T[m.fcB] if nonrel else 1.0) * Ic);   I[m.fcB]=Ib
-        Ia = wbar(hand_M(m.fcA, sigma, p), p) @ ((T[m.fcA] if nonrel else 1.0) * Ib);   I[m.fcA]=Ia
+        Ic = wb(hand_M(m.fcC, sigma, p), p) @ seed; I[m.fcC]=Ic
+        Ib = wb(hand_M(m.fcB, sigma, p), p) @ Ic;   I[m.fcB]=Ib
+        Ia = wb(hand_M(m.fcA, sigma, p), p) @ Ib;   I[m.fcA]=Ia
         return I
     relh, nrh = seq(False), seq(True)
     for fc, key in zip(fcs, "ABC"):
@@ -116,6 +119,11 @@ for p in (1, 2):
               f"max|d|={(sc['rel'][fc]-relh[fc]).abs().max():.1e}")
         check(f"standalone NONREL p={p} fc{key}", torch.allclose(sc['nonrel'][fc], nrh[fc], atol=1e-6),
               f"max|d|={(sc['nonrel'][fc]-nrh[fc]).abs().max():.1e}")
+    if p == 2:  # PDF identity: variance propagation == relative criterion
+        for fc, key in zip(fcs, "ABC"):
+            check(f"standalone p=2 NONREL==REL fc{key}",
+                  torch.allclose(sc['nonrel'][fc], sc['rel'][fc], atol=1e-6),
+                  f"max|d|={(sc['nonrel'][fc]-sc['rel'][fc]).abs().max():.1e}")
 
 # production path on same MLP
 print("  -- production MeanResidualManager (same MLP) --")
@@ -127,21 +135,24 @@ for p in (1, 2):
     seed = torch.full((DIMS[3],), 1.0/DIMS[3])
     rel = mgr.propagation_importance(I_out=seed, p=p, relative=True)
     nr  = mgr.propagation_importance(I_out=seed, p=p, relative=False)
-    # production hand-ref using ITS sigma buffers (sigma_x = input std). transfer for fcA=sigma_x[fcB],
-    # fcB=sigma_x[fcC], fcC=terminal(own sigma_out_x).
+    # production hand-ref from ITS M buffers (sigma folded once). rel=L1, nonrel=L2. No transfer.
     def Mp_prod(rp):
         from torch_pruning.utils.reparam import _contribution_weight
         w = _contribution_weight(rp).detach(); return w.t().abs()
-    Tp = {rpA: rpB.sigma_x.pow(p), rpB: rpC.sigma_x.pow(p), rpC: rpC.sigma_out_x.pow(p)}
     def seqp(nonrel):
-        IC = wbar(Mp_prod(rpC), p) @ ((Tp[rpC] if nonrel else 1.0) * seed)
-        IB = wbar(Mp_prod(rpB), p) @ ((Tp[rpB] if nonrel else 1.0) * IC)
-        IA = wbar(Mp_prod(rpA), p) @ ((Tp[rpA] if nonrel else 1.0) * IB)
+        wb = wbar_nr if nonrel else wbar
+        IC = wb(Mp_prod(rpC), p) @ seed
+        IB = wb(Mp_prod(rpB), p) @ IC
+        IA = wb(Mp_prod(rpA), p) @ IB
         return {"fcA": IA, "fcB": IB, "fcC": IC}
     rh, nh = seqp(False), seqp(True)
     for k in ["fcA", "fcB", "fcC"]:
         check(f"production REL    p={p} {k}", torch.allclose(rel[k], rh[k], atol=1e-5), f"max|d|={(rel[k]-rh[k]).abs().max():.1e}")
         check(f"production NONREL p={p} {k}", torch.allclose(nr[k], nh[k], atol=1e-5), f"max|d|={(nr[k]-nh[k]).abs().max():.1e}")
+    if p == 2:
+        for k in ["fcA", "fcB", "fcC"]:
+            check(f"production p=2 NONREL==REL {k}", torch.allclose(nr[k], rel[k], atol=1e-6),
+                  f"max|d|={(nr[k]-rel[k]).abs().max():.1e}")
 
 # ============================================================ 2. RESIDUAL skip-join
 # out = fcC(relu( fcB(relu(fcA(x))) + fcS(x) )). The ADD merges fcB(main) + fcS(skip) and feeds
