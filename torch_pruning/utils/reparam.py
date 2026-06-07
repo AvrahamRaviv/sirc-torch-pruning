@@ -1182,17 +1182,19 @@ class MeanResidualManager(BaseReparamManager):
             else:
                 sig_p = {b: self._reparam_modules[b].sigma_out_x.detach().pow(p)
                          for b in unique_branches}
-                # Denominator = node variance at the merged sum C = Σ branches. Default uses
-                # Σσ_branch^p, which ASSUMES Var(C)=ΣVar(branch) (independence). With
-                # use_measured_sigma_c, use the MEASURED post-add std σ_c (= the merged
-                # consumer's calibrated input std sigma_x, per merged channel) instead — the
-                # PDF's σ_c^p/(σ_a^p+σ_b^p) correction, which restores the dropped 2·Cov term.
+                base_sum = sum(sig_p.values()) + 1e-8         # Σσ_branch^p (independence node var)
+                # Default branch share = σ_branch^p / Σσ_branch^p (assumes Var(C)=ΣVar(branch)).
+                # use_measured_sigma_c: multiply by the PDF skip factor σ_c^p/(σ_a^p+σ_b^p), with
+                # σ_c = MEASURED post-add std (= merged consumer's calibrated sigma_x). cov(A,B)>0
+                # ⇒ σ_c^p > Σσ_branch^p ⇒ factor>1 ⇒ branch weight BOOSTED (correct direction —
+                # brute-force drop-branch confirms; the earlier σ_branch^p/σ_c^p form was inverted).
                 if use_measured_sigma_c:
-                    total = self._reparam_modules[dst].sigma_x.detach().pow(p) + 1e-8
+                    factor = self._reparam_modules[dst].sigma_x.detach().pow(p) / base_sum
+                    for b in unique_branches:
+                        weights[(b, dst)] = (sig_p[b] / base_sum) * factor   # per-channel tensor
                 else:
-                    total = sum(sig_p.values()) + 1e-8
-                for b in unique_branches:
-                    weights[(b, dst)] = sig_p[b] / total      # per-channel tensor
+                    for b in unique_branches:
+                        weights[(b, dst)] = sig_p[b] / base_sum              # per-channel tensor
 
         # Assemble final topology with weights
         topology = OrderedDict()
