@@ -389,9 +389,9 @@ def main(argv):
                 ws = torch.distributed.get_world_size()
                 for d in (var_imp.variance, var_imp.means):
                     for k in list(d.keys()):
-                        t = d[k].detach().clone().contiguous()
+                        t = d[k].detach().to(device).contiguous()   # NCCL needs CUDA tensors
                         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
-                        d[k] = t / ws
+                        d[k] = (t / ws).to(d[k].device)
             log_info(f"tp_variance: collected activation stats on {len(var_imp.variance)} layers "
                      f"({args.calib_batches} calib batches), norm_per_layer={var_imp.norm_per_layer}")
 
@@ -411,7 +411,7 @@ def main(argv):
                 if torch.distributed.is_available() and torch.distributed.is_initialized():
                     ws = torch.distributed.get_world_size()
                     for k in list(mean_dict.keys()):
-                        t = mean_dict[k].detach().clone().contiguous()
+                        t = mean_dict[k].detach().to(device).contiguous()   # NCCL needs CUDA
                         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
                         mean_dict[k] = t / ws
             log_info(f"bias_comp: activation means on {len(mean_dict)} layers "
