@@ -80,7 +80,7 @@ def _classifier_seed(mgr, topology, classifier, p):
 def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
                                  I_out=None, p=2, conv_reduction="frobenius",
                                  on_mismatch="warn", relative=True, classifier=None,
-                                 use_measured_sigma_c=False):
+                                 use_measured_sigma_c=False, use_measured_var=False):
     """Pull per-input-channel scores from an ACTIVE reparam manager.
 
     mode="per_layer"   → mgr.input_channel_scores()  (‖σ·v‖ = √NCI, the §2 criterion).
@@ -111,13 +111,15 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
             seed = _classifier_seed(mgr, topo, classifier, p)
         return mgr.propagation_importance(
             I_out=seed, p=p, conv_reduction=conv_reduction,
-            on_mismatch=on_mismatch, topology=topo, relative=relative)
+            on_mismatch=on_mismatch, topology=topo, relative=relative,
+            use_measured_var=use_measured_var)
     raise ValueError(f"mode must be 'per_layer' or 'propagation', got {mode!r}")
 
 
 def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
                            conv_reduction="frobenius", on_mismatch="warn",
-                           relative=True, classifier=None, use_measured_sigma_c=False):
+                           relative=True, classifier=None, use_measured_sigma_c=False,
+                           use_measured_var=False):
     """Score extraction with the propagation-needs-mean-variant guard, shared by the
     single-GPU (prune_e2) and DDP (pruning_utils) paths.
 
@@ -136,7 +138,8 @@ def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
     return extract_input_channel_scores(
         mgr, mode=mode, example_inputs=example_inputs, p=p,
         conv_reduction=conv_reduction, on_mismatch=on_mismatch, relative=relative,
-        classifier=classifier, use_measured_sigma_c=use_measured_sigma_c)
+        classifier=classifier, use_measured_sigma_c=use_measured_sigma_c,
+        use_measured_var=use_measured_var)
 
 
 class NormalizedNetImportance(GroupMagnitudeImportance):

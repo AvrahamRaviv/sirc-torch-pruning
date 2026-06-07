@@ -105,6 +105,13 @@ INCLUDE_NCI_COV_FULL = os.environ.get("INCLUDE_NCI_COV_FULL", "1") != "0"
 # denominator = MEASURED post-add σ_c instead of the independence sum Σσ_branch^p. The "no cov,
 # yes σ_c" cell (σ_c lives in propagation; cov lives in the one-hop nci_cov — different criteria).
 INCLUDE_PROP_SIGMAC = os.environ.get("INCLUDE_PROP_SIGMAC", "1") != "0"
+# NONREL 2×2 (all --prop_non_relative --imp_normalizer none — keeps the cross-layer scale the
+# corrections restore, instead of erasing it with mean-1). Both knobs are the SAME fix — measured
+# node variance vs the independence-summed estimate — at two points:
+#   cov (--prop_measured_var): per-LAYER denominator colsum Σ(σW)² → measured σ_out² (true Var Z_j)
+#   σ_c (--skip_sigma_c):      residual-JOIN denominator Σσ_branch² → measured σ_c² (true Var C)
+# 4 cells: base / cov / σ_c / both.
+INCLUDE_NONREL_2X2 = os.environ.get("INCLUDE_NONREL_2X2", "1") != "0"
 
 # Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
@@ -249,6 +256,14 @@ def main():
     if INCLUDE_PROP_SIGMAC:
         made.append(_write("A0_prop_sigmac", DENSE_8086, A0_EXTRA,
                            " --skip_sigma_c --imp_normalizer mean", shared=SHARED_NOFOLD))
+    # NONREL 2×2 — all --prop_non_relative --imp_normalizer none (cross-layer scale KEPT). cov =
+    # --prop_measured_var (layer var), σ_c = --skip_sigma_c (join var). 4 cells.
+    if INCLUDE_NONREL_2X2:
+        NR = " --prop_non_relative --imp_normalizer none"
+        made.append(_write("A0_nonrel_base",   DENSE_8086, A0_EXTRA, NR, shared=SHARED_NOFOLD))
+        made.append(_write("A0_nonrel_cov",    DENSE_8086, A0_EXTRA, NR + " --prop_measured_var", shared=SHARED_NOFOLD))
+        made.append(_write("A0_nonrel_sigmac", DENSE_8086, A0_EXTRA, NR + " --skip_sigma_c", shared=SHARED_NOFOLD))
+        made.append(_write("A0_nonrel_both",   DENSE_8086, A0_EXTRA, NR + " --prop_measured_var --skip_sigma_c", shared=SHARED_NOFOLD))
     # CLASSICAL baselines (same harness: 80.86, mac 2G global, KD, no sparse phase). The
     # --scorer override (last-wins over SHARED's propagation) swaps the criterion. These are
     # the controls that should recover — magnitude/bn_scale lack the propagation gutting.

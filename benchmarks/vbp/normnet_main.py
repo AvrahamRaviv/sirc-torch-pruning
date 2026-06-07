@@ -417,7 +417,8 @@ def main(argv):
             scores = extract_normnet_scores(
                 mgr, args.scorer, example_inputs=(ex if args.scorer == "propagation" else None),
                 relative=not args.prop_non_relative, classifier=clf,
-                use_measured_sigma_c=args.skip_sigma_c)
+                use_measured_sigma_c=args.skip_sigma_c,
+                use_measured_var=args.prop_measured_var)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 for k in list(scores.keys()):
                     t = scores[k].contiguous()
@@ -682,6 +683,11 @@ def parse_args(argv):
                    help="propagation: at residual joins use the MEASURED post-add std σ_c as the "
                         "branch-weight denominator (PDF σ_c^p/(σ_a^p+σ_b^p) skip factor) instead of "
                         "the independence sum Σσ_branch^p. Restores the dropped 2·Cov(A,B) term.")
+    p.add_argument("--prop_measured_var", action="store_true",
+                   help="propagation: per-layer denominator = MEASURED output variance σ_out_x^p "
+                        "(true Var(Z_j)) instead of the computed independence colsum Σ_i(σ_i W_ij)^p. "
+                        "Corrects the within-layer independence assumption (the off-diagonal cov "
+                        "term). Pairs with --skip_sigma_c (joins) for the full covariance 2×2.")
     p.add_argument("--pruning_ratio", type=float, default=0.5)
     p.add_argument("--mac_target_g", type=float, default=0.0,
                    help="target MACs in GMAC (e.g. 2.0). >0 overrides --pruning_ratio: "

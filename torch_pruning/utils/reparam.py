@@ -1207,7 +1207,8 @@ class MeanResidualManager(BaseReparamManager):
                                on_mismatch="warn",
                                topology=None,
                                p=2,
-                               relative=True):
+                               relative=True,
+                               use_measured_var=False):
         """Per-input-channel global importance via reverse-walk recursion.
 
         Implements the paper's propagation criterion (normalized_nets_pruning.pdf
@@ -1295,12 +1296,19 @@ class MeanResidualManager(BaseReparamManager):
                 w_red = w                                          # [out, in]
             return w_red.t().abs()                                 # [in, out]
 
-        def _Wbar(M):
+        def _Wbar(M, measured_denom=None):
             """Column-normalized W̄ = M^p · D (no σ transfer — σ is already in M).
             relative → D = 1/Σ_i M^p (column-stochastic). non-relative → D = 1/σ_pre^p
-            = 1/(Σ_i M^2)^{p/2} (std/L2 norm). Identical for p=2."""
+            = 1/(Σ_i M^2)^{p/2} (std/L2 norm). Identical for p=2.
+
+            measured_denom (use_measured_var): per-output MEASURED node variance σ_out_x^p.
+            The computed denom Σ_i(σ_i W_ij)^p is the INDEPENDENCE estimate of Var(Z_j); the
+            measured σ_out_x^p is the true Var(Z_j) (incl. cross-channel covariance). Using it
+            corrects the within-layer independence assumption (PDF; = the off-diagonal cov term)."""
             Mp = M.pow(p)
-            if relative:
+            if measured_denom is not None:
+                denom = measured_denom.to(Mp.dtype).clamp(min=eps)        # true Var(Z_j)^{p/2}
+            elif relative:
                 denom = Mp.sum(dim=0).clamp(min=eps)                       # L1 of M^p
             else:
                 denom = M.pow(2).sum(dim=0).clamp(min=eps).pow(p / 2.0)    # σ_pre^p (L2)
@@ -1308,11 +1316,15 @@ class MeanResidualManager(BaseReparamManager):
 
         layers = list(self._reparam_modules.items())  # forward order
         Ms = {name: _layer_M(rp) for name, rp in layers}
+        # use_measured_var: per-layer MEASURED output node variance σ_out_x^p (true Var(Z_j)),
+        # replaces the computed independence denominator Σ_i(σ_i W_ij)^p in _Wbar.
+        meas_denom = ({name: rp.sigma_out_x.detach().pow(p) for name, rp in layers}
+                      if use_measured_var else {})
 
         # ---- DAG walk path (M3): topology provided ----
         if topology is not None:
             return self._propagate_dag(layers, Ms, topology, I_out, eps, p, relative,
-                                       wbar_fn=_Wbar)
+                                       wbar_fn=_Wbar, meas_denom=meas_denom)
 
         # ---- Sequential path (M2): no topology ----
         # Seed I_out at last layer's output
@@ -1350,7 +1362,7 @@ class MeanResidualManager(BaseReparamManager):
                 # SCORE RECURSION I^l = W̄^l·I^{l+1} (normalized_nets_pruning.pdf steps 7-10).
                 # σ is already in M (=σ·W); no separate transfer. relative → column-stochastic
                 # D=1/Σ_iM^p; non-relative → D=1/σ_pre^p (L2). Identical for p=2.
-                I_l = _Wbar(M) @ I_next                        # propagate one layer back → [in]
+                I_l = _Wbar(M, meas_denom.get(name)) @ I_next  # propagate one layer back → [in]
 
             results.append((name, I_l))
             I_next = I_l  # chains to layer l-1 (whose out_dim should equal in_l = I_next.numel())
@@ -1358,7 +1370,7 @@ class MeanResidualManager(BaseReparamManager):
         return OrderedDict(reversed(results))
 
     def _propagate_dag(self, layers, Ms, topology, I_out, eps, p=2, relative=True,
-                       wbar_fn=None):
+                       wbar_fn=None, meas_denom=None):
         """DAG reverse-walk using a downstream+weight topology (M3).
 
         For each layer L (visited in reverse forward order — assumes named_modules order
@@ -1452,7 +1464,8 @@ class MeanResidualManager(BaseReparamManager):
             # σ already in M (=σ·W); no separate transfer. relative → column-stochastic
             # (D=1/Σ_iM^p); non-relative → D=1/σ_pre^p (L2). Identical for p=2. The residual
             # fan-in weights `w` above (σ^p/Σσ^p branch split) are a separate, orthogonal mix.
-            I_by_name[name] = wbar_fn(M) @ I_next
+            md = meas_denom.get(name) if meas_denom else None
+            I_by_name[name] = wbar_fn(M, md) @ I_next
 
         # Return in forward order
         return OrderedDict((name, I_by_name[name]) for name, _ in layers)
