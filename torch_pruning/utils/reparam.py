@@ -905,16 +905,11 @@ class MeanResidualManager(BaseReparamManager):
         ...  # train with mgr.regularization_loss() as aux loss
         mgr.merge_back()                   # restore standard modules before pruning
 
-    TODO (pruning, deferred — base training is the current focus):
-      The NCI contribution-variance score is ‖v·σ‖, but this manager carries no σ
-      (it folds away σ entirely; σ cancels in the forward). To prune on the mean path:
-        1. Calibrate and store a fixed per-input-channel σ buffer (BN-EMA) on each
-           MeanResidual* module at reparameterize() time.
-        2. Score channels by ‖v·σ‖ (not ‖v‖) in channel_stats()/importance.
-        3. If contribution-variance *regularization* is wanted, add it as an EXPLICIT
-           penalty λ‖v·σ‖ in regularization_loss() — do NOT fold σ into the trainable
-           (that reintroduces the 1/σ² optimizer-geometry overshoot). This decouples the
-           whitening penalty from the optimizer step.
+    Pruning on the mean path is supported: each MeanResidual* module stores a frozen
+    per-input-channel sigma_x buffer (set at reparameterize()), input_channel_scores()
+    ranks by ‖σ·v‖ (= √NCI), and regularization_loss() penalizes ‖σ·v‖ with σ detached.
+    σ is NEVER folded into the trainable v — that would reintroduce the 1/σ²
+    optimizer-geometry overshoot; the penalty stays decoupled from the optimizer step.
     """
 
     def __init__(self, model, target_names, device, lambda_reg=0.01, max_batches=200,
