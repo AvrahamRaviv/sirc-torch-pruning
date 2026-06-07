@@ -253,17 +253,20 @@ def main():
         made.append(_write("A0_nci_cov_full", DENSE_8086, A0_EXTRA,
                            " --scorer nci_cov --imp_normalizer mean", shared=SHARED_BASE))
     # A0 prop + σ_c — propagation rel with the PDF measured-σ_c skip factor. "no cov, yes σ_c".
+    # fold ON (SHARED): propagation needs σ_out POST-BN (the signal that actually propagates) +
+    # --bias_comp (preserve E[Δy] on channel removal). Both default for the prop/cov arms.
     if INCLUDE_PROP_SIGMAC:
         made.append(_write("A0_prop_sigmac", DENSE_8086, A0_EXTRA,
-                           " --skip_sigma_c --imp_normalizer mean", shared=SHARED_NOFOLD))
+                           " --skip_sigma_c --imp_normalizer mean --bias_comp", shared=SHARED))
     # NONREL 2×2 — all --prop_non_relative --imp_normalizer none (cross-layer scale KEPT). cov =
-    # --prop_measured_var (layer var), σ_c = --skip_sigma_c (join var). 4 cells.
+    # --prop_measured_var (layer var), σ_c = --skip_sigma_c (join var). 4 cells. fold ON (SHARED,
+    # post-BN node variances) + --bias_comp default.
     if INCLUDE_NONREL_2X2:
-        NR = " --prop_non_relative --imp_normalizer none"
-        made.append(_write("A0_nonrel_base",   DENSE_8086, A0_EXTRA, NR, shared=SHARED_NOFOLD))
-        made.append(_write("A0_nonrel_cov",    DENSE_8086, A0_EXTRA, NR + " --prop_measured_var", shared=SHARED_NOFOLD))
-        made.append(_write("A0_nonrel_sigmac", DENSE_8086, A0_EXTRA, NR + " --skip_sigma_c", shared=SHARED_NOFOLD))
-        made.append(_write("A0_nonrel_both",   DENSE_8086, A0_EXTRA, NR + " --prop_measured_var --skip_sigma_c", shared=SHARED_NOFOLD))
+        NR = " --prop_non_relative --imp_normalizer none --bias_comp"
+        made.append(_write("A0_nonrel_base",   DENSE_8086, A0_EXTRA, NR, shared=SHARED))
+        made.append(_write("A0_nonrel_cov",    DENSE_8086, A0_EXTRA, NR + " --prop_measured_var", shared=SHARED))
+        made.append(_write("A0_nonrel_sigmac", DENSE_8086, A0_EXTRA, NR + " --skip_sigma_c", shared=SHARED))
+        made.append(_write("A0_nonrel_both",   DENSE_8086, A0_EXTRA, NR + " --prop_measured_var --skip_sigma_c", shared=SHARED))
     # CLASSICAL baselines (same harness: 80.86, mac 2G global, KD, no sparse phase). The
     # --scorer override (last-wins over SHARED's propagation) swaps the criterion. These are
     # the controls that should recover — magnitude/bn_scale lack the propagation gutting.
