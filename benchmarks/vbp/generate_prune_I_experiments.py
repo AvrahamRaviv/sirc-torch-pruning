@@ -148,11 +148,16 @@ def main():
             made.append(_write(f"A0_prop_{rname}", DENSE_8086, A0_EXTRA, rflag))
     # A0 NCI — cold prune by ‖σv‖=√NCI (--scorer per_layer overrides SHARED's propagation).
     # The bounded cross-layer one-hop baseline against A0_prop_rel/nonrel; same harness.
+    # --imp_normalizer mean: per-layer mean-1 BEFORE the global threshold = the proven NCI
+    # setting (old vbp_imagenet norm_per_layer=True) AND tp's DepGraph default. WITHOUT it raw
+    # ‖σv‖ carries the kernel-size bias (3x3 conv2 ~9x a 1x1 conv1) → conv2 never pruned, conv1
+    # gutted. The prop arms keep none (their cross-layer scale IS the criterion).
     if INCLUDE_NCI:
-        made.append(_write("A0_nci", DENSE_8086, A0_EXTRA, " --scorer per_layer"))
-    # A0 magnitude — cold prune by L2 weight magnitude (--scorer magnitude). Classical control.
+        made.append(_write("A0_nci", DENSE_8086, A0_EXTRA, " --scorer per_layer --imp_normalizer mean"))
+    # A0 magnitude — cold prune by L2 weight magnitude (--scorer magnitude). Classical control,
+    # mean normalizer = tp DepGraph default (original config the user asked for).
     if INCLUDE_MAGNITUDE:
-        made.append(_write("A0_magnitude", DENSE_8086, A0_EXTRA, " --scorer magnitude"))
+        made.append(_write("A0_magnitude", DENSE_8086, A0_EXTRA, " --scorer magnitude --imp_normalizer mean"))
     # CLASSICAL baselines (same harness: 80.86, mac 2G global, KD, no sparse phase). The
     # --scorer override (last-wins over SHARED's propagation) swaps the criterion. These are
     # the controls that should recover — magnitude/bn_scale lack the propagation gutting.
