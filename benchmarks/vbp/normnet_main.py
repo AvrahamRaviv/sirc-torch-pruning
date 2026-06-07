@@ -395,6 +395,28 @@ def main(argv):
             log_info(f"tp_variance: collected activation stats on {len(var_imp.variance)} layers "
                      f"({args.calib_batches} calib batches), norm_per_layer={var_imp.norm_per_layer}")
 
+        # Bias compensation: removing input channel c shifts each consumer's output by
+        # E[Δy]=W[:,c]·μ_c. Adding that to the consumer bias BEFORE pruning preserves the
+        # expected output (base_pruner._apply_compensation, auto-applied when mean_dict set).
+        # μ = per-channel activation mean on calib data. Reuse tp_variance's already-collected
+        # (and DDP-synced) means; else collect + all-reduce so every rank edits biases identically.
+        mean_dict = None
+        if args.bias_comp:
+            if var_imp is not None and var_imp.means:
+                mean_dict = dict(var_imp.means)
+            else:
+                from torch_pruning.pruner.importance import collect_activation_means
+                mean_dict = collect_activation_means(
+                    model, calib_loader, device, max_batches=args.calib_batches)
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    ws = torch.distributed.get_world_size()
+                    for k in list(mean_dict.keys()):
+                        t = mean_dict[k].detach().clone().contiguous()
+                        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+                        mean_dict[k] = t / ws
+            log_info(f"bias_comp: activation means on {len(mean_dict)} layers "
+                     f"({args.calib_batches} calib batches)")
+
         # GLOBAL pruning ranks all groups against ONE threshold (base_pruner cats every group's
         # importance). A per-group normalizer ("mean" → each layer forced to mean-1) ERASES the
         # cross-layer scale before that global ranking → reduces global pruning to ~per-layer-
@@ -432,7 +454,8 @@ def main(argv):
 
         tp.pruner.MagnitudePruner(
             model, ex, importance=_imp(model), global_pruning=args.global_pruning,
-            pruning_ratio=ratio, max_pruning_ratio=mpr, ignored_layers=_ignored(model)).step()
+            pruning_ratio=ratio, max_pruning_ratio=mpr, ignored_layers=_ignored(model),
+            mean_dict=mean_dict).step()
         model.to(device)
         per_layer_dist, global_kept = log_prune_distribution(pre_w, _layer_widths(model))
         # reinsert fresh BN at the PRUNED widths (the native BN we folded is gone) so FT has
@@ -557,6 +580,12 @@ def parse_args(argv):
                         "global pruning + the propagation criterion). 'mean' = old behavior "
                         "(per-layer mean-1 → global pruning collapses to per-layer-uniform).")
     p.add_argument("--no_bn_recalib", action="store_true")
+    p.add_argument("--bias_comp", action="store_true",
+                   help="bias compensation: add E[Δy]=W[:,c]·μ_c to each consumer bias before "
+                        "removing channel c, preserving the expected output. μ = per-channel "
+                        "activation mean on calib data. NOTE: a BN after the consumer that gets "
+                        "recalibrated (default) re-centers and absorbs most of this — pair with "
+                        "--no_bn_recalib to see the compensation effect cleanly.")
     p.add_argument("--no_save_preprune", action="store_true",
                    help="skip saving the pre-prune dense checkpoint (default: save it)")
     p.add_argument("--max_prune_ratio", type=float, default=0.0,

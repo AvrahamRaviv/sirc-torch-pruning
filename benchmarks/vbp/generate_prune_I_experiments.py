@@ -73,6 +73,11 @@ INCLUDE_NCI_FBN = os.environ.get("INCLUDE_NCI_FBN", "1") != "0"
 # tp_variance = the OLD vbp_imagenet_pat criterion (group-L2 both-sides × sqrt(conv-output
 # var), no fold, per-layer mean-1). ABLATION vs nci_fbn — same harness, fold OFF. Default off.
 INCLUDE_TP_VARIANCE = os.environ.get("INCLUDE_TP_VARIANCE", "0") != "0"
+# nci_fbn at FULL scope (no interior_only) — also prune the residual stream (conv3/downsample).
+# See how the dist looks when the wide dims are prunable. Default off.
+INCLUDE_NCI_FBN_FULL = os.environ.get("INCLUDE_NCI_FBN_FULL", "0") != "0"
+# nci_fbn + bias compensation (add W[:,c]·μ_c to consumer bias before removal). Default off.
+INCLUDE_NCI_FBN_BC = os.environ.get("INCLUDE_NCI_FBN_BC", "0") != "0"
 
 # Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
@@ -101,16 +106,18 @@ FOLD_BN = os.environ.get("FOLD_NATIVE_BN", "1") != "0"
 # interior_only=True, 32 groups). Full scope (INTERIOR_ONLY=0) also cuts the wide residual dims
 # → ~10M params @ 2G MAC, pre-FT acc ~0 (residual surgery).
 INTERIOR_ONLY = os.environ.get("INTERIOR_ONLY", "1") != "0"
-# SHARED_NOFOLD = everything except the BN-fold flag; SHARED adds it (when FOLD_BN). The fbn
-# arm uses SHARED_NOFOLD to force fold OFF regardless of the global FOLD_BN toggle.
-SHARED_NOFOLD = (
+# Composable shared strings:
+#   SHARED_BASE   = no fold, no interior_only (full scope, BN unfolded)
+#   SHARED_NOFOLD = SHARED_BASE + interior_only (when INTERIOR_ONLY) — the fbn arm's base
+#   SHARED        = SHARED_NOFOLD + fold (when FOLD_BN)              — the default arms' base
+SHARED_BASE = (
     f"--model_type cnn --cnn_arch resnet50 --data_path {DATA} --reparam_variant mean "
     f"--scorer propagation --global_pruning --mac_target_g {MAC_TARGET_G} --max_prune_ratio 0.8 "
     f"--calib_batches 50 "
     f"--epochs_ft {FT} --lr_ft 2e-2 --wd 1e-4 --momentum 0.9 --use_kd --kd_alpha 0.5 "
     f"--kd_T 2.0 --train_batch_size 128 --val_resize 232"
-    + (" --interior_only" if INTERIOR_ONLY else "")
 )
+SHARED_NOFOLD = SHARED_BASE + (" --interior_only" if INTERIOR_ONLY else "")
 SHARED = SHARED_NOFOLD + (" --fold_native_bn" if FOLD_BN else "")
 # Option B: load vnr, no reg recompute (already 30-ep trained).
 B_EXTRA = "--epochs_train 0 --epochs_norm_ft 0"
@@ -178,6 +185,14 @@ def main():
     if INCLUDE_TP_VARIANCE:
         made.append(_write("A0_tp_variance", DENSE_8086, A0_EXTRA,
                            " --scorer tp_variance --imp_normalizer mean", shared=SHARED_NOFOLD))
+    # A0 nci_fbn FULL scope — nci_fbn but residual stream prunable (SHARED_BASE = no interior_only).
+    if INCLUDE_NCI_FBN_FULL:
+        made.append(_write("A0_nci_fbn_full", DENSE_8086, A0_EXTRA,
+                           " --scorer per_layer --imp_normalizer mean", shared=SHARED_BASE))
+    # A0 nci_fbn + bias compensation — interior_only, fold OFF, + --bias_comp.
+    if INCLUDE_NCI_FBN_BC:
+        made.append(_write("A0_nci_fbn_bc", DENSE_8086, A0_EXTRA,
+                           " --scorer per_layer --imp_normalizer mean --bias_comp", shared=SHARED_NOFOLD))
     # CLASSICAL baselines (same harness: 80.86, mac 2G global, KD, no sparse phase). The
     # --scorer override (last-wins over SHARED's propagation) swaps the criterion. These are
     # the controls that should recover — magnitude/bn_scale lack the propagation gutting.
