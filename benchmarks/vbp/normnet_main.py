@@ -375,6 +375,26 @@ def main(argv):
             log_info(f"saved pre-prune checkpoint → {pp}")
         pre_w = _layer_widths(model)            # widths before the structural edit
 
+        # tp_variance ABLATION (old vbp_imagenet_pat criterion): group-L2(both sides) ×
+        # sqrt(conv-OUTPUT activation var). Needs a stats pass on the merged plain model. Build
+        # + collect ONCE (expensive); _imp returns it. DDP: per-rank shards → per-rank var →
+        # divergent masks/hang. Sync self.variance/means across ranks (all-reduce mean) so every
+        # rank ranks identically. imp_normalizer=mean → norm_per_layer=True (the old setting).
+        var_imp = None
+        if args.scorer == "tp_variance":
+            var_imp = tp.importance.VarianceImportance(
+                norm_per_layer=(args.imp_normalizer == "mean"), importance_mode="tp_variance")
+            var_imp.collect_statistics(model, calib_loader, device, max_batches=args.calib_batches)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                ws = torch.distributed.get_world_size()
+                for d in (var_imp.variance, var_imp.means):
+                    for k in list(d.keys()):
+                        t = d[k].detach().clone().contiguous()
+                        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+                        d[k] = t / ws
+            log_info(f"tp_variance: collected activation stats on {len(var_imp.variance)} layers "
+                     f"({args.calib_batches} calib batches), norm_per_layer={var_imp.norm_per_layer}")
+
         # GLOBAL pruning ranks all groups against ONE threshold (base_pruner cats every group's
         # importance). A per-group normalizer ("mean" → each layer forced to mean-1) ERASES the
         # cross-layer scale before that global ranking → reduces global pruning to ~per-layer-
@@ -389,6 +409,8 @@ def main(argv):
                 return tp.importance.GroupMagnitudeImportance(p=2, group_reduction="mean", normalizer=norm)
             if args.scorer == "bn_scale":
                 return tp.importance.BNScaleImportance(normalizer=norm)
+            if args.scorer == "tp_variance":
+                return var_imp                      # prebuilt + stats-collected (old criterion)
             return NormalizedNetImportance(mdl, scores, group_reduction="mean", normalizer=norm)
 
         def _ignored(mdl):
@@ -515,10 +537,11 @@ def parse_args(argv):
     # 3. prune
     p.add_argument("--no_prune", action="store_true")
     p.add_argument("--scorer", default="per_layer",
-                   choices=["per_layer", "propagation", "magnitude", "bn_scale"],
+                   choices=["per_layer", "propagation", "magnitude", "bn_scale", "tp_variance"],
                    help="normnet: per_layer (‖σv‖=√NCI) / propagation (I). classical baselines "
                         "(same harness, no normnet scores): magnitude (group L2) / bn_scale "
-                        "(network-slimming BN γ).")
+                        "(network-slimming BN γ) / tp_variance (OLD vbp_imagenet_pat criterion: "
+                        "group-L2(both sides) × sqrt(conv-output activation var); ABLATION vs nci).")
     p.add_argument("--prop_non_relative", action="store_true",
                    help="propagation: non-relative criterion W̄=M^p (raw product, no column-norm "
                         "→ cross-layer, compounds). Default = relative W̄=M^p·D (within-layer).")

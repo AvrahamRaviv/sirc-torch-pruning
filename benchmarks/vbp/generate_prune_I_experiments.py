@@ -70,6 +70,9 @@ INCLUDE_MAGNITUDE = os.environ.get("INCLUDE_MAGNITUDE", "0") != "0"
 # proven old tp_variance (which did NOT fold BN). Same as A0_nci otherwise (per_layer, mean
 # normalizer, interior_only). DEFAULT ON (the only arm emitted by a bare run).
 INCLUDE_NCI_FBN = os.environ.get("INCLUDE_NCI_FBN", "1") != "0"
+# tp_variance = the OLD vbp_imagenet_pat criterion (group-L2 both-sides × sqrt(conv-output
+# var), no fold, per-layer mean-1). ABLATION vs nci_fbn — same harness, fold OFF. Default off.
+INCLUDE_TP_VARIANCE = os.environ.get("INCLUDE_TP_VARIANCE", "0") != "0"
 
 # Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
@@ -171,6 +174,10 @@ def main():
     if INCLUDE_NCI_FBN:
         made.append(_write("A0_nci_fbn", DENSE_8086, A0_EXTRA,
                            " --scorer per_layer --imp_normalizer mean", shared=SHARED_NOFOLD))
+    # A0 tp_variance — old vbp_imagenet_pat criterion, fold OFF, mean norm. Ablation vs nci_fbn.
+    if INCLUDE_TP_VARIANCE:
+        made.append(_write("A0_tp_variance", DENSE_8086, A0_EXTRA,
+                           " --scorer tp_variance --imp_normalizer mean", shared=SHARED_NOFOLD))
     # CLASSICAL baselines (same harness: 80.86, mac 2G global, KD, no sparse phase). The
     # --scorer override (last-wins over SHARED's propagation) swaps the criterion. These are
     # the controls that should recover — magnitude/bn_scale lack the propagation gutting.
