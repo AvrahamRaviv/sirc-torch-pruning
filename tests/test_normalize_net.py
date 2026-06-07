@@ -1467,14 +1467,14 @@ def test_classifier_seed_pdf_output_importance():
     topo = {"last": []}                      # single terminal
     clf = nn.Linear(feat, classes)
 
-    seed = _classifier_seed(mgr, topo, clf, p=2, relative=True)
+    seed = _classifier_seed(mgr, topo, clf, p=2)
     assert seed is not None and "last" in seed
     assert seed["last"].numel() == feat
     assert float(seed["last"].std()) > 0.0, "seed must be non-uniform (else global pruning guts)"
     # fall-backs → None (caller uses uniform)
-    assert _classifier_seed(mgr, topo, None, 2, True) is None          # no classifier
-    assert _classifier_seed(mgr, topo, nn.Linear(feat + 1, classes), 2, True) is None  # dim mismatch
-    assert _classifier_seed(mgr, {"a": ["b"], "b": []}, clf, 2, True) is None  # >1? no, single terminal "b"
+    assert _classifier_seed(mgr, topo, None, 2) is None          # no classifier
+    assert _classifier_seed(mgr, topo, nn.Linear(feat + 1, classes), 2) is None  # dim mismatch
+    assert _classifier_seed(mgr, {"a": ["b"], "b": []}, clf, 2) is None  # >1? no, single terminal "b"
 
 
 def test_ckpt_bundle_roundtrip_dense_ema_and_pruned():

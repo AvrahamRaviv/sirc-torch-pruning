@@ -296,7 +296,7 @@ def main(argv):
     log_prune_distribution(pre_widths, _layer_widths(model))
 
     # Recalibrate BN running stats: structural pruning invalidates them, so pre-FT eval
-    # reads ~random (the e0≈0.001 we saw) without this. Reuses the proven harness routine.
+    # reads ~random (top-1 ≈ 0.001) without this. Reuses the shared harness routine.
     if not args.no_bn_recalib:
         from torch_pruning.utils.pruning_utils import _recalibrate_bn
         _recalibrate_bn(model, train_loader, device, max_batches=args.calib_batches)

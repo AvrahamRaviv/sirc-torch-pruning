@@ -41,12 +41,12 @@ from torch_pruning.pruner.importance import GroupMagnitudeImportance
 _IN_FNS = (function.prune_conv_in_channels, function.prune_linear_in_channels)
 
 
-def _classifier_seed(mgr, topology, classifier, p, relative):
+def _classifier_seed(mgr, topology, classifier, p):
     """Build the propagation output seed I^o per the PDF: I^L = W̄^fc · 𝟙_classes, NOT a
     uniform-over-features vector. The PDF chain runs to the NETWORK output (the classifier),
     seeded uniform over CLASSES; the terminal feature layer's importance is that uniform
     class-importance propagated back through the classifier. Seeding uniform-over-features
-    instead (the bug) ties every final-stage channel → global pruning guts them.
+    instead ties every final-stage channel uniformly, so global pruning guts that stage.
 
     M^fc[feature, class] = σ_feature · |W_fc[class, feature]|, with σ_feature = the terminal
     layer's per-output-channel std (sigma_out_x). Returns {terminal_name → seed[feat]} or
@@ -70,7 +70,7 @@ def _classifier_seed(mgr, topology, classifier, p, relative):
     Mp = M.pow(p)
     # Column-stochastic (D = 1/col-sum) for BOTH forms — the classifier transfer W̄^fc·𝟙 is
     # the D^L normalizer of the PDF chain; the relative/non-relative split lives in the layer
-    # recursion's inter-layer transfer Σ^{l+1}, not the seed. (`relative` no longer branches here.)
+    # recursion's inter-layer transfer Σ^{l+1}, not the seed.
     Wbar = Mp / Mp.sum(dim=0).clamp(min=1e-8)[None, :]
     num_classes = W.shape[0]
     ones = torch.full((num_classes,), 1.0 / num_classes, device=Wbar.device, dtype=Wbar.dtype)
@@ -86,10 +86,11 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
     mode="propagation" → mgr.propagation_importance() (the §3 global criterion).
         Pass example_inputs to build the residual/DAG topology (build_propagation_topology
         with the SAME p); omit it for a pure sequential walk.
-        `relative` picks the spec's two forms (additions.md §4): True (default) → W̄=M^p·D
-        (columns column-normalized → within-layer/local metric); False → non-relative,
-        W̄=M^p raw product (NO column-norm → cross-layer, compounds with depth). σ_out^p is
-        NOT a per-layer transfer (it weights residual-branch joins only). per_layer ignores it.
+        `relative` picks the spec's two forms (additions.md §4): both share the column-
+        stochastic W̄=M^p·D (D=1/col-sum). True (default) → within-layer/local metric;
+        False → non-relative, which re-injects the per-hop inter-layer transfer σ_post^p
+        (the measured activation gain Σ^{l+1}) before each matmul → cross-layer, but
+        compounds with depth (operator spectral radius ≠ 1). per_layer uses neither.
 
     Returns OrderedDict[name → 1-D tensor], one score per input channel of that layer.
     Must be called before mgr.merge_back().
@@ -105,7 +106,7 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
         # ties → global pruning guts the last stage. None → uniform fallback.
         seed = I_out
         if seed is None and classifier is not None and topo is not None:
-            seed = _classifier_seed(mgr, topo, classifier, p, relative)
+            seed = _classifier_seed(mgr, topo, classifier, p)
         return mgr.propagation_importance(
             I_out=seed, p=p, conv_reduction=conv_reduction,
             on_mismatch=on_mismatch, topology=topo, relative=relative)
@@ -122,8 +123,8 @@ def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
     tracks → propagation_importance is a mean-manager method. The bn (canonical) variant
     has no propagation_importance yet, so guard with a clear error.
 
-    `relative` (propagation only): True → W̄=M^p·D within-layer (default); False → non-
-    relative = raw M^p product (cross-layer, compounds). No per-layer σ_out^p (spec §4).
+    `relative` (propagation only): both forms share W̄=M^p·D; True → within-layer (default);
+    False → non-relative adds the per-hop σ_post^p transfer → cross-layer (spec §4).
     """
     if mode == "propagation" and not hasattr(mgr, "propagation_importance"):
         raise ValueError(

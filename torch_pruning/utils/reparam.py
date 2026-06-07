@@ -68,8 +68,9 @@ class MeanResidualLinear(nn.Module):
 
     Carries a frozen sigma_x buffer (per-input-channel std from calibration). σ does NOT
     enter the forward — it stays a stop-grad factor used only by the pruning score
-    ‖σ·v‖ and the optional λ‖σ·v‖ regularizer. Folding σ into the trainable produces the
-    1/σ² overshoot (the deprecated bn variant).
+    ‖σ·v‖ and the optional λ‖σ·v‖ regularizer. Folding σ directly into a W-trainable
+    (σ-divide) parametrization produces a 1/σ² optimizer-geometry overshoot, which this
+    mean variant avoids by keeping σ out of the forward.
     """
 
     def __init__(self, in_features, out_features, v, m, mu_x, sigma_x=None,
@@ -199,11 +200,11 @@ class MeanResidualConv2d(nn.Module):
 class BNResidualLinear(nn.Module):
     """BN(affine=False) + Linear with mean-residual decomposition.
 
-    Boss spec: normalize input by the LIVE EMA σ (running stat, not batch), trainable
+    Normalize input by the live EMA σ (running stat, not batch). Trainable
     v_tilde = σ_cal·W (σ-scaling applied once at init, then frozen into v_tilde). Forward
     uses the effective-bias trick z = linear(x, v_tilde/σ_run, m − (v_tilde/σ_run)@μ_run)
-    = v_tilde·(x−μ)/σ — equals BN-normalize-then-linear but with RUNNING (EMA) stats so it
-    matches the Conv variant and "keep σ updated with EMA". ‖v_tilde[:,k]‖ = contribution.
+    = v_tilde·(x−μ)/σ — equals BN-normalize-then-linear but with running (EMA) stats so it
+    matches the Conv variant. ‖v_tilde[:,k]‖ = contribution.
     """
 
     def __init__(self, in_features, out_features, v_tilde, m, bn_running_mean,
@@ -222,8 +223,8 @@ class BNResidualLinear(nn.Module):
         self.register_buffer('sigma_out_x', sigma_out_x)
 
     def forward(self, x):
-        # Update EMA running stats in train mode (no grad), then normalize by RUNNING
-        # stats via the effective-bias trick — not batch stats (boss: normalize by EMA σ).
+        # Update EMA running stats in train mode (no grad), then normalize by running
+        # stats via the effective-bias trick — not batch stats.
         if self.training:
             with torch.no_grad():
                 D = x.shape[-1]
@@ -637,8 +638,8 @@ class BaseReparamManager(ABC):
         """Global ‖σ·v‖ distribution across all reparam'd layers (one flat vector).
 
         Returns dict (or {} if inactive) with mean/median/std/min/max and the
-        natural-sparsity fractions frac_below_{0.01,0.1,1.0} — the headline signal
-        for the λ regularization sweep (E4): a growing left tail = induced channel
+        natural-sparsity fractions frac_below_{0.01,0.1,1.0} — the primary signal
+        for the λ regularization sweep: a growing left tail = induced channel
         sparsity. Machine-friendly (all python floats/ints) for metrics.jsonl.
         """
         if not self._reparam_modules:
@@ -1349,7 +1350,7 @@ class MeanResidualManager(BaseReparamManager):
                 # (cancels the pre-activation output variance). They differ ONLY by the
                 # inter-layer transfer Σ^{l+1} = post-act output std^p: relative DROPS it
                 # (within-layer/local — PDF p3); non-relative KEEPS it (D^lΣ^{l+1}=f_j the
-                # measured activation gain → cross-layer). Raw M^p (no D) was a BUG: it
+                # measured activation gain → cross-layer). Raw M^p (no D) is incorrect: it
                 # compounds the σ^l_j it should divide out (∏ col-sum ≪1 → vanish).
                 Mp = M.pow(p)
                 col_sums = Mp.sum(dim=0).clamp(min=eps)        # = σ^l_j^p (pre-act output)
@@ -1557,7 +1558,7 @@ class NormalizedResidualManager(BaseReparamManager):
                          max_batches=max_batches, scale_invariant=scale_invariant,
                          reparam_target=reparam_target)
         self._entropy_lambda = entropy_lambda
-        # σ EMA momentum for the input-normalizing BN (boss: "keep σ updated with EMA").
+        # σ EMA momentum for the input-normalizing BN.
         # 0.1 = torch BN default; slower (e.g. 0.01) for long from-scratch training.
         if not 0.0 <= float(bn_momentum) <= 1.0:
             raise ValueError(f"bn_momentum must be in [0, 1], got {bn_momentum}")
@@ -1625,7 +1626,7 @@ class NormalizedResidualManager(BaseReparamManager):
     def regularization_loss(self):
         """L_{2,1} on Ṽ along self.norm_dim. Ṽ=σW operates on unit-variance normalized
         input, so ‖Ṽ‖ IS the contribution score — this is plain magnitude pruning on the
-        normalized net (boss recap #6), no separate σ factor needed."""
+        normalized net, no separate σ factor needed."""
         loss = torch.tensor(0.0, device=self.device)
         for reparam in self._reparam_modules.values():
             norms = _channel_group_norm(reparam.v_tilde, self.norm_dim)

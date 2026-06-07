@@ -12,7 +12,7 @@ prune_e2 / generate_e2_experiments. So this set tests the TRAINING-side theory:
         vnorm_summary.frac_below_0.1 grow in <tag>_metrics.jsonl as λ rises.
 
 KD teacher = the frozen pretrained net (built inside normalize_net, no --teacher flag).
-σ EMA kept slow via --norm_bn_momentum (boss: "keep σ updated with EMA").
+σ EMA kept slow via --norm_bn_momentum.
 
 >>> ASSUMPTIONS to eyeball before submit (top constants): EPOCHS, LR, WARMUP. <<<
 This is a FT of a converged net (not prune-recovery), so moderate lr + short cosine.

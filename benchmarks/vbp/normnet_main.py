@@ -17,7 +17,7 @@ Four optional steps (skip any with its epochs/flag):
   4. FINE-TUNE    regular post-prune recovery (plain net, plain WD)
 
 Examples
-  # zero-shot §7 demo: train from scratch, normalize, fine-tune in normalized coords
+  # zero-shot: train from scratch, normalize, fine-tune in normalized coords
   python normnet_main.py --cnn_arch resnet50 --data_path <in1k> \
     --epochs_train 90 --lr_train 0.1 --epochs_norm_ft 0 --no_prune --epochs_ft 0
 

@@ -67,24 +67,24 @@ from torch_pruning.utils.reparam import (
 def build_reparam_manager(model, layer_names, device, args):
     """Construct the reparam manager for the chosen --reparam_variant.
 
-    CANONICAL — bn (the "BN trick", boss spec): normalize input by the LIVE EMA σ
+    CANONICAL — bn (the "BN trick"): normalize input by the live EMA σ
         (BN(affine=False), running stats), trainable v_tilde = σ_cal·W (σ-scaling applied
         ONCE at init, frozen into v_tilde), fold μ into the bias. ‖v_tilde‖ = the
         contribution score, so plain weight-decay on v_tilde = the pruning regularizer.
         Gradient w.r.t v_tilde is on unit-variance normalized input → well-scaled (no
-        1/σ² overshoot; that earlier diagnosis assumed a W-trainable / σ-divide impl,
+        1/σ² overshoot — that applies to a W-trainable / σ-divide parametrization,
         not this v_tilde-trainable one). bn_momentum controls the σ EMA.
 
     ABLATION — mean: trainable v = W, forward v·(x−μ) + m. σ is ABSENT from the forward
         (input not normalized); σ only a detached factor in the ‖σ·v‖ score / aux reg.
-        Use to ablate the input-normalization; not the boss spec.
+        Use to ablate the input-normalization; not the canonical variant.
     """
     lam = float(getattr(args, "reparam_lambda", 0.0))
     variant = getattr(args, "reparam_variant", "bn")
     if variant == "mean":
         mu_ema = float(getattr(args, "mu_ema_momentum", 0.0))
         log_info("--reparam_variant=mean (ABLATION): σ NOT in the forward, input not "
-                 "normalized — σ is only a detached score factor. Boss spec is the BN "
+                 "normalized — σ is only a detached score factor. Canonical is the BN "
                  "trick (--reparam_variant=bn): normalize input by live-EMA σ + trainable "
                  "v_tilde=σW. Use mean only to ablate input-normalization.")
         return MeanResidualManager(
@@ -668,7 +668,7 @@ def parse_args():
                         help="Baseline arm: plain training, skip normalization")
     parser.add_argument("--reparam_variant", default="bn", choices=["mean", "bn"],
                         help="Reparam parametrization (normalized arm). 'bn' (default, "
-                             "CANONICAL = boss's BN trick): normalize input by live-EMA σ, "
+                             "CANONICAL BN trick): normalize input by live-EMA σ, "
                              "trainable v_tilde=σ·W (σ frozen-in at init), μ folded to bias; "
                              "‖v_tilde‖ = contribution score, WD on it = pruning reg. "
                              "'mean' (ABLATION): trainable v=W, forward v·(x−μ)+m, σ absent "

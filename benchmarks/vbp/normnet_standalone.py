@@ -596,7 +596,7 @@ def main():
     example_inputs = torch.randn(1, 3, 224, 224, device=device)
 
     # fold native BN into the preceding Conv/Linear BEFORE scoring: bakes γ/σ_run into the
-    # weight so M is honest and the chain is pure Conv/Linear (boss's "fold BN back").
+    # weight so M is honest and the chain is pure Conv/Linear (fold BN back).
     # Function-preserving -> logits must be unchanged.
     model.eval()
     ref = model(example_inputs).detach().clone()
