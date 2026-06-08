@@ -144,6 +144,26 @@ def _ignored_layers(model, model_type, interior_only=False):
     return ig
 
 
+def _bias_comp_target_layers(model, model_type, ex):
+    """(producer_module, post_act_fn) pairs for bias-compensation μ collection.
+
+    bias_comp's correction E[Δy]=W[:,c]·μ_c needs μ = the CONSUMER's input mean, which is the
+    producer's output AFTER its activation (ReLU/GELU) — NOT the raw pre-activation output that
+    plain collect_activation_means returns. VarianceImportance applies post_act_fn in-hook and
+    keys means by the producer module (= the pruner group root _apply_compensation looks up).
+    Mirrors vbp_imagenet. convnext: (pwconv1, GELU) — plain act, NO NHWC→NCHW permute (the
+    current isinstance(Linear) hook reads channels from the LAST dim, so a permute would misread
+    spatial as channels). cnn: walk the DG to compose each conv's BN+activation."""
+    if model_type == "convnext":
+        return [(blk.pwconv1, blk.act) for stage in model.stages for blk in stage]
+    if model_type == "vit":
+        return [(b.intermediate.dense, b.intermediate.intermediate_act_fn)
+                for b in model.vit.encoder.layer]
+    from torch_pruning.pruner.importance import build_cnn_target_layers
+    dg = tp.DependencyGraph().build_dependency(model, example_inputs=ex)
+    return build_cnn_target_layers(model, dg)
+
+
 def _layer_widths(model):
     """name → output width (out_channels / out_features) for every Conv2d / Linear."""
     w = {}
@@ -496,23 +516,25 @@ def main(argv):
         # Bias compensation: removing input channel c shifts each consumer's output by
         # E[Δy]=W[:,c]·μ_c. Adding that to the consumer bias BEFORE pruning preserves the
         # expected output (base_pruner._apply_compensation, auto-applied when mean_dict set).
-        # μ = per-channel activation mean on calib data. Reuse tp_variance's already-collected
-        # (and DDP-synced) means; else collect + all-reduce so every rank edits biases identically.
+        # μ MUST be the consumer's INPUT mean = the producer's output AFTER its activation
+        # (ReLU/GELU), keyed by the producer (the group root). Collect with post-act target_layers
+        # (like vbp_imagenet) — NOT raw collect_activation_means (pre-act → wrong reference; on a
+        # BN-free net like convnext nothing absorbs the error → corrupted biases, acc≈0).
         mean_dict = None
         if args.bias_comp:
-            if var_imp is not None and var_imp.means:
-                mean_dict = dict(var_imp.means)
-            else:
-                from torch_pruning.pruner.importance import collect_activation_means
-                mean_dict = collect_activation_means(
-                    model, calib_loader, device, max_batches=args.calib_batches)
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    ws = torch.distributed.get_world_size()
-                    for k in list(mean_dict.keys()):
-                        t = mean_dict[k].detach().to(device).contiguous()   # NCCL needs CUDA
-                        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
-                        mean_dict[k] = t / ws
-            log_info(f"bias_comp: activation means on {len(mean_dict)} layers "
+            from torch_pruning.pruner.importance import VarianceImportance
+            tl = _bias_comp_target_layers(model, args.model_type, ex)
+            vi_bc = VarianceImportance()
+            vi_bc.collect_statistics(model, calib_loader, device,
+                                     target_layers=tl, max_batches=args.calib_batches)
+            mean_dict = dict(vi_bc.means)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                ws = torch.distributed.get_world_size()
+                for k in list(mean_dict.keys()):
+                    t = mean_dict[k].detach().to(device).contiguous()   # NCCL needs CUDA
+                    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+                    mean_dict[k] = t / ws
+            log_info(f"bias_comp: post-activation means on {len(mean_dict)} layers "
                      f"({args.calib_batches} calib batches)")
 
         # GLOBAL pruning ranks all groups against ONE threshold (base_pruner cats every group's

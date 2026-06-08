@@ -123,17 +123,15 @@ INCLUDE_PROP_SIGMAC = os.environ.get("INCLUDE_PROP_SIGMAC", "1") != "0"
 # 4 cells: base / cov / σ_c / both.
 INCLUDE_NONREL_2X2 = os.environ.get("INCLUDE_NONREL_2X2", "1") != "0"
 
-# convnext: most default-ON arms are invalid here. fold_native_bn is a no-op (no Conv-BN);
-# bias_comp references the producer's PRE-activation output mean and relies on a post-consumer
-# BN to absorb it (resnet) — convnext has no BN, so the offset corrupts biases → pre-FT acc ~0.
-# propagation arms need the residual topology (the known cross-layer dead-end). Keep only the
-# valid one-hop scorers: nci, nci_cov, tp_variance, magnitude. Force ON plain nci (the no-bc
-# per_layer baseline) so the comparison is complete.
+# convnext: prune only the valid one-hop scorers. bias_comp now collects POST-activation μ
+# (normnet_main _bias_comp_target_layers, the vbp_imagenet recipe) so it works on BN-free
+# convnext too. fold_native_bn is a harmless no-op (no Conv-BN). Gated OFF: nci_cov_full
+# (== nci_cov here, no interior_only distinction) and the propagation arms (the known
+# cross-layer dead-end + residual-topology risk). Force ON plain nci (the no-bc baseline).
 if IS_CONVNEXT:
     INCLUDE_NCI = True
-    INCLUDE_NCI_FBN = INCLUDE_NCI_FBN_FULL = INCLUDE_NCI_FBN_BC = False
-    INCLUDE_NCI_FBN_BC_NOBN = INCLUDE_NCI_FBN_BC_NONORM = False
-    INCLUDE_NCI_COV_FULL = False          # == nci_cov on convnext (no interior_only distinction)
+    INCLUDE_NCI_FBN = INCLUDE_NCI_FBN_FULL = False          # fold is a no-op on convnext
+    INCLUDE_NCI_COV_FULL = False                            # == nci_cov on convnext
     INCLUDE_NONREL_NORM = INCLUDE_PROP_SIGMAC = INCLUDE_NONREL_2X2 = False
 
 # Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
