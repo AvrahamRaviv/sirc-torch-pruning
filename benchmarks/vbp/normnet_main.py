@@ -167,17 +167,25 @@ def compute_nci_cov_scores(model, loader, device, max_batches=50):
     and space. Returns {consumer_name: per-input-channel score} for NormalizedNetImportance —
     these score the consumer's INPUTS = the producer's pruned OUTPUT channels.
     """
+    # Prunable consumers only: Linear, or dense (groups==1) Conv2d. Depthwise convs
+    # (groups != 1) are NOT consumers of a pruned producer channel (their weight has 1
+    # input channel/group → no C×C Gram) and are skipped by build_whole_net_reparam_layers
+    # too. Including them → M (1×1) vs cov (C×C) shape crash.
     targets = {n: m for n, m in model.named_modules()
-               if isinstance(m, (torch.nn.Conv2d, torch.nn.Linear)) and
-               (m.in_channels if isinstance(m, torch.nn.Conv2d) else m.in_features) > 1}
+               if (isinstance(m, torch.nn.Linear) and m.in_features > 1)
+               or (isinstance(m, torch.nn.Conv2d) and m.groups == 1 and m.in_channels > 1)}
     acc = {n: None for n in targets}          # [sum_AtA (C×C), sum_A (C), count]
     name_of = {m: n for n, m in targets.items()}
 
     def hook(mod, inp):
+        # Dispatch on module TYPE, not tensor ndim: convnext feeds its pwconv (Linear) a 4D
+        # channels-LAST (N,H,W,C) tensor — channel is the LAST dim, not dim 1. A conv's input
+        # is channels-FIRST (N,C,H,W). Keying off x.dim()==4 misreads the Linear's spatial dim
+        # as channels (the 96-vs-56 mismatch).
         x = inp[0].detach()
-        if x.dim() == 4:                      # conv (N,C,H,W) → (N*H*W, C)
+        if isinstance(mod, torch.nn.Conv2d):  # channels-first (N,C,H,W) → (N*H*W, C)
             a = x.permute(0, 2, 3, 1).reshape(-1, x.shape[1])
-        else:                                 # linear (N,...,C) → (-1, C)
+        else:                                 # Linear: channel = last dim (handles (N,C) and (N,H,W,C))
             a = x.reshape(-1, x.shape[-1])
         a = a.float()
         n = name_of[mod]
