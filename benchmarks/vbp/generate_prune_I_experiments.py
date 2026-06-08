@@ -123,6 +123,19 @@ INCLUDE_PROP_SIGMAC = os.environ.get("INCLUDE_PROP_SIGMAC", "1") != "0"
 # 4 cells: base / cov / σ_c / both.
 INCLUDE_NONREL_2X2 = os.environ.get("INCLUDE_NONREL_2X2", "1") != "0"
 
+# convnext: most default-ON arms are invalid here. fold_native_bn is a no-op (no Conv-BN);
+# bias_comp references the producer's PRE-activation output mean and relies on a post-consumer
+# BN to absorb it (resnet) — convnext has no BN, so the offset corrupts biases → pre-FT acc ~0.
+# propagation arms need the residual topology (the known cross-layer dead-end). Keep only the
+# valid one-hop scorers: nci, nci_cov, tp_variance, magnitude. Force ON plain nci (the no-bc
+# per_layer baseline) so the comparison is complete.
+if IS_CONVNEXT:
+    INCLUDE_NCI = True
+    INCLUDE_NCI_FBN = INCLUDE_NCI_FBN_FULL = INCLUDE_NCI_FBN_BC = False
+    INCLUDE_NCI_FBN_BC_NOBN = INCLUDE_NCI_FBN_BC_NONORM = False
+    INCLUDE_NCI_COV_FULL = False          # == nci_cov on convnext (no interior_only distinction)
+    INCLUDE_NONREL_NORM = INCLUDE_PROP_SIGMAC = INCLUDE_NONREL_2X2 = False
+
 # Option B (reuse pre-regularized RN_bn vnr ckpts) is OFF by default: all the RN_bn sparse
 # ckpts were lost/corrupted. Re-enable with INCLUDE_OPTION_B=1 once a valid vnr ckpt exists
 # (edit RN_CKPTS to point at it). Until then only Option A (self-contained from 80.86) runs.
