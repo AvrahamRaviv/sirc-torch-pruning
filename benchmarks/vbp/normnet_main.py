@@ -144,16 +144,16 @@ def _ignored_layers(model, model_type, interior_only=False):
     return ig
 
 
-def _bias_comp_target_layers(model, model_type, ex):
-    """(producer_module, post_act_fn) pairs for bias-compensation μ collection.
+def _post_act_target_layers(model, model_type, ex):
+    """(producer_module, post_act_fn) pairs for POST-ACTIVATION stats collection — shared by
+    tp_variance (the criterion's sqrt(output var)) and bias_comp (μ = consumer input mean).
 
-    bias_comp's correction E[Δy]=W[:,c]·μ_c needs μ = the CONSUMER's input mean, which is the
-    producer's output AFTER its activation (ReLU/GELU) — NOT the raw pre-activation output that
-    plain collect_activation_means returns. VarianceImportance applies post_act_fn in-hook and
-    keys means by the producer module (= the pruner group root _apply_compensation looks up).
-    Mirrors vbp_imagenet. convnext: (pwconv1, GELU) — plain act, NO NHWC→NCHW permute (the
-    current isinstance(Linear) hook reads channels from the LAST dim, so a permute would misread
-    spatial as channels). cnn: walk the DG to compose each conv's BN+activation."""
+    Both need the producer's output AFTER its activation (ReLU/GELU), keyed by the producer
+    (= the pruner group root). Without target_layers, collect_statistics hooks the RAW
+    pre-activation output → wrong variance / wrong μ → ranking + compensation diverge from the
+    proven vbp_imagenet_pat behavior. convnext: (pwconv1, GELU) — plain act, NO NHWC→NCHW
+    permute (the current isinstance(Linear) hook reads channels from the LAST dim, so a permute
+    would misread spatial as channels). cnn: walk the DG to compose each conv's BN+activation."""
     if model_type == "convnext":
         return [(blk.pwconv1, blk.act) for stage in model.stages for blk in stage]
     if model_type == "vit":
@@ -486,7 +486,12 @@ def main(argv):
         if args.scorer == "tp_variance":      # per _imp call so it survives _ratio_for_mac's copies
             var_imp = tp.importance.VarianceImportance(
                 norm_per_layer=(args.imp_normalizer == "mean"), importance_mode="tp_variance")
-            var_imp.collect_statistics(model, calib_loader, device, max_batches=args.calib_batches)
+            # POST-activation output variance (the proven vbp_imagenet_pat criterion). Without
+            # target_layers collect_statistics hooks the raw pre-activation output → different
+            # ranking → different prune distribution → bad retention (convnext esp.).
+            var_imp.collect_statistics(model, calib_loader, device,
+                                       target_layers=_post_act_target_layers(model, args.model_type, ex),
+                                       max_batches=args.calib_batches)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 ws = torch.distributed.get_world_size()
                 for d in (var_imp.variance, var_imp.means):
@@ -523,7 +528,7 @@ def main(argv):
         mean_dict = None
         if args.bias_comp:
             from torch_pruning.pruner.importance import VarianceImportance
-            tl = _bias_comp_target_layers(model, args.model_type, ex)
+            tl = _post_act_target_layers(model, args.model_type, ex)
             vi_bc = VarianceImportance()
             vi_bc.collect_statistics(model, calib_loader, device,
                                      target_layers=tl, max_batches=args.calib_batches)
