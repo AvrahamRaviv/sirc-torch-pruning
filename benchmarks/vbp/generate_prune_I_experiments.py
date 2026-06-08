@@ -40,16 +40,26 @@ Run:
 import os
 import stat
 
-BASE_OUT = os.environ.get("PRUNE_BASE_OUT", "/algo/NetOptimization/outputs/NORMNET/ResNet50")
+# MODEL switch: resnet50 (default, MAC-target / 32-group scope) or convnext_tiny (MLP-only,
+# keep_ratio scope, adamw FT — mirrors the proven vbp_imagenet_pat convnext recipe).
+MODEL = os.environ.get("MODEL", "resnet50")
+IS_CONVNEXT = MODEL == "convnext_tiny"
+
+_DEFAULT_BASE_OUT = ("/algo/NetOptimization/outputs/NORMNET/ConvNeXt_tiny" if IS_CONVNEXT
+                     else "/algo/NetOptimization/outputs/NORMNET/ResNet50")
+BASE_OUT = os.environ.get("PRUNE_BASE_OUT", _DEFAULT_BASE_OUT)
 REPO = os.environ.get("EXP_REPO", "/home/avrahamra/PycharmProjects/sirc-torch-pruning")
 NORMNET = f"{REPO}/benchmarks/vbp/normnet_main.py"
 DATA = "/algo/NetOptimization/outputs/VBP/"
 NPROC = int(os.environ.get("EXP_NPROC", "4"))
 
-DENSE_8086 = os.environ.get(
-    "CKPT", "/algo/NetOptimization/outputs/VBP/ResNet50_TP/resnet50_imagenet1k.pth")
-MAC_TARGET_G = float(os.environ.get("MAC_TARGET_G", "2.0"))   # GMAC budget
-FT = int(os.environ.get("FT_EPOCHS", "30"))                    # post-prune FT (DDP)
+_DEFAULT_CKPT = ("/algo/NetOptimization/outputs/VBP/ConvNeXt_tiny_TP/convnext_tiny_22k_1k_224.pth"
+                 if IS_CONVNEXT
+                 else "/algo/NetOptimization/outputs/VBP/ResNet50_TP/resnet50_imagenet1k.pth")
+DENSE_8086 = os.environ.get("CKPT", _DEFAULT_CKPT)
+MAC_TARGET_G = float(os.environ.get("MAC_TARGET_G", "2.0"))   # GMAC budget (resnet)
+CN_PRUNE_RATIO = float(os.environ.get("CN_PRUNE_RATIO", "0.05"))  # convnext: keep_ratio 0.95
+FT = int(os.environ.get("FT_EPOCHS", "40" if IS_CONVNEXT else "30"))   # post-prune FT (DDP)
 A_REG = int(os.environ.get("A_REG_EPOCHS", "10"))             # Option A λ-reg norm-ft epochs
 A_LAMBDA = os.environ.get("A_LAMBDA", "1e-4")                 # λ on ‖ṽ‖ (sweepable)
 A_MU_EMA = os.environ.get("A_MU_EMA", "0.1")                  # σ/μ EMA momentum → LIVE σ in reg
@@ -144,15 +154,29 @@ INTERIOR_ONLY = os.environ.get("INTERIOR_ONLY", "1") != "0"
 #   SHARED_BASE   = no fold, no interior_only (full scope, BN unfolded)
 #   SHARED_NOFOLD = SHARED_BASE + interior_only (when INTERIOR_ONLY) — the fbn arm's base
 #   SHARED        = SHARED_NOFOLD + fold (when FOLD_BN)              — the default arms' base
-SHARED_BASE = (
-    f"--model_type cnn --cnn_arch resnet50 --data_path {DATA} --reparam_variant mean "
-    f"--scorer propagation --global_pruning --mac_target_g {MAC_TARGET_G} --max_prune_ratio 0.8 "
-    f"--calib_batches 50 "
-    f"--epochs_ft {FT} --lr_ft 2e-2 --wd 1e-4 --momentum 0.9 --use_kd --kd_alpha 0.5 "
-    f"--kd_T 2.0 --train_batch_size 128 --val_resize 232"
-)
-SHARED_NOFOLD = SHARED_BASE + (" --interior_only" if INTERIOR_ONLY else "")
-SHARED = SHARED_NOFOLD + (" --fold_native_bn" if FOLD_BN else "")
+if IS_CONVNEXT:
+    # convnext: MLP-only scope is automatic (_ignored_layers convnext branch) → no interior_only;
+    # no native Conv-BN → no fold. Prune by keep_ratio (0.95 → pruning_ratio 0.05), adamw FT.
+    # Mirrors the working vbp_imagenet_pat convnext command (kd_alpha 0 = CE only).
+    SHARED_BASE = (
+        f"--model_type convnext --model_name convnext_tiny --data_path {DATA} --reparam_variant mean "
+        f"--scorer propagation --global_pruning --pruning_ratio {CN_PRUNE_RATIO} "
+        f"--calib_batches 50 "
+        f"--epochs_ft {FT} --opt adamw --lr_ft 1e-4 --wd 0 --ft_warmup_epochs 3 --ft_eta_min 2e-5 "
+        f"--use_kd --kd_alpha 0.0 --kd_T 4.0 --train_batch_size 128"
+    )
+    SHARED_NOFOLD = SHARED_BASE      # no interior_only for convnext
+    SHARED = SHARED_BASE             # no native BN to fold
+else:
+    SHARED_BASE = (
+        f"--model_type cnn --cnn_arch resnet50 --data_path {DATA} --reparam_variant mean "
+        f"--scorer propagation --global_pruning --mac_target_g {MAC_TARGET_G} --max_prune_ratio 0.8 "
+        f"--calib_batches 50 "
+        f"--epochs_ft {FT} --lr_ft 2e-2 --wd 1e-4 --momentum 0.9 --use_kd --kd_alpha 0.5 "
+        f"--kd_T 2.0 --train_batch_size 128 --val_resize 232"
+    )
+    SHARED_NOFOLD = SHARED_BASE + (" --interior_only" if INTERIOR_ONLY else "")
+    SHARED = SHARED_NOFOLD + (" --fold_native_bn" if FOLD_BN else "")
 # Option B: load vnr, no reg recompute (already 30-ep trained).
 B_EXTRA = "--epochs_train 0 --epochs_norm_ft 0"
 # Option A (THE thesis test): dense 80.86 → λ-reg norm-ft (push low-contribution ‖ṽ‖→0 so the
@@ -168,7 +192,11 @@ A0_EXTRA = "--epochs_train 0 --epochs_norm_ft 0"
 REL_VARIANTS = [("rel", "")] + ([("nonrel", " --prop_non_relative")] if INCLUDE_NONREL else [])
 
 
+TAG_PREFIX = "cn_" if IS_CONVNEXT else ""
+
+
 def _write(tag, ckpt, extra, rflag, shared=SHARED):
+    tag = TAG_PREFIX + tag
     out_dir = os.path.join(BASE_OUT, tag)
     os.makedirs(out_dir, exist_ok=True)
     line = (f"python3 -m torch.distributed.launch --nproc_per_node={NPROC} {NORMNET} "
