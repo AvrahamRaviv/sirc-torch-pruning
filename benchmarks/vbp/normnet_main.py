@@ -404,6 +404,11 @@ def main(argv):
                  f"(function-preserving — should match pre-fold)")
 
     # -- 2. NORMALIZE (one-shot transform) ----------------------------------------------
+    # Classical baselines (magnitude / variance=VBP / tp_variance / bn_scale) must score the
+    # ORIGINAL net. The normalize transform scales weights to v_tilde=σW → magnitude-on-σW IS
+    # NCI, not true magnitude; and reparam→merge_back is not bit-exact on a BN-free residual net
+    # (convnext) → perturbs the baseline. Skip the transform for these scorers entirely.
+    do_normalize = args.scorer not in ("magnitude", "variance", "tp_variance", "bn_scale")
     names = build_whole_net_reparam_layers(
         model, exclude_classifier=True, exclude_stem=args.exclude_stem)
     args.max_batches = args.calib_batches
@@ -411,22 +416,27 @@ def main(argv):
     # Calibrate σ/μ on CLEAN center-crop images, NOT the augmented train loader (scale-0.08
     # RandomResizedCrop distorts σ — and σ defines the normalized weight every score uses).
     calib_loader = build_calib_loader(args, use_ddp=use_ddp)
-    mgr.reparameterize(calib_loader)            # post-act BN(affine=False) + v_tilde=σW
-    if use_ddp:
-        from normalize_net import _broadcast_model_state
-        _broadcast_model_state(model)
-    acc, _ = validate(model, val_loader, device, args.model_type)
-    log_info(f"NORMALIZE: {len(names)} layers, post-transform acc={acc:.4f} "
-             f"(function-preserving — should match post-train)")
+    if do_normalize:
+        mgr.reparameterize(calib_loader)            # post-act BN(affine=False) + v_tilde=σW
+        if use_ddp:
+            from normalize_net import _broadcast_model_state
+            _broadcast_model_state(model)
+        acc, _ = validate(model, val_loader, device, args.model_type)
+        log_info(f"NORMALIZE: {len(names)} layers, post-transform acc={acc:.4f} "
+                 f"(function-preserving — should match post-train)")
+    else:
+        log_info(f"classical scorer ({args.scorer}): SKIP normalize transform — "
+                 f"prune original net (no reparam to norm form)")
 
     # -- 2b. optional FT in normalized coordinates (train v_tilde; WD on σW = contrib reg)
     # Bracket the reg phase with ‖ṽ‖ snapshots → the delta = how much λ-reg made channels
     # prunable (contribution pushed toward 0). Only meaningful when a reg phase actually runs.
-    reg_active = args.epochs_norm_ft > 0
+    reg_active = do_normalize and args.epochs_norm_ft > 0
     if reg_active:
         log_contribution_norms(mgr, args, "pre_reg")
-    _run_phase(model, mgr, loaders, args, device, use_ddp,
-               epochs=args.epochs_norm_ft, lr=args.lr_norm_ft, tag="NORM-FT", teacher=teacher)
+    if do_normalize:
+        _run_phase(model, mgr, loaders, args, device, use_ddp,
+                   epochs=args.epochs_norm_ft, lr=args.lr_norm_ft, tag="NORM-FT", teacher=teacher)
     if reg_active:
         log_contribution_norms(mgr, args, "post_reg")
 
@@ -465,7 +475,8 @@ def main(argv):
         else:
             log_info(f"classical scorer ({args.scorer}) — stock tp importance, no normnet scores")
 
-        mgr.merge_back()                        # back to plain modules for the tp pruner
+        if do_normalize:
+            mgr.merge_back()                    # back to plain modules for the tp pruner
         # Save the pre-prune (post-norm-ft, merged) DENSE net so a prune+FT can be retried
         # without redoing training: --checkpoint <preprune> --epochs_norm_ft 0.
         if is_main() and not args.no_save_preprune:
