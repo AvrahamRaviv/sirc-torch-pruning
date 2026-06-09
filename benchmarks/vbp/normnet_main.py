@@ -483,9 +483,11 @@ def main(argv):
         # rank ranks identically. imp_normalizer=mean → norm_per_layer=True (the old setting).
         var_imp = None
         var_stats_by_name = None              # tp_variance: {name: (variance, means)} — rebind
-        if args.scorer == "tp_variance":      # per _imp call so it survives _ratio_for_mac's copies
+        if args.scorer in ("tp_variance", "variance"):  # per _imp call so it survives _ratio_for_mac's copies
+            # scorer "variance" = ORIGINAL VBP paper criterion = pure activation variance σ²
+            # (no weight term). scorer "tp_variance" = group-L2(both sides) × σ.
             var_imp = tp.importance.VarianceImportance(
-                norm_per_layer=(args.imp_normalizer == "mean"), importance_mode="tp_variance")
+                norm_per_layer=(args.imp_normalizer == "mean"), importance_mode=args.scorer)
             # POST-activation output variance (the proven vbp_imagenet_pat criterion). Without
             # target_layers collect_statistics hooks the raw pre-activation output → different
             # ranking → different prune distribution → bad retention (convnext esp.).
@@ -504,7 +506,7 @@ def main(argv):
             for nm, m in model.named_modules():
                 if m in var_imp.variance:
                     var_stats_by_name[nm] = (var_imp.variance[m], var_imp.means.get(m))
-            log_info(f"tp_variance: collected activation stats on {len(var_imp.variance)} layers "
+            log_info(f"{args.scorer}: collected activation stats on {len(var_imp.variance)} layers "
                      f"({args.calib_batches} calib batches), norm_per_layer={var_imp.norm_per_layer}")
 
         # nci_cov: covariance-aware NCI. Hook every Conv2d/Linear, accumulate channel covariance
@@ -556,12 +558,12 @@ def main(argv):
                 return tp.importance.GroupMagnitudeImportance(p=2, group_reduction="mean", normalizer=norm)
             if args.scorer == "bn_scale":
                 return tp.importance.BNScaleImportance(normalizer=norm)
-            if args.scorer == "tp_variance":
+            if args.scorer in ("tp_variance", "variance"):
                 # Rebind the collected stats onto THIS model's modules (mdl may be a
                 # _ratio_for_mac deepcopy → different module objects, same names). Without this
                 # the lookup misses → uniform ones → degenerate global threshold → ratio≈0.
                 vi = tp.importance.VarianceImportance(
-                    norm_per_layer=var_imp.norm_per_layer, importance_mode="tp_variance")
+                    norm_per_layer=var_imp.norm_per_layer, importance_mode=args.scorer)
                 for nm, m in mdl.named_modules():
                     if nm in var_stats_by_name:
                         var, mean = var_stats_by_name[nm]
@@ -703,7 +705,7 @@ def parse_args(argv):
     p.add_argument("--no_prune", action="store_true")
     p.add_argument("--scorer", default="per_layer",
                    choices=["per_layer", "propagation", "magnitude", "bn_scale", "tp_variance",
-                            "nci_cov"],
+                            "variance", "nci_cov"],
                    help="normnet: per_layer (‖σv‖=√NCI) / propagation (I). classical baselines "
                         "(same harness, no normnet scores): magnitude (group L2) / bn_scale "
                         "(network-slimming BN γ) / tp_variance (OLD vbp_imagenet_pat criterion: "
