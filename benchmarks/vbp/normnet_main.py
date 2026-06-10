@@ -109,6 +109,27 @@ def _classifier(model):
     return None
 
 
+def _propagation_branch_scale(model):
+    """Per-channel scale between a residual branch's output and its add, for the
+    propagation topology's join shares (PDF σ_a^p/(σ_a^p+σ_b^p) needs σ AT the add).
+
+    ConvNeXt: x = input + gamma * pwconv2(...) — layer-scale gamma (init 1e-6, trained
+    per-channel) sits AFTER pwconv2, whose sigma_out_x is measured PRE-gamma. Without
+    this, branch shares are skewed by relative gamma^p across blocks. Detect by module
+    shape (has both a per-channel `gamma` Parameter and a `pwconv2` child) so it works
+    on the reparam'd model too (pwconv2 swapped in place, gamma untouched).
+
+    Returns {pwconv2_dotted_name → |gamma|} or None (resnet etc. — when native BN is
+    folded pre-reparam, sigma_out_x already includes it; nothing else sits before the add).
+    """
+    scale = {}
+    for name, mod in model.named_modules():
+        g = getattr(mod, "gamma", None)
+        if isinstance(g, torch.nn.Parameter) and g.dim() == 1 and hasattr(mod, "pwconv2"):
+            scale[f"{name}.pwconv2"] = g.detach().abs()
+    return scale or None
+
+
 def _ignored_layers(model, model_type, interior_only=False):
     """Layers the global pruner must NOT touch.
 
@@ -452,11 +473,17 @@ def main(argv):
             # PDF seed: propagation runs to the classifier (I^o = 𝟙 over classes, back through
             # W̄^fc) → final-stage features get real importance instead of a uniform tie.
             clf = _classifier(model)
+            # ConvNeXt layer-scale gamma sits between pwconv2 and the residual add —
+            # fold it into the join branch shares (σ at the add, per the PDF).
+            bscale = _propagation_branch_scale(model) if args.scorer == "propagation" else None
+            if bscale:
+                log_info(f"propagation: branch_out_scale (layer-scale gamma) on {len(bscale)} branches")
             scores = extract_normnet_scores(
                 mgr, args.scorer, example_inputs=(ex if args.scorer == "propagation" else None),
                 relative=not args.prop_non_relative, classifier=clf,
                 use_measured_sigma_c=args.skip_sigma_c,
-                use_measured_var=args.prop_measured_var)
+                use_measured_var=args.prop_measured_var,
+                branch_out_scale=bscale)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 for k in list(scores.keys()):
                     t = scores[k].contiguous()
@@ -725,8 +752,11 @@ def parse_args(argv):
                         "2Σ_k M_ck Σ_ck − M_cc Σ_cc (M=weight Gram, Σ=channel cov); NCI is its "
                         "independence approximation (off-diagonal Σ dropped).")
     p.add_argument("--prop_non_relative", action="store_true",
-                   help="propagation: non-relative criterion W̄=M^p (raw product, no column-norm "
-                        "→ cross-layer, compounds). Default = relative W̄=M^p·D (within-layer).")
+                   help="propagation: non-relative column norm D=1/σ_pre^p (PDF steps 7-8) "
+                        "instead of column-stochastic D=1/Σ_iM^p. NOTE: for p=2 (the only "
+                        "exponent wired here) the two are IDENTICAL (PDF: 'variance propagation "
+                        "yields the same relative importance criterion for p=2') — this flag is "
+                        "a NO-OP and kept only for arm-name compatibility.")
     p.add_argument("--skip_sigma_c", action="store_true",
                    help="propagation: at residual joins use the MEASURED post-add std σ_c as the "
                         "branch-weight denominator (PDF σ_c^p/(σ_a^p+σ_b^p) skip factor) instead of "
@@ -742,11 +772,15 @@ def parse_args(argv):
                         "binary-search the global ratio that hits it. 0 = use ratio.")
     p.add_argument("--global_pruning", action="store_true")
     p.add_argument("--imp_normalizer", default="none",
-                   choices=["none", "mean", "max", "sum", "standarization", "gaussian"],
+                   choices=["none", "mean", "max", "sum", "standarization", "gaussian", "width"],
                    help="per-group importance normalizer (applied BEFORE the global threshold). "
                         "Default 'none' = keep raw cross-layer-comparable scores (REQUIRED for "
                         "global pruning + the propagation criterion). 'mean' = old behavior "
-                        "(per-layer mean-1 → global pruning collapses to per-layer-uniform).")
+                        "(per-layer mean-1 → global pruning collapses to per-layer-uniform). "
+                        "'width' = score × layer width: undoes the 1/width per-channel dilution "
+                        "of the mass-conserving (column-stochastic) propagation score while "
+                        "KEEPING the cross-layer mass signal — the fix for global pruning "
+                        "gutting the widest layers (convnext stage3 pwconv1=3072).")
     p.add_argument("--no_bn_recalib", action="store_true")
     p.add_argument("--bias_comp", action="store_true",
                    help="bias compensation: add E[Δy]=W[:,c]·μ_c to each consumer bias before "

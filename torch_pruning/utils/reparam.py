@@ -1054,7 +1054,8 @@ class MeanResidualManager(BaseReparamManager):
                 loss = loss + norms.sum()
         return self.lambda_reg * loss
 
-    def build_propagation_topology(self, example_inputs, p=2, use_measured_sigma_c=False):
+    def build_propagation_topology(self, example_inputs, p=2, use_measured_sigma_c=False,
+                                   branch_out_scale=None):
         """Build the per-layer downstream + branch-weight topology via tp.DependencyGraph.
 
         Returns OrderedDict[name → list of (downstream_name, weight)]:
@@ -1071,6 +1072,11 @@ class MeanResidualManager(BaseReparamManager):
                 propagation_importance (default 2 = variance / VBP-consistent; 1 = std).
             example_inputs: torch.Tensor (or list/dict) suitable for one forward pass —
                 used by DepGraph to trace the computational graph on `self.model`.
+            branch_out_scale: optional {layer_name → per-channel scale tensor}. The PDF
+                join share needs the branch std AT THE ADD, but sigma_out_x is measured at
+                the reparam'd layer's RAW output — any per-channel scaling between them
+                (ConvNeXt layer-scale gamma, an unfolded BN) is missed. Pass |scale| here
+                to correct: branch σ = sigma_out_x · scale before the σ^p share.
         """
         try:
             import torch_pruning as tp
@@ -1121,18 +1127,21 @@ class MeanResidualManager(BaseReparamManager):
             name_by_module = {plain_by_name[n]: n for n in saved.keys()}
 
             return self._build_topology_from_dg(DG, name_by_module, saved, p=p,
-                                                use_measured_sigma_c=use_measured_sigma_c)
+                                                use_measured_sigma_c=use_measured_sigma_c,
+                                                branch_out_scale=branch_out_scale)
         finally:
             # Swap reparam'd modules back regardless of outcome.
             for name, original_rp in saved.items():
                 self._replace_module(name, original_rp)
 
     def _build_topology_from_dg(self, DG, name_by_module, saved, p=2,
-                                use_measured_sigma_c=False):
+                                use_measured_sigma_c=False, branch_out_scale=None):
         """Walk the DepGraph forward to assemble the (downstream_name, weight) topology.
         Branch weights at residual ADDs come from σ_out^p (mean per branch). When
         use_measured_sigma_c, the join denominator is the measured post-add σ_c (PDF skip
-        factor) instead of the independence sum Σσ_branch^p."""
+        factor) instead of the independence sum Σσ_branch^p. branch_out_scale corrects
+        each branch's σ for per-channel scaling between the layer output and the add
+        (see build_propagation_topology)."""
 
         def _walk_downstream(node, visited):
             """Forward BFS from node.outputs; collect reparam'd modules reached."""
@@ -1180,8 +1189,16 @@ class MeanResidualManager(BaseReparamManager):
             if len(unique_branches) == 1:
                 weights[(unique_branches[0], dst)] = 1.0
             else:
-                sig_p = {b: self._reparam_modules[b].sigma_out_x.detach().pow(p)
-                         for b in unique_branches}
+                # Branch σ at the ADD: sigma_out_x is measured at the layer's raw output;
+                # apply any per-channel scale sitting between it and the add (ConvNeXt
+                # layer-scale gamma) so the PDF σ_a^p/(σ_a^p+σ_b^p) share uses the std the
+                # join actually sees. Missing this skews shares by relative gamma^p.
+                def _branch_sigma(b):
+                    s = self._reparam_modules[b].sigma_out_x.detach()
+                    if branch_out_scale and b in branch_out_scale:
+                        s = s * branch_out_scale[b].detach().abs().to(s.device, s.dtype)
+                    return s
+                sig_p = {b: _branch_sigma(b).pow(p) for b in unique_branches}
                 base_sum = sum(sig_p.values()) + 1e-8         # Σσ_branch^p (independence node var)
                 # Default branch share = σ_branch^p / Σσ_branch^p (assumes Var(C)=ΣVar(branch)).
                 # use_measured_sigma_c: multiply by the PDF skip factor σ_c^p/(σ_a^p+σ_b^p), with

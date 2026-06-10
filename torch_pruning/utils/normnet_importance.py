@@ -80,18 +80,20 @@ def _classifier_seed(mgr, topology, classifier, p):
 def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
                                  I_out=None, p=2, conv_reduction="frobenius",
                                  on_mismatch="warn", relative=True, classifier=None,
-                                 use_measured_sigma_c=False, use_measured_var=False):
+                                 use_measured_sigma_c=False, use_measured_var=False,
+                                 branch_out_scale=None):
     """Pull per-input-channel scores from an ACTIVE reparam manager.
 
     mode="per_layer"   → mgr.input_channel_scores()  (‖σ·v‖ = √NCI, the §2 criterion).
     mode="propagation" → mgr.propagation_importance() (the §3 global criterion).
         Pass example_inputs to build the residual/DAG topology (build_propagation_topology
         with the SAME p); omit it for a pure sequential walk.
-        `relative` picks the spec's two forms (additions.md §4): both share the column-
-        stochastic W̄=M^p·D (D=1/col-sum). True (default) → within-layer/local metric;
-        False → non-relative, which re-injects the per-hop inter-layer transfer σ_post^p
-        (the measured activation gain Σ^{l+1}) before each matmul → cross-layer, but
-        compounds with depth (operator spectral radius ≠ 1). per_layer uses neither.
+        `relative` selects the column normalizer D (reparam._Wbar): True (default) →
+        D=1/Σ_iM^p (column-stochastic); False → D=1/σ_pre^p (the PDF steps 7-8 L2 norm).
+        NOTE: for p=2 the two COINCIDE (PDF: "variance propagation yields the same
+        relative importance criterion for p=2") — the forms differ only at p=1.
+        branch_out_scale: per-channel scale between each branch's output and its residual
+        add (ConvNeXt layer-scale gamma) — see build_propagation_topology.
 
     Returns OrderedDict[name → 1-D tensor], one score per input channel of that layer.
     Must be called before mgr.merge_back().
@@ -102,7 +104,8 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
         topo = None
         if example_inputs is not None:
             topo = mgr.build_propagation_topology(
-                example_inputs, p=p, use_measured_sigma_c=use_measured_sigma_c)
+                example_inputs, p=p, use_measured_sigma_c=use_measured_sigma_c,
+                branch_out_scale=branch_out_scale)
         # PDF seed: I^o propagated back through the classifier (W̄^fc · 𝟙_classes), so the
         # final-stage features get REAL importance. Without it the terminal seeds uniform →
         # ties → global pruning empties the last stage. None → uniform fallback.
@@ -119,7 +122,7 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
 def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
                            conv_reduction="frobenius", on_mismatch="warn",
                            relative=True, classifier=None, use_measured_sigma_c=False,
-                           use_measured_var=False):
+                           use_measured_var=False, branch_out_scale=None):
     """Score extraction with the propagation-needs-mean-variant guard, shared by the
     single-GPU (prune_e2) and DDP (pruning_utils) paths.
 
@@ -127,8 +130,8 @@ def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
     tracks → propagation_importance is a mean-manager method. The bn (canonical) variant
     has no propagation_importance yet, so guard with a clear error.
 
-    `relative` (propagation only): both forms share W̄=M^p·D; True → within-layer (default);
-    False → non-relative adds the per-hop σ_post^p transfer → cross-layer (spec §4).
+    `relative` (propagation only) selects the column normalizer D — identical for p=2,
+    differs only at p=1 (see extract_input_channel_scores).
     """
     if mode == "propagation" and not hasattr(mgr, "propagation_importance"):
         raise ValueError(
@@ -139,7 +142,7 @@ def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
         mgr, mode=mode, example_inputs=example_inputs, p=p,
         conv_reduction=conv_reduction, on_mismatch=on_mismatch, relative=relative,
         classifier=classifier, use_measured_sigma_c=use_measured_sigma_c,
-        use_measured_var=use_measured_var)
+        use_measured_var=use_measured_var, branch_out_scale=branch_out_scale)
 
 
 class NormalizedNetImportance(GroupMagnitudeImportance):
