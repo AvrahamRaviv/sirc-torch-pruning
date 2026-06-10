@@ -1225,61 +1225,44 @@ class MeanResidualManager(BaseReparamManager):
                                use_measured_var=False):
         """Per-input-channel global importance via reverse-walk recursion.
 
-        Implements the paper's propagation criterion (normalized_nets_pruning.pdf
-        steps 7-10):
+        The paper's propagation criterion (normalized_nets_pruning.pdf steps 7-10):
 
             I^l = W̄^l · I^{l+1},   W̄ = M^p · D,
               M[i, j] = |σ_i · reduce_kernel(v[j, i, :])| = |W'[i,j]|   (in × out)
             I^{L+1} = I_out (default uniform 1/out_dim on the last layer's outputs)
 
-        σ is folded into M ONCE (M = σ·W = W'); there is NO separate per-hop σ transfer
-        — the PDF's interleaved Σ^{l+1} is already absorbed into the next layer's
-        M^{l+1} = σ_in^{l+1}·W. `relative` selects the column normalizer D:
+        σ is folded into M ONCE; no separate per-hop σ transfer — the PDF's interleaved
+        Σ^{l+1} is already absorbed into M^{l+1} = σ_in^{l+1}·W. `relative` selects D:
 
-          relative=True  (default) → D = 1/Σ_i M[i,j]^p  — each column sums to 1
-              (column-stochastic, mass-preserving). ρ=1 → magnitude does NOT compound
-              with depth; a WITHIN-LAYER / local metric (PDF p.3).
-          relative=False → D = 1/σ_pre,j^p = 1/(Σ_i M[i,j]^2)^{p/2}  — the std/L2
-              column norm (PDF steps 7-8 non-relative). NOT column-stochastic for p=1
-              → ρ≠1 → magnitude compounds with depth (cross-layer in intent, but the
-              scale explodes as ρ^depth; see the no-free-lunch note below).
+          relative=True  (default) → D = 1/Σ_i M[i,j]^p — column-stochastic, bounded,
+              but mass-conserving → cross-layer ranking degenerates to 1/width (local
+              metric, PDF p.3).
+          relative=False → D = 1/(Σ_i M[i,j]^2)^{p/2} — the std/L2 column norm (PDF
+              steps 7-8). Cross-layer in intent, but ρ≠1 → scale compounds ρ^depth →
+              global sort degenerates to ranking-by-depth.
 
-        IMPORTANT — for p=2 the two normalizers COINCIDE: Σ_i M^2 = (Σ_i M^2)^{2/2}, so
-        relative and non-relative are IDENTICAL (PDF: "variance propagation yields the
-        same relative importance criterion for p=2"). The forms differ only at p=1.
+        For p=2 the two normalizers COINCIDE (PDF: "variance propagation yields the same
+        relative importance criterion for p=2"); they differ only at p=1 (std). Neither
+        form is a bounded global criterion; that is per-layer ‖σ·v‖ = √NCI
+        (mode="per_layer").
 
-        The exponent `p` selects variance (p=2, DEFAULT, VBP-consistent, = the L2
-        per-layer score) vs std (p=1).
-
-        No-free-lunch: column-stochastic (relative / p=2) is bounded but conserves mass,
-        so every layer sums to the same total → cross-layer ranking is only 1/width, not
-        contribution → local. Non-stochastic (non-relative / p=1) lets totals differ
-        (cross-layer reach) but ρ≠1 → the per-layer scale grows ρ^depth → a global sort
-        degenerates to ranking-by-depth. Neither propagated form is a bounded global
-        criterion; the bounded global score is per-layer ‖σ·v‖ = √NCI (one hop, no
-        iteration), exposed via mode="per_layer".
-
-        Walks self._reparam_modules in reverse forward order (sequential nets). Returns
+        Walks self._reparam_modules in reverse forward order. Returns
         OrderedDict[name → I^l tensor of length in_features^l], in forward order.
 
         Args:
             I_out: Output seed, length = out_features^L. None → uniform.
-            conv_reduction: kernel collapse to per-(i,j) scalar — "frobenius" (default,
-                ‖v[j,i,:,:]‖_2) or "abs_sum".
-            on_mismatch: when two consecutive reparam'd layers have out_l ≠ in_{l+1}
-                (residual / branched boundary): "warn" (default) → log + per-layer
-                fallback ‖σ·v‖ for that layer; "raise" → RuntimeError; "skip" → silent
-                fallback.
-            p: relative-contribution exponent (2 variance / 1 std). For residual nets
-                build the topology with the SAME p (build_propagation_topology(p=...)).
+            conv_reduction: kernel collapse — "frobenius" (default, ‖v[j,i,:,:]‖_2)
+                or "abs_sum".
+            on_mismatch: out_l ≠ in_{l+1} boundary (residual/branched): "warn" (default,
+                per-layer ‖σ·v‖ fallback + log), "raise", or "skip" (silent fallback).
+            p: 2 = variance (default, VBP-consistent) / 1 = std. For residual nets build
+                the topology with the SAME p.
+            topology: None → sequential walk (M2). Residual/branched nets: pass
+                `self.build_propagation_topology(example_inputs, p=p)` (M3 DAG walk
+                with σ_out^p branch weighting).
 
-        Notes:
-            - topology=None → sequential walk (M2 behavior). For residual / branched
-              nets, pass `topology=self.build_propagation_topology(example_inputs, p=p)`
-              — M3 DepGraph-based DAG traversal with σ_out^p branch weighting.
-            - σ stop-grad (buffer; .detach() for safety).
-            - M is taken absolute so column sums are non-negative (the paper takes
-              |w_ij| in §1; for p=2 the sign is irrelevant anyway).
+        σ is stop-grad throughout; M is taken absolute (PDF §1 |w_ij|; sign-free for
+        p=2 anyway).
         """
         if not self._active or not self._reparam_modules:
             return OrderedDict()
