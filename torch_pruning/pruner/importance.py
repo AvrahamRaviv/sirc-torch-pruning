@@ -138,6 +138,13 @@ class GroupMagnitudeImportance(Importance):
             return group_importance / group_importance.mean()
         elif normalizer == "max":
             return group_importance / group_importance.max()
+        elif normalizer == "width":
+            # score × layer width = "mass share vs uniform". A column-stochastic (mass-
+            # conserving) propagation score dilutes per-channel as 1/width, so a global
+            # threshold guts the widest layers. Unlike "mean" (forces every layer to
+            # mean-1, erasing the cross-layer mass signal entirely), ×width removes only
+            # the 1/width dilution and keeps the genuine cross-layer mass (joins + seed).
+            return group_importance * group_importance.numel()
         elif normalizer == 'gaussian':
             return (group_importance - group_importance.mean()) / (group_importance.std()+1e-8)
         elif normalizer.startswith('sentinel'): # normalize the score with the k-th smallest element. e.g. sentinel_0.5 means median normalization
