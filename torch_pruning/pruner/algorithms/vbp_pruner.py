@@ -11,19 +11,14 @@ from .. import function
 
 
 class VBPPruner(BasePruner):
-    def __init__(self, model, example_inputs, *args, mean_dict=None, var_dict=None, verbose=True, **kwargs):
+    def __init__(self, model, example_inputs, *args, mean_dict=None, verbose=True, **kwargs):
         super().__init__(model, example_inputs, *args, mean_dict=mean_dict, **kwargs)
         self.example_inputs = example_inputs
-        self.var_dict = var_dict  # reserved for future BN variance correction
         self.verbose = verbose
 
         # mean-check state
         self._meancheck_enabled = False
         self._meancheck_handles = []
-
-    @torch.no_grad()
-    def set_var_dict(self, var_dict):
-        self.var_dict = var_dict
 
     @torch.no_grad()
     def enable_meancheck(self, model):

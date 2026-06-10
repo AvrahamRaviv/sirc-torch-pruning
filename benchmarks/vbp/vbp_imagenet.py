@@ -52,7 +52,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch_pruning as tp
 
 from torch_pruning.utils.sparse_utils import (
-    get_fc1_modules, l21_regularization, gmp_sparsity_schedule,
+    get_fc1_modules, gmp_sparsity_schedule,
     apply_unstructured_pruning, remove_pruning_reparametrization,
     compute_variance_entropy, compute_weight_sparsity,
 )
@@ -283,7 +283,7 @@ def run_reparam_pretraining(model, teacher, train_loader, train_sampler,
         # Periodic μ_x refresh (function-preserving)
         refresh = getattr(args, 'reparam_refresh_interval', 0)
         if refresh > 0 and (epoch + 1) % refresh == 0:
-            mgr.refresh_mu(train_loader)
+            mgr.refresh_stats(train_loader)
 
         if is_main():
             acc, _ = validate(model, val_loader, device, args.model_type)

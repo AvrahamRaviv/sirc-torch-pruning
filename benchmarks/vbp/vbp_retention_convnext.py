@@ -41,7 +41,7 @@ from torch_pruning.pruner.importance import VarianceImportance
 
 # Local ConvNeXt implementation (FB version)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from convnext import convnext_tiny, convnext_small, convnext_base, Block
+from convnext import convnext_tiny, convnext_small, convnext_base
 
 
 # ---------------------------------------------------------------------------

@@ -29,7 +29,6 @@ Example (one scorer, RN50):
 """
 import argparse
 import copy
-import json
 import os
 import sys
 

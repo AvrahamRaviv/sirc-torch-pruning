@@ -861,31 +861,6 @@ class TestRefreshStats:
         assert torch.allclose(y_before, y_after, atol=1e-5), \
             f"Max diff after refresh: {(y_before - y_after).abs().max()}"
 
-    def test_mean_residual_refresh_mu_alias(self):
-        """MeanResidualManager.refresh_mu still works (backward compat)."""
-        from torch_pruning.utils.reparam import MeanResidualManager
-
-        model = TinyMLP()
-        loader = _make_dataloader()
-        x = torch.randn(4, 16)
-
-        mgr = MeanResidualManager(model, ["fc1"], torch.device("cpu"),
-                                   lambda_reg=0.01)
-        mgr.reparameterize(loader)
-
-        model.eval()
-        with torch.no_grad():
-            y_before = model(x).clone()
-
-        mgr.refresh_mu(loader)
-
-        model.eval()
-        with torch.no_grad():
-            y_after = model(x)
-
-        assert torch.allclose(y_before, y_after, atol=1e-5), \
-            f"Max diff after refresh_mu: {(y_before - y_after).abs().max()}"
-
 
 # ---------------------------------------------------------------------------
 # Test: entropy loss

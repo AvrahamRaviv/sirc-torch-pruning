@@ -61,7 +61,7 @@ try:
         logger, is_main, log_info, setup_logging,
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate,
-        train_one_epoch, build_cosine_scheduler,
+        train_one_epoch,
         build_sparse_scheduler, build_ft_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
     )
@@ -71,7 +71,7 @@ except ImportError:
         logger, is_main, log_info, setup_logging,
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate,
-        train_one_epoch, build_cosine_scheduler,
+        train_one_epoch,
         build_sparse_scheduler, build_ft_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
     )

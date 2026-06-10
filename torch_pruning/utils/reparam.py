@@ -927,11 +927,6 @@ class MeanResidualManager(BaseReparamManager):
             raise ValueError(f"ema_momentum must be in [0, 1], got {ema_momentum}")
         self.ema_momentum = float(ema_momentum)
 
-    # Backward-compat alias
-    def refresh_mu(self, loader):
-        """Alias for refresh_stats (backward compatibility)."""
-        return self.refresh_stats(loader)
-
     def sync_ema_buffers(self):
         """All-reduce (μ_x, σ_x, σ_out_x) across DDP ranks; no-op on single rank.
 
