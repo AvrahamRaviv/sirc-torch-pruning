@@ -46,7 +46,7 @@ try:
         logger, is_main, log_info, setup_logging,
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate, forward_logits,
-        train_one_epoch, build_ft_scheduler,
+        train_one_epoch, build_ft_scheduler, broadcast_model_state,
         build_whole_net_reparam_layers, attach_biases, _merge_vnr_state_dict,
     )
 except ImportError:
@@ -55,7 +55,7 @@ except ImportError:
         logger, is_main, log_info, setup_logging,
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate, forward_logits,
-        train_one_epoch, build_ft_scheduler,
+        train_one_epoch, build_ft_scheduler, broadcast_model_state,
         build_whole_net_reparam_layers, attach_biases, _merge_vnr_state_dict,
     )
 
@@ -107,15 +107,6 @@ def get_device():
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
-
-def _broadcast_model_state(model):
-    """Broadcast params and buffers from rank 0 after a structural change."""
-    import torch.distributed as dist
-    for param in model.parameters():
-        dist.broadcast(param.data, src=0)
-    for buf in model.buffers():
-        dist.broadcast(buf, src=0)
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +211,7 @@ def verify_roundtrip(model, mgr, loader, args, device, use_ddp):
     resolved = list(mgr._reparam_modules.keys())
     log_info(f"Reparameterized {len(resolved)} layers")
     if use_ddp:
-        _broadcast_model_state(model)
+        broadcast_model_state(model)
     y1 = _forward(model, xb, args.model_type)
     vnr_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
@@ -546,7 +537,7 @@ def main(argv):
                 log_info("norm_bn_momentum ignored: only applies to --reparam_variant bn "
                          "(mean variant has no inserted BN; μ_x is frozen at calibration)")
         if use_ddp:
-            _broadcast_model_state(model)
+            broadcast_model_state(model)
         log_info(f"Reparameterized {len(mgr._reparam_modules)} layers (WD acts on v_tilde)")
 
         # Log calibrated σ_x spread + baseline ‖σ·v‖ range — sanity-check for the

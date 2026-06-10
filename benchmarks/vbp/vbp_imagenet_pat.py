@@ -61,7 +61,7 @@ try:
         logger, is_main, log_info, setup_logging,
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate,
-        train_one_epoch,
+        train_one_epoch, broadcast_model_state,
         build_sparse_scheduler, build_ft_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
     )
@@ -71,7 +71,7 @@ except ImportError:
         logger, is_main, log_info, setup_logging,
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate,
-        train_one_epoch,
+        train_one_epoch, broadcast_model_state,
         build_sparse_scheduler, build_ft_scheduler,
         VarianceConcentrationHooks, build_layers_to_prune, build_reparam_layers,
     )
@@ -214,18 +214,6 @@ def build_optimizer(model, args, reparam_manager=None, lr_override=None):
 # ---------------------------------------------------------------------------
 # DDP sync helpers
 # ---------------------------------------------------------------------------
-def _broadcast_model_state(model):
-    """Broadcast model parameters and buffers from rank 0.
-
-    Called after structural changes (reparameterize) so all DDP ranks
-    have identical model state.
-    """
-    for param in model.parameters():
-        dist.broadcast(param.data, src=0)
-    for buf in model.buffers():
-        dist.broadcast(buf, src=0)
-
-
 def _make_stats_sync_hook(device):
     """Create a post-stats hook that broadcasts importance stats from rank 0.
 
@@ -466,7 +454,7 @@ def main(argv):
 
         # 3. Rebuild optimizer/DDP after model changes (reparam, prune, sparse)
         if use_ddp and changed:
-            _broadcast_model_state(model)
+            broadcast_model_state(model)
         if changed:
             ft_lr = args.ft_lr if args.ft_lr is not None else args.lr
             phase_lr = args.lr if cp.phase == "Sparse" else ft_lr

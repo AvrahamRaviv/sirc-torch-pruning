@@ -99,6 +99,14 @@ def cleanup():
         dist.destroy_process_group()
 
 
+def broadcast_model_state(model):
+    """Broadcast params and buffers from rank 0 after a structural change."""
+    for param in model.parameters():
+        dist.broadcast(param.data, src=0)
+    for buf in model.buffers():
+        dist.broadcast(buf, src=0)
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------

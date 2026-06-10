@@ -37,10 +37,10 @@ from torch.utils.data import DataLoader, DistributedSampler
 import torchvision.transforms as T
 from torchvision.datasets import ImageFolder
 
-from vbp_common import load_model, validate, build_whole_net_reparam_layers, FastImageNet
+from vbp_common import load_model, validate, build_whole_net_reparam_layers, FastImageNet, broadcast_model_state
 from normalize_net import (
     build_reparam_manager, log_info, get_device, append_metrics, write_run,
-    setup_logging, is_main, _broadcast_model_state,
+    setup_logging, is_main,
 )
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -350,7 +350,7 @@ def main(argv):
             mgr = build_reparam_manager(raw, names, device, args)
             mgr.reparameterize(calib_loader)               # normalize (calibrate σ,μ)
             if use_ddp:
-                _broadcast_model_state(raw)
+                broadcast_model_state(raw)
             optimizer = build_opt(raw, lr_at(epoch, args), args)   # new params (v_tilde,m)
             if args.switch_precond:
                 _switch_precond_handles = _install_switch_precond(mgr)

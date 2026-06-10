@@ -440,8 +440,8 @@ def main(argv):
     if do_normalize:
         mgr.reparameterize(calib_loader)            # post-act BN(affine=False) + v_tilde=σW
         if use_ddp:
-            from normalize_net import _broadcast_model_state
-            _broadcast_model_state(model)
+            from vbp_common import broadcast_model_state
+            broadcast_model_state(model)
         acc, _ = validate(model, val_loader, device, args.model_type)
         log_info(f"NORMALIZE: {len(names)} layers, post-transform acc={acc:.4f} "
                  f"(function-preserving — should match post-train)")
