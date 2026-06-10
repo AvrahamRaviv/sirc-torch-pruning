@@ -51,4 +51,17 @@ img.png
 # Local project management (not pushed to remote)
 CLAUDE.md
 STATUS.md
-.claude/channel_dumps/
+.claude/
+.rtk/
+
+# Generated experiment / build artifacts
+out/
+channel_dumps/
+.DS_Store
+*.aux
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.bak
+paper/AAAI-26-author-kit.zip
