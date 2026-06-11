@@ -478,12 +478,28 @@ def main(argv):
             bscale = _propagation_branch_scale(model) if args.scorer == "propagation" else None
             if bscale:
                 log_info(f"propagation: branch_out_scale (layer-scale gamma) on {len(bscale)} branches")
+            # Full covariance fix: input correlation Σ̂ per reparam'd layer → cov numerator
+            # whose colsum reconstructs true Var(Z) (numerator+denominator together).
+            icov = None
+            if args.scorer == "propagation" and args.prop_cov:
+                if args.prop_p != 2:
+                    raise SystemExit("--prop_cov requires --prop_p 2 (variance decomposition)")
+                icov = mgr.collect_input_covariance(calib_loader, max_batches=args.calib_batches)
+                off = [float((s - torch.eye(s.shape[0], device=s.device, dtype=s.dtype)).abs().sum() / s.abs().sum()) for s in icov.values()]
+                log_info(f"prop_cov: input correlation on {len(icov)} layers "
+                         f"({args.calib_batches} calib batches), "
+                         f"median offdiag mass={sorted(off)[len(off) // 2]:.2f}")
+            elif args.scorer == "propagation" and args.prop_measured_var:
+                log_info("WARNING: --prop_measured_var without --prop_cov = denominator-only "
+                         "(numerator stays independence) → mass leaks → depth bias returns. "
+                         "Ablation rung only; add --prop_cov for the full fix.")
             scores = extract_normnet_scores(
                 mgr, args.scorer, example_inputs=(ex if args.scorer == "propagation" else None),
+                p=args.prop_p,
                 relative=not args.prop_non_relative, classifier=clf,
                 use_measured_sigma_c=args.skip_sigma_c,
                 use_measured_var=args.prop_measured_var,
-                branch_out_scale=bscale)
+                branch_out_scale=bscale, input_cov=icov)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 for k in list(scores.keys()):
                     t = scores[k].contiguous()
@@ -753,10 +769,24 @@ def parse_args(argv):
                         "independence approximation (off-diagonal Σ dropped).")
     p.add_argument("--prop_non_relative", action="store_true",
                    help="propagation: non-relative column norm D=1/σ_pre^p (PDF steps 7-8) "
-                        "instead of column-stochastic D=1/Σ_iM^p. NOTE: for p=2 (the only "
-                        "exponent wired here) the two are IDENTICAL (PDF: 'variance propagation "
-                        "yields the same relative importance criterion for p=2') — this flag is "
-                        "a NO-OP and kept only for arm-name compatibility.")
+                        "instead of column-stochastic D=1/Σ_iM^p. NOTE: at p=2 the two are "
+                        "IDENTICAL (PDF: 'variance propagation yields the same relative "
+                        "importance criterion for p=2') — NO-OP unless --prop_p 1, where the "
+                        "forms genuinely differ (and nonrel colsums ΣM/σ_pre ≥ 1 → mass "
+                        "inflates per step → depth bias; that's the point of the ablation).")
+    p.add_argument("--prop_p", type=int, default=2, choices=[1, 2],
+                   help="propagation exponent: 2 = variance (default; rel ≡ nonrel; cov-fix "
+                        "capable), 1 = std (rel/nonrel genuinely differ; no cov form exists — "
+                        "std does not decompose additively over channel pairs).")
+    p.add_argument("--prop_cov", action="store_true",
+                   help="propagation FULL covariance fix (p=2 only): numerator AND denominator "
+                        "together. Collects per-layer input correlation Σ̂ on calib data; "
+                        "numerator becomes the signed cov share N[c,j]=w̃_jc(w̃Σ̂)_jc whose "
+                        "colsum reconstructs true Var(Z_j) → W̄ exactly column-stochastic → "
+                        "mass conserved with COVARIANCE-correct shares (independence numerator "
+                        "= diag-only special case; convnext offdiag = 53-89%% of Var). With "
+                        "--prop_measured_var the denom uses measured σ_out_x² instead of the "
+                        "recon colsum (recon≈meas).")
     p.add_argument("--skip_sigma_c", action="store_true",
                    help="propagation: at residual joins use the MEASURED post-add std σ_c as the "
                         "branch-weight denominator (PDF σ_c^p/(σ_a^p+σ_b^p) skip factor) instead of "
@@ -764,8 +794,11 @@ def parse_args(argv):
     p.add_argument("--prop_measured_var", action="store_true",
                    help="propagation: per-layer denominator = MEASURED output variance σ_out_x^p "
                         "(true Var(Z_j)) instead of the computed independence colsum Σ_i(σ_i W_ij)^p. "
-                        "Corrects the within-layer independence assumption (the off-diagonal cov "
-                        "term). Pairs with --skip_sigma_c (joins) for the full covariance 2×2.")
+                        "WARNING — WITHOUT --prop_cov this is a DENOMINATOR-ONLY fix (numerator "
+                        "stays independence ΣM²): colsums = indep/meas ≈ 1/2…1/17, per-output "
+                        "varying → mass leaks per step → depth bias RETURNS, worse than no fix. "
+                        "Fix numerator+denominator together (--prop_cov) or neither. Kept as "
+                        "ablation rung.")
     p.add_argument("--pruning_ratio", type=float, default=0.5)
     p.add_argument("--mac_target_g", type=float, default=0.0,
                    help="target MACs in GMAC (e.g. 2.0). >0 overrides --pruning_ratio: "

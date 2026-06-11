@@ -681,6 +681,74 @@ class BaseReparamManager(ABC):
             out[name] = _channel_group_norm(w, 0)  # 0 → per input channel
         return out
 
+    @torch.no_grad()
+    def collect_input_covariance(self, loader, max_batches=50):
+        """Per-layer input-channel CORRELATION matrix Σ̂ for the propagation cov numerator.
+
+        Hooks every ACTIVE reparam module, accumulates raw input moments over `loader`
+        (conv: channels-first NCHW, pooled over batch+space; linear: channel = LAST dim,
+        which also handles convnext's channels-last 4D pwconv input), then
+        Σ̂ = cov(x) / (σσᵀ) — the covariance of the NORMALIZED input x̂ that the
+        contribution weight w̃ = σ·v acts on, so w̃ Σ̂ w̃ᵀ = true Var(Z) including the
+        off-diagonal covariance the independence colsum drops (diag(Σ̂)=1 recovers it).
+        σ here is the cov-pass std itself (NOT the stored calibration sigma_x) so the
+        diagonal is exactly 1 and the matrix is variant-agnostic (mean AND bn).
+        DDP: raw moments are all-reduced → identical Σ̂ on every rank.
+
+        Call while ACTIVE. Returns OrderedDict[name → Σ̂ [in, in]] for
+        propagation_importance(input_cov=...). O(in²) memory per layer (convnext
+        worst case 3072² fp32 ≈ 38 MB).
+        """
+        if not self._active or not self._reparam_modules:
+            return OrderedDict()
+        acc = {name: None for name in self._reparam_modules}   # [AtA, sumA, count]
+        name_of = {m: n for n, m in self._reparam_modules.items()}
+
+        def hook(mod, inp):
+            x = inp[0].detach()
+            if hasattr(mod, "in_channels"):     # conv: channels-first (N,C,H,W) → (N·H·W, C)
+                a = x.permute(0, 2, 3, 1).reshape(-1, x.shape[1])
+            else:                               # linear: channel = last dim ((N,C) or (N,H,W,C))
+                a = x.reshape(-1, x.shape[-1])
+            a = a.float()
+            n = name_of[mod]
+            AtA, As, cnt = a.t() @ a, a.sum(0), a.shape[0]
+            if acc[n] is None:
+                acc[n] = [AtA, As, cnt]
+            else:
+                acc[n][0] += AtA; acc[n][1] += As; acc[n][2] += cnt
+
+        handles = [m.register_forward_pre_hook(hook) for m in self._reparam_modules.values()]
+        was_training = self.model.training
+        self.model.eval()
+        for bi, batch in enumerate(loader):
+            if bi >= max_batches:
+                break
+            x = batch[0] if isinstance(batch, (list, tuple)) else batch
+            self.model(x.to(self.device))
+        for h in handles:
+            h.remove()
+        if was_training:
+            self.model.train()
+
+        ddp = torch.distributed.is_available() and torch.distributed.is_initialized()
+        out = OrderedDict()
+        for name in self._reparam_modules:
+            if acc[name] is None:
+                continue
+            AtA, As, cnt = acc[name]
+            if ddp:                             # sync raw moments (CUDA tensors for NCCL)
+                cnt_t = torch.tensor([float(cnt)], device=AtA.device)
+                torch.distributed.all_reduce(AtA, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(As, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(cnt_t, op=torch.distributed.ReduceOp.SUM)
+                cnt = float(cnt_t.item())
+            mean = As / cnt
+            cov = AtA / cnt - torch.outer(mean, mean)
+            sig = cov.diag().clamp(min=1e-12).sqrt()
+            out[name] = cov / torch.outer(sig, sig)            # correlation, diag = 1
+        return out
+
     # ------------------------------------------------------------------
     # Abstract interface for subclasses
     # ------------------------------------------------------------------
@@ -1222,7 +1290,8 @@ class MeanResidualManager(BaseReparamManager):
                                topology=None,
                                p=2,
                                relative=True,
-                               use_measured_var=False):
+                               use_measured_var=False,
+                               input_cov=None):
         """Per-input-channel global importance via reverse-walk recursion.
 
         The paper's propagation criterion (normalized_nets_pruning.pdf steps 7-10):
@@ -1260,9 +1329,19 @@ class MeanResidualManager(BaseReparamManager):
             topology: None → sequential walk (M2). Residual/branched nets: pass
                 `self.build_propagation_topology(example_inputs, p=p)` (M3 DAG walk
                 with σ_out^p branch weighting).
+            input_cov: {name → Σ̂ [in,in]} from collect_input_covariance() — the FULL
+                covariance fix (p=2 only). Replaces the independence numerator M^2 with
+                the signed covariance share N[c,j] = w̃_jc·(w̃Σ̂)_jc (clamped ≥0), whose
+                column sums reconstruct the true Var(Z_j). Default denominator = that
+                colsum → W̄ exactly column-stochastic → mass conserved per backward
+                step WITH correct (covariance-aware) shares. use_measured_var then
+                swaps the denom for measured σ_out_x² (recon≈meas, both legal).
+                NOTE: numerator and denominator must be fixed TOGETHER —
+                use_measured_var alone (denom-only) breaks the colsum (indep/meas ≈
+                1/2…1/17, per-output varying) → mass leaks → depth bias returns.
 
         σ is stop-grad throughout; M is taken absolute (PDF §1 |w_ij|; sign-free for
-        p=2 anyway).
+        p=2 anyway). The cov numerator keeps the SIGN of w̃ (cross terms cancel).
         """
         if not self._active or not self._reparam_modules:
             return OrderedDict()
@@ -1272,6 +1351,9 @@ class MeanResidualManager(BaseReparamManager):
             raise ValueError(f"on_mismatch must be 'warn'/'raise'/'skip', got {on_mismatch!r}")
         if p not in (1, 2):
             raise ValueError(f"p must be 1 (std) or 2 (variance), got {p!r}")
+        if input_cov and p != 2:
+            raise ValueError("input_cov (covariance numerator) is a variance decomposition "
+                             "— only valid at p=2. Drop input_cov or use p=2.")
 
         eps = 1e-8
 
@@ -1293,15 +1375,43 @@ class MeanResidualManager(BaseReparamManager):
                 w_red = w                                          # [out, in]
             return w_red.t().abs()                                 # [in, out]
 
-        def _Wbar(M, measured_denom=None):
+        def _layer_N(rp, S):
+            """SIGNED covariance numerator N [in, out]: N[c,j] = w̃_jc · (w̃ Σ̂)_jc.
+            Row-sums over c reconstruct the true Var(Z_j) = w̃Σ̂w̃ᵀ (off-diagonals kept;
+            the independence M² numerator is the diag(Σ̂)=1 special case). Conv uses the
+            channel-stationary kernel-aligned form N[c,j] = Σ_c' ⟨v_jc,·,v_jc',·⟩ Σ̂_cc'
+            (same approximation as nci_cov's Gram). Negative entries (removing the
+            channel would INCREASE Var) clamp to 0; the column normalizer is taken
+            AFTER the clamp so W̄ stays exactly column-stochastic."""
+            w = _contribution_weight(rp).detach()
+            S = S.to(w.device, w.dtype)
+            if w.dim() == 4:
+                V = w.flatten(2)                              # [out, in, kHkW]
+                T = torch.einsum('odk,dc->ock', V, S)         # (w̃ Σ̂) kernel-aligned
+                N = (V * T).sum(-1)                           # [out, in]
+            else:
+                N = w * (w @ S)                               # [out, in]
+            return N.t().clamp_min(0.0)                       # [in, out]
+
+        def _Wbar(M, measured_denom=None, N=None):
             """Column-normalized W̄ = M^p · D (no σ transfer — σ is already in M).
             relative → D = 1/Σ_i M^p (column-stochastic). non-relative → D = 1/σ_pre^p
             = 1/(Σ_i M^2)^{p/2} (std/L2 norm). Identical for p=2.
 
-            measured_denom (use_measured_var): per-output MEASURED node variance σ_out_x^p.
-            The computed denom Σ_i(σ_i W_ij)^p is the INDEPENDENCE estimate of Var(Z_j); the
-            measured σ_out_x^p is the true Var(Z_j) (incl. cross-channel covariance). Using it
-            corrects the within-layer independence assumption (PDF; = the off-diagonal cov term)."""
+            N (input_cov): FULL covariance fix — numerator = cov share N, denominator =
+            its own colsum (exactly column-stochastic) or measured σ_out_x² when
+            use_measured_var (recon ≈ meas). Numerator+denominator move TOGETHER.
+
+            measured_denom WITHOUT N (use_measured_var alone) is the broken middle rung:
+            numerator stays independence ΣM², denom becomes true Var → colsums =
+            indep/meas ≈ 1/2…1/17 per-output varying → mass leaks unevenly per step →
+            depth bias (compounding) returns. Kept for ablation only."""
+            if N is not None:
+                if measured_denom is not None:
+                    denom = measured_denom.to(N.dtype).clamp(min=eps)      # true Var(Z_j)
+                else:
+                    denom = N.sum(dim=0).clamp(min=eps)                    # recon Var (exact)
+                return N / denom[None, :]
             Mp = M.pow(p)
             if measured_denom is not None:
                 denom = measured_denom.to(Mp.dtype).clamp(min=eps)        # true Var(Z_j)^{p/2}
@@ -1317,11 +1427,26 @@ class MeanResidualManager(BaseReparamManager):
         # replaces the computed independence denominator Σ_i(σ_i W_ij)^p in _Wbar.
         meas_denom = ({name: rp.sigma_out_x.detach().pow(p) for name, rp in layers}
                       if use_measured_var else {})
+        # input_cov: covariance numerators (full cov fix). Layers missing from input_cov
+        # (or with a stale shape) fall back to the independence M^p numerator.
+        cov_num = {}
+        if input_cov:
+            for name, rp in layers:
+                S = input_cov.get(name)
+                if S is None:
+                    continue
+                if S.shape[0] != Ms[name].shape[0]:
+                    _log_warning(f"input_cov[{name!r}] is {tuple(S.shape)} but layer has "
+                                 f"{Ms[name].shape[0]} input channels — skipping cov "
+                                 f"numerator for this layer (independence fallback)")
+                    continue
+                cov_num[name] = _layer_N(rp, S)
 
         # ---- DAG walk path (M3): topology provided ----
         if topology is not None:
             return self._propagate_dag(layers, Ms, topology, I_out, eps, p, relative,
-                                       wbar_fn=_Wbar, meas_denom=meas_denom)
+                                       wbar_fn=_Wbar, meas_denom=meas_denom,
+                                       cov_num=cov_num)
 
         # ---- Sequential path (M2): no topology ----
         # Seed I_out at last layer's output
@@ -1359,7 +1484,7 @@ class MeanResidualManager(BaseReparamManager):
                 # SCORE RECURSION I^l = W̄^l·I^{l+1} (normalized_nets_pruning.pdf steps 7-10).
                 # σ is already in M (=σ·W); no separate transfer. relative → column-stochastic
                 # D=1/Σ_iM^p; non-relative → D=1/σ_pre^p (L2). Identical for p=2.
-                I_l = _Wbar(M, meas_denom.get(name)) @ I_next  # propagate one layer back → [in]
+                I_l = _Wbar(M, meas_denom.get(name), cov_num.get(name)) @ I_next  # one layer back → [in]
 
             results.append((name, I_l))
             I_next = I_l  # chains to layer l-1 (whose out_dim should equal in_l = I_next.numel())
@@ -1367,7 +1492,7 @@ class MeanResidualManager(BaseReparamManager):
         return OrderedDict(reversed(results))
 
     def _propagate_dag(self, layers, Ms, topology, I_out, eps, p=2, relative=True,
-                       wbar_fn=None, meas_denom=None):
+                       wbar_fn=None, meas_denom=None, cov_num=None):
         """DAG reverse-walk using a downstream+weight topology (M3).
 
         For each layer L (visited in reverse forward order — assumes named_modules order
@@ -1462,7 +1587,8 @@ class MeanResidualManager(BaseReparamManager):
             # (D=1/Σ_iM^p); non-relative → D=1/σ_pre^p (L2). Identical for p=2. The residual
             # fan-in weights `w` above (σ^p/Σσ^p branch split) are a separate, orthogonal mix.
             md = meas_denom.get(name) if meas_denom else None
-            I_by_name[name] = wbar_fn(M, md) @ I_next
+            cn = cov_num.get(name) if cov_num else None
+            I_by_name[name] = wbar_fn(M, md, cn) @ I_next
 
         # Return in forward order
         return OrderedDict((name, I_by_name[name]) for name, _ in layers)

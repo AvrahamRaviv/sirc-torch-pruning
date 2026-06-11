@@ -81,7 +81,7 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
                                  I_out=None, p=2, conv_reduction="frobenius",
                                  on_mismatch="warn", relative=True, classifier=None,
                                  use_measured_sigma_c=False, use_measured_var=False,
-                                 branch_out_scale=None):
+                                 branch_out_scale=None, input_cov=None):
     """Pull per-input-channel scores from an ACTIVE reparam manager.
 
     mode="per_layer"   → mgr.input_channel_scores()  (‖σ·v‖ = √NCI, the §2 criterion).
@@ -94,6 +94,8 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
         relative importance criterion for p=2") — the forms differ only at p=1.
         branch_out_scale: per-channel scale between each branch's output and its residual
         add (ConvNeXt layer-scale gamma) — see build_propagation_topology.
+        input_cov: {name → Σ̂} from mgr.collect_input_covariance() — FULL covariance fix
+        (numerator AND denominator together, p=2 only); see propagation_importance.
 
     Returns OrderedDict[name → 1-D tensor], one score per input channel of that layer.
     Must be called before mgr.merge_back().
@@ -115,14 +117,14 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
         return mgr.propagation_importance(
             I_out=seed, p=p, conv_reduction=conv_reduction,
             on_mismatch=on_mismatch, topology=topo, relative=relative,
-            use_measured_var=use_measured_var)
+            use_measured_var=use_measured_var, input_cov=input_cov)
     raise ValueError(f"mode must be 'per_layer' or 'propagation', got {mode!r}")
 
 
 def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
                            conv_reduction="frobenius", on_mismatch="warn",
                            relative=True, classifier=None, use_measured_sigma_c=False,
-                           use_measured_var=False, branch_out_scale=None):
+                           use_measured_var=False, branch_out_scale=None, input_cov=None):
     """Score extraction with the propagation-needs-mean-variant guard, shared by the
     single-GPU (prune_e2) and DDP (pruning_utils) paths.
 
@@ -142,7 +144,8 @@ def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
         mgr, mode=mode, example_inputs=example_inputs, p=p,
         conv_reduction=conv_reduction, on_mismatch=on_mismatch, relative=relative,
         classifier=classifier, use_measured_sigma_c=use_measured_sigma_c,
-        use_measured_var=use_measured_var, branch_out_scale=branch_out_scale)
+        use_measured_var=use_measured_var, branch_out_scale=branch_out_scale,
+        input_cov=input_cov)
 
 
 class NormalizedNetImportance(GroupMagnitudeImportance):
