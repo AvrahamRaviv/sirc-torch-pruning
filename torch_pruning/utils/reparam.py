@@ -1391,7 +1391,8 @@ class MeanResidualManager(BaseReparamManager):
                                p=2,
                                relative=True,
                                use_measured_var=False,
-                               input_cov=None):
+                               input_cov=None,
+                               keep=None):
         """Per-input-channel global importance via reverse-walk recursion.
 
         The paper's propagation criterion (normalized_nets_pruning.pdf steps 7-10):
@@ -1542,11 +1543,29 @@ class MeanResidualManager(BaseReparamManager):
                     continue
                 cov_num[name] = _layer_N(rp, S)
 
+        # keep: iterative-pruning input-channel mask (v2 "variances forced to 1" update).
+        # A pruned hidden channel is an INPUT (row of M [in,out]) of its consumer; zero that
+        # row so the column denominator Σ_i M^p re-normalizes over the survivors. Its producer
+        # side is handled implicitly — the consumer's I^l[c]=0 flows back as the producer's
+        # output seed. Default None ⇒ byte-identical to one-shot.
+        def _keep_mask(name):
+            if not keep:
+                return None
+            k = keep.get(name)
+            return None if k is None else k.to(Ms[name].device).bool().reshape(-1)
+        if keep:
+            for name in Ms:
+                k = _keep_mask(name)
+                if k is not None:
+                    Ms[name] = Ms[name].clone(); Ms[name][~k] = 0
+                    if name in cov_num:
+                        cov_num[name] = cov_num[name].clone(); cov_num[name][~k] = 0
+
         # ---- DAG walk path (M3): topology provided ----
         if topology is not None:
             return self._propagate_dag(layers, Ms, topology, I_out, eps, p, relative,
                                        wbar_fn=_Wbar, meas_denom=meas_denom,
-                                       cov_num=cov_num)
+                                       cov_num=cov_num, keep_mask=_keep_mask)
 
         # ---- Sequential path (M2): no topology ----
         # Seed I_out at last layer's output
@@ -1586,13 +1605,16 @@ class MeanResidualManager(BaseReparamManager):
                 # D=1/Σ_iM^p; non-relative → D=1/σ_pre^p (L2). Identical for p=2.
                 I_l = _Wbar(M, meas_denom.get(name), cov_num.get(name)) @ I_next  # one layer back → [in]
 
+            km = _keep_mask(name)
+            if km is not None:
+                I_l = I_l * km.to(I_l.dtype)        # pruned inputs carry no importance
             results.append((name, I_l))
             I_next = I_l  # chains to layer l-1 (whose out_dim should equal in_l = I_next.numel())
 
         return OrderedDict(reversed(results))
 
     def _propagate_dag(self, layers, Ms, topology, I_out, eps, p=2, relative=True,
-                       wbar_fn=None, meas_denom=None, cov_num=None):
+                       wbar_fn=None, meas_denom=None, cov_num=None, keep_mask=None):
         """DAG reverse-walk using a downstream+weight topology (M3).
 
         For each layer L (visited in reverse forward order — assumes named_modules order
@@ -1688,7 +1710,11 @@ class MeanResidualManager(BaseReparamManager):
             # fan-in weights `w` above (σ^p/Σσ^p branch split) are a separate, orthogonal mix.
             md = meas_denom.get(name) if meas_denom else None
             cn = cov_num.get(name) if cov_num else None
-            I_by_name[name] = wbar_fn(M, md, cn) @ I_next
+            I_l = wbar_fn(M, md, cn) @ I_next
+            km = keep_mask(name) if keep_mask else None
+            if km is not None:
+                I_l = I_l * km.to(I_l.dtype)        # pruned inputs carry no importance
+            I_by_name[name] = I_l
 
         # Return in forward order
         return OrderedDict((name, I_by_name[name]) for name, _ in layers)
