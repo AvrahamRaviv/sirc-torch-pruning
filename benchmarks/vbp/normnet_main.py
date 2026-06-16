@@ -658,7 +658,7 @@ def main(argv):
                     **_extract_kwargs)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 for k in list(scores.keys()):
-                    t = scores[k].contiguous()
+                    t = scores[k].detach().to(device).contiguous()   # NCCL needs CUDA tensors
                     torch.distributed.broadcast(t, src=0)
                     scores[k] = t
             n0 = sum(int((s < 0.1).sum()) for s in scores.values())
