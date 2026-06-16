@@ -130,6 +130,20 @@ def _propagation_branch_scale(model):
     return scale or None
 
 
+def _residual_blocks(model):
+    """Map each residual Block module → its residual-branch terminal reparam-layer name, for
+    collect_join_covariance. The block's forward must be c = input + branch (a = first input,
+    c = output), so hooking it gives a, c and b = c − a at the ADD. ConvNeXt Block detected by
+    the same (per-channel `gamma` Parameter + `pwconv2` child) signature as the branch scale;
+    the branch terminal is `{block}.pwconv2` (out-channels = residual stream width = c)."""
+    blocks = {}
+    for name, mod in model.named_modules():
+        g = getattr(mod, "gamma", None)
+        if isinstance(g, torch.nn.Parameter) and g.dim() == 1 and hasattr(mod, "pwconv2"):
+            blocks[mod] = f"{name}.pwconv2"
+    return blocks
+
+
 def _ignored_layers(model, model_type, interior_only=False):
     """Layers the global pruner must NOT touch.
 
@@ -493,13 +507,31 @@ def main(argv):
                 log_info("WARNING: --prop_measured_var without --prop_cov = denominator-only "
                          "(numerator stays independence) → mass leaks → depth bias returns. "
                          "Ablation rung only; add --prop_cov for the full fix.")
+            # EXACT residual-join covariance share Cov(b,c)/Var(c) (mass-conserving) — the
+            # join-level analogue of prop_cov, replacing the non-conserving skip_sigma_c rescale.
+            jcov = None
+            if args.scorer == "propagation" and args.prop_join_cov:
+                rblocks = _residual_blocks(model)
+                if not rblocks:
+                    log_info("WARNING: --prop_join_cov set but no residual blocks detected "
+                             "(γ+pwconv2) — independence join shares used.")
+                else:
+                    if args.skip_sigma_c:
+                        log_info("NOTE: --prop_join_cov overrides --skip_sigma_c at joins "
+                                 "(exact mass-conserving Cov(b,c)/Var(c) vs the σ_c rescale).")
+                    jcov = mgr.collect_join_covariance(
+                        calib_loader, rblocks, max_batches=args.calib_batches)
+                    sums = []  # Σ_branch weight per join should be ≈1 (mass-conserved)
+                    log_info(f"prop_join_cov: exact join share on {len(jcov)} residual branches "
+                             f"({args.calib_batches} calib batches), "
+                             f"median weight_b={sorted(float(w.median()) for w in jcov.values())[len(jcov)//2]:.3f}")
             scores = extract_normnet_scores(
                 mgr, args.scorer, example_inputs=(ex if args.scorer == "propagation" else None),
                 p=args.prop_p,
                 relative=not args.prop_non_relative, classifier=clf,
                 use_measured_sigma_c=args.skip_sigma_c,
                 use_measured_var=args.prop_measured_var,
-                branch_out_scale=bscale, input_cov=icov)
+                branch_out_scale=bscale, input_cov=icov, join_cov=jcov)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 for k in list(scores.keys()):
                     t = scores[k].contiguous()
@@ -790,7 +822,14 @@ def parse_args(argv):
     p.add_argument("--skip_sigma_c", action="store_true",
                    help="propagation: at residual joins use the MEASURED post-add std σ_c as the "
                         "branch-weight denominator (PDF σ_c^p/(σ_a^p+σ_b^p) skip factor) instead of "
-                        "the independence sum Σσ_branch^p. Restores the dropped 2·Cov(A,B) term.")
+                        "the independence sum Σσ_branch^p. HEURISTIC: rescales every branch by the "
+                        "same σ_c^p/Σσ^p (shares stay ∝ own variance, sum to σ_c^p/Σσ^p ≠ 1 → "
+                        "spurious join mass). Prefer --prop_join_cov (exact, mass-conserving).")
+    p.add_argument("--prop_join_cov", action="store_true",
+                   help="propagation: EXACT residual-join branch share = Cov(b,c)/Var(c) measured "
+                        "at the add (mass-conserving: Σ_branches = 1; attributes 2·Cov(a,b) to the "
+                        "right path). Join-level analogue of --prop_cov; supersedes the "
+                        "--skip_sigma_c rescale (overrides it if both set).")
     p.add_argument("--prop_measured_var", action="store_true",
                    help="propagation: per-layer denominator = MEASURED output variance σ_out_x^p "
                         "(true Var(Z_j)) instead of the computed independence colsum Σ_i(σ_i W_ij)^p. "

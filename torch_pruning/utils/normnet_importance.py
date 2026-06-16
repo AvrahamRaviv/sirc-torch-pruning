@@ -81,7 +81,7 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
                                  I_out=None, p=2, conv_reduction="frobenius",
                                  on_mismatch="warn", relative=True, classifier=None,
                                  use_measured_sigma_c=False, use_measured_var=False,
-                                 branch_out_scale=None, input_cov=None):
+                                 branch_out_scale=None, input_cov=None, join_cov=None):
     """Pull per-input-channel scores from an ACTIVE reparam manager.
 
     mode="per_layer"   → mgr.input_channel_scores()  (‖σ·v‖ = √NCI, the §2 criterion).
@@ -96,6 +96,9 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
         add (ConvNeXt layer-scale gamma) — see build_propagation_topology.
         input_cov: {name → Σ̂} from mgr.collect_input_covariance() — FULL covariance fix
         (numerator AND denominator together, p=2 only); see propagation_importance.
+        join_cov: {residual_terminal_name → weight_b} from mgr.collect_join_covariance() —
+        EXACT residual-join branch share Cov(b,c)/Var(c) (mass-conserving); supersedes the
+        use_measured_sigma_c heuristic at residual adds. See build_propagation_topology.
 
     Returns OrderedDict[name → 1-D tensor], one score per input channel of that layer.
     Must be called before mgr.merge_back().
@@ -107,7 +110,7 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
         if example_inputs is not None:
             topo = mgr.build_propagation_topology(
                 example_inputs, p=p, use_measured_sigma_c=use_measured_sigma_c,
-                branch_out_scale=branch_out_scale)
+                branch_out_scale=branch_out_scale, join_cov=join_cov)
         # PDF seed: I^o propagated back through the classifier (W̄^fc · 𝟙_classes), so the
         # final-stage features get REAL importance. Without it the terminal seeds uniform →
         # ties → global pruning empties the last stage. None → uniform fallback.
@@ -124,7 +127,8 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
 def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
                            conv_reduction="frobenius", on_mismatch="warn",
                            relative=True, classifier=None, use_measured_sigma_c=False,
-                           use_measured_var=False, branch_out_scale=None, input_cov=None):
+                           use_measured_var=False, branch_out_scale=None, input_cov=None,
+                           join_cov=None):
     """Score extraction with the propagation-needs-mean-variant guard, shared by the
     single-GPU (prune_e2) and DDP (pruning_utils) paths.
 
@@ -145,7 +149,7 @@ def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
         conv_reduction=conv_reduction, on_mismatch=on_mismatch, relative=relative,
         classifier=classifier, use_measured_sigma_c=use_measured_sigma_c,
         use_measured_var=use_measured_var, branch_out_scale=branch_out_scale,
-        input_cov=input_cov)
+        input_cov=input_cov, join_cov=join_cov)
 
 
 class NormalizedNetImportance(GroupMagnitudeImportance):

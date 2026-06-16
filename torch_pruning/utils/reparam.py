@@ -749,6 +749,84 @@ class BaseReparamManager(ABC):
             out[name] = cov / torch.outer(sig, sig)            # correlation, diag = 1
         return out
 
+    def collect_join_covariance(self, loader, residual_blocks, max_batches=50):
+        """EXACT, mass-conserving residual-join branch shares from measured covariance.
+
+        At a residual add c = a + b (skip a + branch b), importance flowing back to c must
+        split by each branch's covariance with the sum, NOT by its own variance:
+
+            weight_b = Cov(b, c) / Var(c)   (Σ_branches Cov(·,c)/Var(c) = Cov(c,c)/Var(c) = 1)
+
+        which conserves mass and attributes the SHARED Cov(a,b) to the right path — unlike the
+        independence share σ_b²/Σσ² (drops 2·Cov(a,b)) and unlike the use_measured_sigma_c
+        rescale (σ_c²/Σσ² boost, keeps shares ∝ own variance, sums to σ_c²/Σσ² ≠ 1).
+
+        Measured at the ADD itself: each block module is hooked, a = block input, c = block
+        output, b = c − a. Per output-channel: Var(c) and Cov(b,c) = Var(c) − Cov(a,c).
+
+        Args:
+            residual_blocks: dict {block_nn_module → residual_terminal_name}. The block's
+                forward must be c = a + (branch), with a = its first input and c = its output
+                (e.g. ConvNeXt Block: x = input + drop_path(γ·pwconv2(...))). The terminal name
+                is the reparam'd layer ending the residual branch (its out-channels = c's), used
+                to key the returned weight onto the topology edge.
+        Returns OrderedDict[residual_terminal_name → per-channel weight_b = Cov(b,c)/Var(c)].
+        For _build_topology_from_dg(join_cov=...); the skip branch(es) take the remainder
+        (1 − weight_b), so the join stays exactly mass-conserving.
+        """
+        if not self._active or not residual_blocks:
+            return OrderedDict()
+        acc = {name: None for name in residual_blocks.values()}   # name → [sa, sc, sac, scc, cnt]
+        name_of = {mod: name for mod, name in residual_blocks.items()}
+
+        def _chan_last(t):  # → [tokens, C]; NCHW conv vs channel-last/linear
+            if t.dim() == 4:
+                return t.permute(0, 2, 3, 1).reshape(-1, t.shape[1]).float()
+            return t.reshape(-1, t.shape[-1]).float()
+
+        def hook(mod, inp, out):
+            a = _chan_last(inp[0].detach())
+            c = _chan_last(out.detach())
+            name = name_of[mod]
+            sa, sc, sac, scc, cnt = a.sum(0), c.sum(0), (a * c).sum(0), (c * c).sum(0), a.shape[0]
+            if acc[name] is None:
+                acc[name] = [sa, sc, sac, scc, cnt]
+            else:
+                acc[name][0] += sa; acc[name][1] += sc
+                acc[name][2] += sac; acc[name][3] += scc; acc[name][4] += cnt
+
+        handles = [m.register_forward_hook(hook) for m in residual_blocks]
+        was_training = self.model.training
+        self.model.eval()
+        for bi, batch in enumerate(loader):
+            if bi >= max_batches:
+                break
+            x = batch[0] if isinstance(batch, (list, tuple)) else batch
+            self.model(x.to(self.device))
+        for h in handles:
+            h.remove()
+        if was_training:
+            self.model.train()
+
+        ddp = torch.distributed.is_available() and torch.distributed.is_initialized()
+        out = OrderedDict()
+        for name in residual_blocks.values():
+            if acc[name] is None:
+                continue
+            sa, sc, sac, scc, cnt = acc[name]
+            if ddp:
+                cnt_t = torch.tensor([float(cnt)], device=sa.device)
+                for t in (sa, sc, sac, scc):
+                    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(cnt_t, op=torch.distributed.ReduceOp.SUM)
+                cnt = float(cnt_t.item())
+            ma, mc = sa / cnt, sc / cnt
+            var_c = (scc / cnt - mc * mc).clamp(min=1e-12)        # Var(c)  per channel
+            cov_ac = sac / cnt - ma * mc                          # Cov(a,c)
+            cov_bc = var_c - cov_ac                               # Cov(b,c) = Var(c) − Cov(a,c)
+            out[name] = cov_bc / var_c                            # weight_b (may be <0 or >1; skip takes 1−)
+        return out
+
     # ------------------------------------------------------------------
     # Abstract interface for subclasses
     # ------------------------------------------------------------------
@@ -1118,7 +1196,7 @@ class MeanResidualManager(BaseReparamManager):
         return self.lambda_reg * loss
 
     def build_propagation_topology(self, example_inputs, p=2, use_measured_sigma_c=False,
-                                   branch_out_scale=None):
+                                   branch_out_scale=None, join_cov=None):
         """Build the per-layer downstream + branch-weight topology via tp.DependencyGraph.
 
         Returns OrderedDict[name → list of (downstream_name, weight)]:
@@ -1191,14 +1269,16 @@ class MeanResidualManager(BaseReparamManager):
 
             return self._build_topology_from_dg(DG, name_by_module, saved, p=p,
                                                 use_measured_sigma_c=use_measured_sigma_c,
-                                                branch_out_scale=branch_out_scale)
+                                                branch_out_scale=branch_out_scale,
+                                                join_cov=join_cov)
         finally:
             # Swap reparam'd modules back regardless of outcome.
             for name, original_rp in saved.items():
                 self._replace_module(name, original_rp)
 
     def _build_topology_from_dg(self, DG, name_by_module, saved, p=2,
-                                use_measured_sigma_c=False, branch_out_scale=None):
+                                use_measured_sigma_c=False, branch_out_scale=None,
+                                join_cov=None):
         """Walk the DepGraph forward to assemble the (downstream_name, weight) topology.
         Branch weights at residual ADDs come from σ_out^p (mean per branch). When
         use_measured_sigma_c, the join denominator is the measured post-add σ_c (PDF skip
@@ -1251,6 +1331,26 @@ class MeanResidualManager(BaseReparamManager):
             unique_branches = list(dict.fromkeys(branches))  # de-dup, preserve order
             if len(unique_branches) == 1:
                 weights[(unique_branches[0], dst)] = 1.0
+            elif join_cov and any(b in join_cov for b in unique_branches):
+                # EXACT covariance share (mass-conserving): residual branch b gets the measured
+                # Cov(b,c)/Var(c); the skip branch(es) — not in join_cov — take the remainder
+                # (1 − Σ weight_b), split by σ^p if more than one. Σ over branches = 1 exactly,
+                # so no spurious mass at the join (unlike use_measured_sigma_c). See
+                # collect_join_covariance.
+                resid = [b for b in unique_branches if b in join_cov]
+                skips = [b for b in unique_branches if b not in join_cov]
+                wsum = None
+                for b in resid:
+                    wb = join_cov[b].detach()
+                    weights[(b, dst)] = wb
+                    wsum = wb if wsum is None else wsum + wb
+                remainder = (1.0 - wsum) if wsum is not None else 1.0
+                if skips:
+                    ssig = {b: self._reparam_modules[b].sigma_out_x.detach().pow(p) for b in skips}
+                    sbase = sum(ssig.values()) + 1e-8
+                    for b in skips:
+                        weights[(b, dst)] = remainder * (ssig[b] / sbase)
+                continue
             else:
                 # Branch σ at the ADD: sigma_out_x is measured at the layer's raw output;
                 # apply any per-channel scale sitting between it and the add (ConvNeXt
