@@ -81,7 +81,8 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
                                  I_out=None, p=2, conv_reduction="frobenius",
                                  on_mismatch="warn", relative=True, classifier=None,
                                  use_measured_sigma_c=False, use_measured_var=False,
-                                 branch_out_scale=None, input_cov=None, join_cov=None):
+                                 branch_out_scale=None, input_cov=None, join_cov=None,
+                                 keep=None):
     """Pull per-input-channel scores from an ACTIVE reparam manager.
 
     mode="per_layer"   → mgr.input_channel_scores()  (‖σ·v‖ = √NCI, the §2 criterion).
@@ -120,7 +121,7 @@ def extract_input_channel_scores(mgr, mode="per_layer", *, example_inputs=None,
         return mgr.propagation_importance(
             I_out=seed, p=p, conv_reduction=conv_reduction,
             on_mismatch=on_mismatch, topology=topo, relative=relative,
-            use_measured_var=use_measured_var, input_cov=input_cov)
+            use_measured_var=use_measured_var, input_cov=input_cov, keep=keep)
     raise ValueError(f"mode must be 'per_layer' or 'propagation', got {mode!r}")
 
 
@@ -128,7 +129,7 @@ def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
                            conv_reduction="frobenius", on_mismatch="warn",
                            relative=True, classifier=None, use_measured_sigma_c=False,
                            use_measured_var=False, branch_out_scale=None, input_cov=None,
-                           join_cov=None):
+                           join_cov=None, keep=None):
     """Score extraction with the propagation-needs-mean-variant guard, shared by the
     single-GPU (prune_e2) and DDP (pruning_utils) paths.
 
@@ -149,7 +150,7 @@ def extract_normnet_scores(mgr, mode, example_inputs=None, *, p=2,
         conv_reduction=conv_reduction, on_mismatch=on_mismatch, relative=relative,
         classifier=classifier, use_measured_sigma_c=use_measured_sigma_c,
         use_measured_var=use_measured_var, branch_out_scale=branch_out_scale,
-        input_cov=input_cov, join_cov=join_cov)
+        input_cov=input_cov, join_cov=join_cov, keep=keep)
 
 
 class NormalizedNetImportance(GroupMagnitudeImportance):

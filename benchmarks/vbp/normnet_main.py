@@ -28,6 +28,7 @@ Examples
 import argparse
 import os
 import sys
+from collections import OrderedDict
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
@@ -142,6 +143,113 @@ def _residual_blocks(model):
         if isinstance(g, torch.nn.Parameter) and g.dim() == 1 and hasattr(mod, "pwconv2"):
             blocks[mod] = f"{name}.pwconv2"
     return blocks
+
+
+def _prunable_input_layers(model_type, score_names):
+    """The layers whose INPUT channels the pruner actually removes — the greedy candidate pool.
+    convnext: pwconv2 inputs (= pwconv1 outputs, the only pruned dim, matches _ignored_layers).
+    Other model types: all scored layers (the TP ignored_layers filter still applies at prune)."""
+    if model_type == "convnext":
+        return [n for n in score_names if n.endswith(".pwconv2")]
+    return list(score_names)
+
+
+def _apply_imp_normalizer(s, normalizer):
+    """Per-layer importance normalizer matching NormalizedNetImportance/_normalize, applied
+    to the greedy candidate scores so the greedy ranks channels the SAME way the global
+    threshold would. Folding it in here lets the pruner run with normalizer='none' on the
+    emitted removal-rank scores (else the rank order would be re-scaled and broken)."""
+    eps = 1e-12
+    if normalizer in (None, "none"):
+        return s
+    if normalizer == "width":
+        return s * s.numel()                       # undo the 1/width per-channel dilution
+    if normalizer == "mean":
+        return s / (s.mean() + eps)
+    if normalizer == "max":
+        return s / (s.max() + eps)
+    if normalizer == "sum":
+        return s / (s.sum() + eps)
+    return s                                       # gaussian/standarization: leave (rare here)
+
+
+def _iterative_propagation_scores(mgr, ex, extract_kwargs, *, model_type, normalizer,
+                                  drop_per_round=1, max_frac=1.0, log=print):
+    """Greedy iterative propagation pruning (v2 §'Importance score updating'), DAG-aware.
+
+    Loops: (1) score with the current channels masked (extract_normnet_scores(keep=...) → the
+    'variances forced to 1' update), (2) remove the global-least-important prunable channel
+    (ranked by the SAME normalizer the pruner uses), (3) repeat. Emits a per-input-channel
+    REMOVAL-RANK score: pruned-earliest = lowest → the unchanged global MAC/ratio threshold
+    (run with normalizer='none') prunes exactly the greedy prefix at any target.
+
+    Returns (scores OrderedDict[name → rank tensor], removal_order list[(name, ch)])."""
+    import torch as _t
+    from torch_pruning.utils.normnet_importance import _classifier_seed
+    # Build the DAG topology + classifier seed ONCE — `keep` masks channels INSIDE the backward
+    # recursion (it does not change the graph topology or the logits seed), so rebuilding them
+    # every round (as extract_normnet_scores would) is pure waste. Score via the masked
+    # propagation_importance directly in the loop.
+    ek = dict(extract_kwargs)
+    p = ek.get("p", 2)
+    topo = mgr.build_propagation_topology(
+        ex, p=p, use_measured_sigma_c=ek.get("use_measured_sigma_c", False),
+        branch_out_scale=ek.get("branch_out_scale"), join_cov=ek.get("join_cov"))
+    clf = ek.get("classifier")
+    seed = _classifier_seed(mgr, topo, clf, p) if clf is not None else None
+
+    def _score(keep):
+        return mgr.propagation_importance(
+            I_out=seed, p=p, topology=topo, relative=ek.get("relative", True),
+            use_measured_var=ek.get("use_measured_var", False),
+            input_cov=ek.get("input_cov"), keep=keep)
+
+    S0 = _score(None)
+    pool = _prunable_input_layers(model_type, list(S0.keys()))
+    pool = [n for n in pool if S0[n].numel() > 0]
+    keep = {n: _t.ones(S0[n].numel(), dtype=_t.bool) for n in pool}
+    total = sum(int(m.numel()) for m in keep.values())
+    target = max(0, min(int(round(max_frac * total)), total))
+    log(f"prop_iterative: pool={len(pool)} prunable layers, {total} channels; "
+        f"greedy target={target} (drop_per_round={drop_per_round})")
+
+    order, milestone = [], max(1, target // 10)
+    while len(order) < target:
+        S = _score(keep)
+        cand = []
+        for n in pool:
+            sn = _apply_imp_normalizer(S[n].float(), normalizer)
+            sn = _t.nan_to_num(sn, nan=float("inf"))   # degenerate → never "least important"
+            for c in _t.nonzero(keep[n]).flatten().tolist():
+                cand.append((float(sn[c]), n, c))
+        cand.sort(key=lambda t: t[0])                  # nan→inf above keeps the sort total-ordered
+        k = min(drop_per_round, target - len(order), len(cand))
+        for _, n, c in cand[:k]:
+            keep[n][c] = False
+            order.append((n, c))
+        if len(order) % milestone < k:
+            log(f"  iter: pruned {len(order)}/{target}  (global-min {cand[0][0]:.3e} "
+                f"@ {cand[0][1]}[{cand[0][2]}])")
+
+    # rank scores: removed channel → its removal step (lower = pruned first); survivors →
+    # total + (final normalized importance) so they always rank above every removed channel.
+    Sf = _score(keep)
+    out = OrderedDict()
+    rank = {n: _t.full((S0[n].numel(),), float(total), dtype=_t.float) for n in pool}
+    for step, (n, c) in enumerate(order):
+        rank[n][c] = float(step)
+    for n, s in S0.items():
+        if n in rank:
+            r = rank[n].clone()
+            surv = keep[n]
+            if surv.any():
+                sf = _apply_imp_normalizer(Sf[n].float().cpu(), normalizer)[surv]
+                sf = _t.nan_to_num(sf, nan=0.0)
+                r[surv] = float(total) + sf / (sf.abs().max() + 1e-12)   # ordered, > all removed
+            out[n] = r
+        else:
+            out[n] = s.float()                     # non-pool (ignored at prune) — left as-is
+    return out, order
 
 
 def _ignored_layers(model, model_type, interior_only=False):
@@ -525,13 +633,29 @@ def main(argv):
                     log_info(f"prop_join_cov: exact join share on {len(jcov)} residual branches "
                              f"({args.calib_batches} calib batches), "
                              f"median weight_b={sorted(float(w.median()) for w in jcov.values())[len(jcov)//2]:.3f}")
-            scores = extract_normnet_scores(
-                mgr, args.scorer, example_inputs=(ex if args.scorer == "propagation" else None),
-                p=args.prop_p,
-                relative=not args.prop_non_relative, classifier=clf,
+            _extract_kwargs = dict(
+                p=args.prop_p, relative=not args.prop_non_relative, classifier=clf,
                 use_measured_sigma_c=args.skip_sigma_c,
                 use_measured_var=args.prop_measured_var,
                 branch_out_scale=bscale, input_cov=icov, join_cov=jcov)
+            if args.scorer == "propagation" and args.prop_iterative:
+                if args.prop_iter_drop < 1:
+                    raise SystemExit("--prop_iter_drop must be ≥ 1")
+                scores, _iter_order = _iterative_propagation_scores(
+                    mgr, ex, _extract_kwargs, model_type=args.model_type,
+                    normalizer=args.imp_normalizer, drop_per_round=args.prop_iter_drop,
+                    max_frac=args.prop_iter_max_frac, log=log_info)
+                # the normalizer is now folded into the greedy removal order (rank scores) →
+                # the pruner must NOT re-apply it, else the rank order is re-scaled and broken.
+                if args.imp_normalizer != "none":
+                    log_info(f"prop_iterative: normalizer '{args.imp_normalizer}' folded into "
+                             f"greedy ranking → pruner runs with normalizer='none'")
+                    args.imp_normalizer = "none"
+            else:
+                scores = extract_normnet_scores(
+                    mgr, args.scorer,
+                    example_inputs=(ex if args.scorer == "propagation" else None),
+                    **_extract_kwargs)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 for k in list(scores.keys()):
                     t = scores[k].contiguous()
@@ -838,6 +962,24 @@ def parse_args(argv):
                         "varying → mass leaks per step → depth bias RETURNS, worse than no fix. "
                         "Fix numerator+denominator together (--prop_cov) or neither. Kept as "
                         "ablation rung.")
+    p.add_argument("--prop_iterative", action="store_true",
+                   help="propagation: ITERATIVE (greedy) score updating (v2 §'Importance score "
+                        "updating'). Instead of scoring once, greedily (1) score, (2) remove the "
+                        "global-least-important prunable channel, (3) re-score with it masked out "
+                        "(propagation_importance(keep=...), the 'variances forced to 1' update — "
+                        "no forward variance pass, no transfer-fn assumption), repeat. Accounts "
+                        "for inter-layer dependency the one-shot score ignores. Emits a per-channel "
+                        "REMOVAL-RANK score (pruned-earliest = lowest) → the existing global "
+                        "MAC/ratio threshold prunes the greedy prefix. propagation scorer only.")
+    p.add_argument("--prop_iter_drop", type=int, default=1,
+                   help="iterative: channels removed per round (re-score every k removals). 1 = "
+                        "pure one-at-a-time greedy (spec default); >1 = batched bottom-k speed knob "
+                        "(L·M² per round; larger k → fewer rounds, coarser update).")
+    p.add_argument("--prop_iter_max_frac", type=float, default=1.0,
+                   help="iterative: prune this fraction of the prunable channel pool greedily "
+                        "(removal order beyond it is irrelevant — the threshold never reaches). "
+                        "1.0 = full order (safe for any ratio); lower = faster when the MAC target "
+                        "is shallow.")
     p.add_argument("--pruning_ratio", type=float, default=0.5)
     p.add_argument("--mac_target_g", type=float, default=0.0,
                    help="target MACs in GMAC (e.g. 2.0). >0 overrides --pruning_ratio: "
