@@ -307,11 +307,22 @@ def _ignored_layers(model, model_type, interior_only=False):
             if isinstance(m, (torch.nn.Linear, torch.nn.Conv2d)) and not _vit_fc1(name):
                 ig.append(m)
     elif model_type == "cnn" and interior_only:
-        # residual-stream out-channels = stem conv1 + every blockX.Y.conv3 + downsample conv.
+        # Protect the RESIDUAL-STREAM out-channels; leave only the bottleneck interior prunable.
+        #   ResNet: stem conv1 + every blockX.Y.conv3 (bottleneck output) + downsample conv.
+        #   MobileNetV2: stem features.0.0 + every project conv (blocks 2-17 '.conv.2',
+        #     block-1 'features.1.conv.1') + final 'features.18.0'. Leaves the inverted-residual
+        #     EXPANSION (conv.0.0 1×1 expand + conv.1.0 3×3 depthwise) prunable — the expanded
+        #     hidden dim (= conv.2 input), the mnv2 analogue of resnet conv1/conv2 / convnext
+        #     pwconv1. Protecting '.conv.2' stops global pruning gutting the stream to 1 channel
+        #     (the collapse seen at aggressive MAC like 0.15G).
         for name, m in model.named_modules():
             if not isinstance(m, torch.nn.Conv2d):
                 continue
-            if name == "conv1" or name.endswith(".conv3") or ".downsample." in name:
+            resnet_stream = (name == "conv1" or name.endswith(".conv3")
+                             or ".downsample." in name)
+            mbv2_stream = (name == "features.0.0" or name.endswith(".conv.2")
+                           or name == "features.1.conv.1" or name == "features.18.0")
+            if resnet_stream or mbv2_stream:
                 ig.append(m)
     return ig
 
