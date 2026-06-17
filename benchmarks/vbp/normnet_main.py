@@ -102,12 +102,30 @@ def _ratio_for_mac(model, ex, imp_factory, ignored_factory, target_g, global_pru
 
 
 def _classifier(model):
-    """The logits head: resnet/mobilenet → .fc, convnext/timm → .head. None if neither."""
-    for attr in ("fc", "head"):
+    """The logits head: resnet/mobilenet → .fc, convnext/timm → .head, HF ViT → .classifier.
+    None if neither."""
+    for attr in ("fc", "head", "classifier"):
         m = getattr(model, attr, None)
         if isinstance(m, torch.nn.Linear):
             return m
     return None
+
+
+# --- ViT/DeiT MLP-layer predicates (arch-agnostic: HF transformers ViT/DeiT AND timm) ----
+def _vit_is_attn(name):
+    return ".attention." in name or ".attn." in name
+
+
+def _vit_fc1(name):
+    """The MLP intermediate/expand layer (output = the prunable hidden dim)."""
+    return name.endswith(".intermediate.dense") or name.endswith(".mlp.fc1")
+
+
+def _vit_fc2(name):
+    """The MLP output/project layer (input = the prunable hidden dim). Exclude attention's
+    own '.output.dense' (HF attention proj shares the .output.dense suffix)."""
+    return (name.endswith(".output.dense") and not _vit_is_attn(name)) \
+        or name.endswith(".mlp.fc2")
 
 
 def _propagation_branch_scale(model):
@@ -151,6 +169,8 @@ def _prunable_input_layers(model_type, score_names):
     Other model types: all scored layers (the TP ignored_layers filter still applies at prune)."""
     if model_type == "convnext":
         return [n for n in score_names if n.endswith(".pwconv2")]
+    if model_type == "vit":
+        return [n for n in score_names if _vit_fc2(n)]   # fc2 inputs = the pruned hidden dim
     return list(score_names)
 
 
@@ -277,6 +297,15 @@ def _ignored_layers(model, model_type, interior_only=False):
         for stage in model.stages:
             for block in stage:
                 ig += [block.dwconv, block.pwconv2]
+    elif model_type == "vit":
+        # MLP-only (mirrors convnext + vbp_imagenet_pat build_layers_to_prune): prune ONLY the
+        # MLP intermediate/fc1 output (the 4×dim hidden = fc2 input). Ignore everything else —
+        # attention (q/k/v + proj), the MLP fc2 (its out = residual-stream width), patch_embed,
+        # and the head. Attention is also kept OUT of the propagation reparam set (see main:
+        # softmax/head reshape isn't channel-linear → would break the propagation DAG).
+        for name, m in model.named_modules():
+            if isinstance(m, (torch.nn.Linear, torch.nn.Conv2d)) and not _vit_fc1(name):
+                ig.append(m)
     elif model_type == "cnn" and interior_only:
         # residual-stream out-channels = stem conv1 + every blockX.Y.conv3 + downsample conv.
         for name, m in model.named_modules():
@@ -300,8 +329,17 @@ def _post_act_target_layers(model, model_type, ex):
     if model_type == "convnext":
         return [(blk.pwconv1, blk.act) for stage in model.stages for blk in stage]
     if model_type == "vit":
-        return [(b.intermediate.dense, b.intermediate.intermediate_act_fn)
-                for b in model.vit.encoder.layer]
+        # Arch-agnostic (HF ViT/DeiT `.intermediate` + `.intermediate_act_fn`; timm `.mlp`
+        # with `.fc1` + `.act`) — pair each MLP's fc1 producer with its activation.
+        out = []
+        for name, m in model.named_modules():
+            if name.endswith(".intermediate") and hasattr(m, "dense") \
+                    and hasattr(m, "intermediate_act_fn"):
+                out.append((m.dense, m.intermediate_act_fn))
+            elif name.endswith(".mlp") and hasattr(m, "fc1") and hasattr(m, "act"):
+                out.append((m.fc1, m.act))
+        if out:
+            return out
     from torch_pruning.pruner.importance import build_cnn_target_layers
     dg = tp.DependencyGraph().build_dependency(model, example_inputs=ex)
     return build_cnn_target_layers(model, dg)
@@ -554,6 +592,13 @@ def main(argv):
     do_normalize = args.scorer not in ("magnitude", "variance", "tp_variance", "bn_scale")
     names = build_whole_net_reparam_layers(
         model, exclude_classifier=True, exclude_stem=args.exclude_stem)
+    if args.model_type == "vit":
+        # MLP-only reparam: keep ONLY fc1/fc2; drop attention (q/k/v + proj) + patch_embed.
+        # Attention's qkv→reshape→softmax→proj is not channel-linear (576≠192 fan-out) and
+        # would break the propagation DAG; the MLP chain (fc1→GELU→fc2) is channel-linear and
+        # carries the prunable hidden dim. Scores still propagate block→block via the residual
+        # stream (attention traversed transparently as a non-reparam'd pass-through).
+        names = [n for n in names if _vit_fc1(n) or _vit_fc2(n)]
     args.max_batches = args.calib_batches
     mgr = build_reparam_manager(model, names, device, args)
     # Calibrate σ/μ on CLEAN center-crop images, NOT the augmented train loader (scale-0.08
