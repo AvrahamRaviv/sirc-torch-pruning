@@ -194,7 +194,8 @@ def _apply_imp_normalizer(s, normalizer):
 
 
 def _iterative_propagation_scores(mgr, ex, extract_kwargs, *, model_type, normalizer,
-                                  drop_per_round=1, max_frac=1.0, log=print):
+                                  drop_per_round=1, max_frac=1.0, protected_names=frozenset(),
+                                  log=print):
     """Greedy iterative propagation pruning (v2 §'Importance score updating'), DAG-aware.
 
     Loops: (1) score with the current channels masked (extract_normnet_scores(keep=...) → the
@@ -227,6 +228,10 @@ def _iterative_propagation_scores(mgr, ex, extract_kwargs, *, model_type, normal
     S0 = _score(None)
     pool = _prunable_input_layers(model_type, list(S0.keys()))
     pool = [n for n in pool if S0[n].numel() > 0]
+    if protected_names:                                # respect interior_only / ignored scope:
+        pool = [n for n in pool if n not in protected_names]   # never greedily remove channels
+                                                       # the real pruner ignores (e.g. mnv2 the
+                                                       # shared residual-stream .conv.2 width)
     keep = {n: _t.ones(S0[n].numel(), dtype=_t.bool) for n in pool}
     total = sum(int(m.numel()) for m in keep.values())
     target = max(0, min(int(round(max_frac * total)), total))
@@ -697,10 +702,14 @@ def main(argv):
             if args.scorer == "propagation" and args.prop_iterative:
                 if args.prop_iter_drop < 1:
                     raise SystemExit("--prop_iter_drop must be ≥ 1")
+                _prot_ids = {id(m) for m in
+                             _ignored_layers(model, args.model_type,
+                                             interior_only=args.interior_only)}
+                _prot_names = {n for n, m in model.named_modules() if id(m) in _prot_ids}
                 scores, _iter_order = _iterative_propagation_scores(
                     mgr, ex, _extract_kwargs, model_type=args.model_type,
                     normalizer=args.imp_normalizer, drop_per_round=args.prop_iter_drop,
-                    max_frac=args.prop_iter_max_frac, log=log_info)
+                    max_frac=args.prop_iter_max_frac, protected_names=_prot_names, log=log_info)
                 # the normalizer is now folded into the greedy removal order (rank scores) →
                 # the pruner must NOT re-apply it, else the rank order is re-scaled and broken.
                 if args.imp_normalizer != "none":
