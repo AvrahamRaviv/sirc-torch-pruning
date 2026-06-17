@@ -108,6 +108,10 @@ def _classifier(model):
         m = getattr(model, attr, None)
         if isinstance(m, torch.nn.Linear):
             return m
+        if isinstance(m, torch.nn.Sequential):                 # mobilenet_v2: classifier =
+            for sub in reversed(m):                            # Sequential(Dropout, Linear) →
+                if isinstance(sub, torch.nn.Linear):           # the last Linear is the logits head
+                    return sub
     return None
 
 
