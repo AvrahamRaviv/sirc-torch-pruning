@@ -745,8 +745,19 @@ class BaseReparamManager(ABC):
                 cnt = float(cnt_t.item())
             mean = As / cnt
             cov = AtA / cnt - torch.outer(mean, mean)
-            sig = cov.diag().clamp(min=1e-12).sqrt()
-            out[name] = cov / torch.outer(sig, sig)            # correlation, diag = 1
+            # Variance is non-negative, but a near-constant channel (dead/saturated activation)
+            # lands cov.diag ≈ 0 or slightly NEGATIVE via float cancellation (AtA/cnt ≈ mean²).
+            # A naive correlation then divides by a hard-clamped sqrt and EXPLODES (diag → -1e4,
+            # off-diag → 1e6), and WHICH channel crosses zero is float-order/platform dependent
+            # → non-reproducible blow-up that measured_var amplifies through the propagation chain.
+            # Clamp variance ≥ 0 with a RELATIVE floor, bound the correlation to its valid [-1,1]
+            # range, and force an exact unit diagonal so diag(Σ̂)=1 (independence recovery) holds.
+            var = cov.diag().clamp_min(0.0)
+            floor = 1e-8 * var.max().clamp_min(1e-12)
+            sig = var.clamp_min(floor).sqrt()
+            corr = (cov / torch.outer(sig, sig)).clamp_(-1.0, 1.0)
+            corr.diagonal().copy_(torch.ones_like(sig))
+            out[name] = corr
         return out
 
     def collect_join_covariance(self, loader, residual_blocks, max_batches=50):
