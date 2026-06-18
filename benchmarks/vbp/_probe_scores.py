@@ -46,6 +46,9 @@ def main():
     ap.add_argument("--ckpt", required=True, help="mobilenet_v2 weights .pth")
     ap.add_argument("--fixed", required=True, help="shared fixed input tensor (calib32.pt)")
     ap.add_argument("--full", action="store_true", help="print every layer, not just probes")
+    ap.add_argument("--debug", action="store_true",
+                    help="dump per-layer intermediates (raw |v|, sigma_x, sigma_out_x, seed) "
+                         "to localize the divergence stage: weights vs calibration vs propagation")
     args = ap.parse_args()
 
     print("torch", torch.__version__, "| torchvision", tv.__name__ and __import__("torchvision").__version__)
@@ -67,7 +70,36 @@ def main():
     names = build_whole_net_reparam_layers(m, exclude_classifier=True, exclude_stem=False)
     mgr = build_reparam_manager(m, names, "cpu", nargs)
     mgr.reparameterize(calib)
+
+    if args.debug:
+        # STAGE diagnostics. Compare these across machines top-down: the FIRST stage that
+        # differs is the culprit.
+        #   |v| (raw weight L2)  → weights only; MUST match if checkpoints identical.
+        #   sigma_x / sigma_out_x → calibration+forward; platform/torch-numerics sensitive.
+        #   seed (terminal)       → classifier_seed = f(W, sigma_out_x).
+        from torch_pruning.utils.normnet_importance import _classifier_seed  # noqa
+        print("=== STAGE 1-2: weights (|v|) + calibration (sigma) per layer ===")
+        for name, rp in mgr._reparam_modules.items():
+            v = rp.v.detach().float()
+            sx = rp.sigma_x.detach().float()
+            so = rp.sigma_out_x.detach().float()
+            print(f"  {name:24s} |v|={float(v.flatten().norm()):.6e} "
+                  f"sx.mean={float(sx.mean()):.6e} so.mean={float(so.mean()):.6e} "
+                  f"so.cv={float(so.std()/(so.mean()+1e-12)):.4f}")
+
     icov = mgr.collect_input_covariance(calib, max_batches=1)
+    if args.debug:
+        print("=== STAGE 3: input covariance diag mean per layer ===")
+        for name, S in icov.items():
+            d = S.detach().float().diagonal()
+            print(f"  {name:24s} cov.diag.mean={float(d.mean()):.6e} cov.absmax={float(S.abs().max()):.6e}")
+        _topo = mgr.build_propagation_topology(ex, p=2)
+        _seed = _classifier_seed(mgr, _topo, NM._classifier(m), 2)
+        if _seed:
+            for tn, sv in _seed.items():
+                sv = sv.float()
+                print(f"=== STAGE 4: seed[{tn}] mean={float(sv.mean()):.6e} "
+                      f"cv={float(sv.std()/(sv.mean()+1e-12)):.4f} ===")
     ek = dict(p=2, relative=True, classifier=NM._classifier(m), use_measured_sigma_c=False,
               use_measured_var=True, branch_out_scale=None, input_cov=icov, join_cov=None)
     sc = extract_normnet_scores(mgr, "propagation", example_inputs=ex, **ek)
