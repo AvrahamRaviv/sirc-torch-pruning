@@ -550,7 +550,11 @@ def _run_phase(model, mgr, loaders, args, device, use_ddp, *, epochs, lr, tag, t
 
 def main(argv):
     args = parse_args(argv[1:])
-    use_ddp = not args.disable_ddp and "RANK" in os.environ
+    # DDP if launched multi-process. WORLD_SIZE>1 is set by BOTH torchrun and
+    # torch.distributed.launch; RANK kept as a fallback. Must be detected BEFORE
+    # setup_logging so is_main() gates logging to rank 0 (else every rank prints).
+    use_ddp = not args.disable_ddp and (
+        int(os.environ.get("WORLD_SIZE", "1")) > 1 or "RANK" in os.environ)
     if use_ddp:
         from normalize_net import setup_distributed
         device = setup_distributed(args)
