@@ -198,19 +198,32 @@ def _apply_imp_normalizer(s, normalizer):
 
 
 def _iterative_propagation_scores(mgr, ex, extract_kwargs, *, model_type, normalizer,
-                                  drop_per_round=1, max_frac=1.0, protected_names=frozenset(),
+                                  drop_per_round=1, max_frac=1.0, ignored_names=frozenset(),
                                   log=print):
-    """Greedy iterative propagation pruning (v2 §'Importance score updating'), DAG-aware.
+    """Greedy iterative propagation pruning (v2 §'Importance score updating'), GROUP-aware.
 
-    Loops: (1) score with the current channels masked (extract_normnet_scores(keep=...) → the
-    'variances forced to 1' update), (2) remove the global-least-important prunable channel
-    (ranked by the SAME normalizer the pruner uses), (3) repeat. Emits a per-input-channel
+    Loops: (1) score with the current channels masked (propagation_importance(keep=...) → the
+    'variances forced to 1' update), (2) remove the global-least-important prunable GROUP-channel
+    (ranked by the SAME reduce+normalizer the pruner uses), (3) repeat. Emits a per-input-channel
     REMOVAL-RANK score: pruned-earliest = lowest → the unchanged global MAC/ratio threshold
     (run with normalizer='none') prunes exactly the greedy prefix at any target.
 
-    Returns (scores OrderedDict[name → rank tensor], removal_order list[(name, ch)])."""
+    GROUP-aware (vs per-layer): a physical prunable dimension can feed SEVERAL in-channel
+    consumers (mnv2 residual stream: G64 = features.8/9/10/11.conv.0.0 — ONE dim, 4 consumers).
+    Scoring/masking per layer-name double-counts it in the budget AND lets the keep state for the
+    same channel diverge across views → degenerate greedy (this was why iter HURT mnv2: 0.11 vs
+    one-shot 0.346, while convnext — pwconv2 one-consumer-per-group — was clean). We build the
+    real TP groups (on a merged clone; mgr stays active) and greedily remove a group-channel at a
+    time: score = reduce(mean) over the group's consumers (matching NormalizedNetImportance),
+    mask sets keep=False for that channel in EVERY consumer, rank emitted to every consumer.
+
+    Returns (scores OrderedDict[name → rank tensor], removal_order list[(group_idx, ch)])."""
+    import copy as _copy
     import torch as _t
+    import torch_pruning as _tp
+    import torch_pruning.pruner.function as _F
     from torch_pruning.utils.normnet_importance import _classifier_seed
+    _IN = (_F.prune_conv_in_channels, _F.prune_linear_in_channels)
     # Build the DAG topology + classifier seed ONCE — `keep` masks channels INSIDE the backward
     # recursion (it does not change the graph topology or the logits seed), so rebuilding them
     # every round (as extract_normnet_scores would) is pure waste. Score via the masked
@@ -230,54 +243,84 @@ def _iterative_propagation_scores(mgr, ex, extract_kwargs, *, model_type, normal
             input_cov=ek.get("input_cov"), keep=keep)
 
     S0 = _score(None)
-    pool = _prunable_input_layers(model_type, list(S0.keys()))
-    pool = [n for n in pool if S0[n].numel() > 0]
-    if protected_names:                                # respect interior_only / ignored scope:
-        pool = [n for n in pool if n not in protected_names]   # never greedily remove channels
-                                                       # the real pruner ignores (e.g. mnv2 the
-                                                       # shared residual-stream .conv.2 width)
-    keep = {n: _t.ones(S0[n].numel(), dtype=_t.bool) for n in pool}
-    total = sum(int(m.numel()) for m in keep.values())
+
+    # --- real prunable groups (deduped multi-consumer dims) from the TP dependency graph ---
+    # Build on a merged plain CLONE: the reparam-active model exposes MeanResidualConv2d (not
+    # nn.Conv2d) so the DepGraph can't trace coupling on it. deepcopy+merge_back leaves the live
+    # mgr untouched (verified). Group canonical channel j ↔ each member's local idxs[j] (TP keeps
+    # every dep's idxs position-aligned to the group's prune order), so masking idxs[j] in all
+    # members removes exactly one physical dim, consistently.
+    _clone = _copy.deepcopy(mgr)
+    _clone.merge_back()
+    DG = _tp.DependencyGraph().build_dependency(_clone.model, ex)
+    _name_of = {m: n for n, m in _clone.model.named_modules()}
+    _ig = [m for n, m in _clone.model.named_modules() if n in ignored_names]
+    groups = []                                        # list[ list[(name, idxs list)] ]
+    for g in DG.get_all_groups(ignored_layers=_ig,
+                               root_module_types=[_t.nn.Conv2d, _t.nn.Linear]):
+        members, seen = [], set()
+        for dep, idxs in g:
+            if dep.handler in _IN:                     # in-channel side = where our score lives
+                nm = _name_of.get(dep.target.module)
+                if nm in S0 and nm not in seen and S0[nm].numel() > 0:
+                    members.append((nm, list(idxs)))
+                    seen.add(nm)
+        if members:
+            groups.append(members)
+
+    pool_names = sorted({nm for mem in groups for nm, _ in mem})
+    keep = {n: _t.ones(S0[n].numel(), dtype=_t.bool) for n in pool_names}
+    g_keep = [_t.ones(len(mem[0][1]), dtype=_t.bool) for mem in groups]
+
+    def _group_score(S, mem):                          # reduce(mean over consumers) → normalize
+        acc = None                                     # (matches NormalizedNetImportance)
+        for nm, idxs in mem:
+            v = S[nm].float().cpu()[_t.as_tensor(idxs)]
+            acc = v if acc is None else acc + v
+        return _apply_imp_normalizer(acc / len(mem), normalizer)
+
+    total = sum(int(k.sum()) for k in g_keep)
     target = max(0, min(int(round(max_frac * total)), total))
-    log(f"prop_iterative: pool={len(pool)} prunable layers, {total} channels; "
+    log(f"prop_iterative: {len(groups)} groups, {total} group-channels; "
         f"greedy target={target} (drop_per_round={drop_per_round})")
 
     order, milestone = [], max(1, target // 10)
     while len(order) < target:
         S = _score(keep)
         cand = []
-        for n in pool:
-            sn = _apply_imp_normalizer(S[n].float(), normalizer)
-            sn = _t.nan_to_num(sn, nan=float("inf"))   # degenerate → never "least important"
-            for c in _t.nonzero(keep[n]).flatten().tolist():
-                cand.append((float(sn[c]), n, c))
-        cand.sort(key=lambda t: t[0])                  # nan→inf above keeps the sort total-ordered
+        for gi, mem in enumerate(groups):
+            gs = _t.nan_to_num(_group_score(S, mem), nan=float("inf"))
+            for j in _t.nonzero(g_keep[gi]).flatten().tolist():
+                cand.append((float(gs[j]), gi, j))
+        cand.sort(key=lambda t: t[0])                  # nan→inf above keeps it total-ordered
         k = min(drop_per_round, target - len(order), len(cand))
-        for _, n, c in cand[:k]:
-            keep[n][c] = False
-            order.append((n, c))
+        for _, gi, j in cand[:k]:
+            g_keep[gi][j] = False
+            order.append((gi, j))
+            for nm, idxs in groups[gi]:                # mask the SAME physical dim in all views
+                keep[nm][idxs[j]] = False
         if len(order) % milestone < k:
             log(f"  iter: pruned {len(order)}/{target}  (global-min {cand[0][0]:.3e} "
-                f"@ {cand[0][1]}[{cand[0][2]}])")
+                f"@ g{cand[0][1]}[{cand[0][2]}])")
 
-    # rank scores: removed channel → its removal step (lower = pruned first); survivors →
-    # total + (final normalized importance) so they always rank above every removed channel.
+    # rank scores: removed group-channel → its removal step (lower = pruned first), written to
+    # EVERY consumer of the group; survivors → total + normalized final importance (> all removed).
     Sf = _score(keep)
     out = OrderedDict()
-    rank = {n: _t.full((S0[n].numel(),), float(total), dtype=_t.float) for n in pool}
-    for step, (n, c) in enumerate(order):
-        rank[n][c] = float(step)
+    rank = {n: _t.full((S0[n].numel(),), float(total), dtype=_t.float) for n in pool_names}
+    for step, (gi, j) in enumerate(order):
+        for nm, idxs in groups[gi]:
+            rank[nm][idxs[j]] = float(step)
+    for gi, mem in enumerate(groups):
+        surv = g_keep[gi]
+        if surv.any():
+            gsf = _t.nan_to_num(_group_score(Sf, mem), nan=0.0)
+            gsf = float(total) + gsf / (gsf.abs().max() + 1e-12)
+            for nm, idxs in mem:
+                for j in _t.nonzero(surv).flatten().tolist():
+                    rank[nm][idxs[j]] = float(gsf[j])
     for n, s in S0.items():
-        if n in rank:
-            r = rank[n].clone()
-            surv = keep[n]
-            if surv.any():
-                sf = _apply_imp_normalizer(Sf[n].float().cpu(), normalizer)[surv]
-                sf = _t.nan_to_num(sf, nan=0.0)
-                r[surv] = float(total) + sf / (sf.abs().max() + 1e-12)   # ordered, > all removed
-            out[n] = r
-        else:
-            out[n] = s.float()                     # non-pool (ignored at prune) — left as-is
+        out[n] = rank[n] if n in rank else s.float()   # non-pool (ignored at prune) — left as-is
     return out, order
 
 
@@ -713,7 +756,7 @@ def main(argv):
                 scores, _iter_order = _iterative_propagation_scores(
                     mgr, ex, _extract_kwargs, model_type=args.model_type,
                     normalizer=args.imp_normalizer, drop_per_round=args.prop_iter_drop,
-                    max_frac=args.prop_iter_max_frac, protected_names=_prot_names, log=log_info)
+                    max_frac=args.prop_iter_max_frac, ignored_names=_prot_names, log=log_info)
                 # the normalizer is now folded into the greedy removal order (rank scores) →
                 # the pruner must NOT re-apply it, else the rank order is re-scaled and broken.
                 if args.imp_normalizer != "none":
