@@ -49,6 +49,11 @@ def main():
     ap.add_argument("--debug", action="store_true",
                     help="dump per-layer intermediates (raw |v|, sigma_x, sigma_out_x, seed) "
                          "to localize the divergence stage: weights vs calibration vs propagation")
+    ap.add_argument("--no_measured", action="store_true",
+                    help="use_measured_var=False → exact column-stochastic cov denom "
+                         "(mass-conserving). If this matches across machines but the default "
+                         "doesn't, measured_var is the platform-fragile (non-stochastic) term.")
+    ap.add_argument("--no_cov", action="store_true", help="drop input_cov numerator too")
     args = ap.parse_args()
 
     print("torch", torch.__version__, "| torchvision", tv.__name__ and __import__("torchvision").__version__)
@@ -101,7 +106,9 @@ def main():
                 print(f"=== STAGE 4: seed[{tn}] mean={float(sv.mean()):.6e} "
                       f"cv={float(sv.std()/(sv.mean()+1e-12)):.4f} ===")
     ek = dict(p=2, relative=True, classifier=NM._classifier(m), use_measured_sigma_c=False,
-              use_measured_var=True, branch_out_scale=None, input_cov=icov, join_cov=None)
+              use_measured_var=(not args.no_measured), branch_out_scale=None,
+              input_cov=(None if args.no_cov else icov), join_cov=None)
+    print(f"config: use_measured_var={not args.no_measured} input_cov={not args.no_cov}")
     sc = extract_normnet_scores(mgr, "propagation", example_inputs=ex, **ek)
 
     layers = list(sc.keys()) if args.full else PROBE_LAYERS
