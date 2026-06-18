@@ -869,10 +869,28 @@ def main(argv):
             log_info(f"mac_target {args.mac_target_g:.2f}G → global pruning_ratio={ratio:.4f} "
                      f"(max_prune_ratio={mpr})")
 
-        tp.pruner.MagnitudePruner(
+        _pruner = tp.pruner.MagnitudePruner(
             model, ex, importance=_imp(model), global_pruning=args.global_pruning,
             pruning_ratio=ratio, max_pruning_ratio=mpr, ignored_layers=_ignored(model),
-            mean_dict=mean_dict).step()
+            mean_dict=mean_dict)
+        if args.dump_prune:
+            # capture exact pruned OUT-channel indices per layer (interactive == .step())
+            _id2name = {id(m): n for n, m in model.named_modules()}
+            pruned_idxs = {}
+            for g in _pruner.step(interactive=True):
+                for dep, idxs in g:
+                    tm = dep.target.module
+                    if isinstance(tm, (torch.nn.Conv2d, torch.nn.Linear)) and \
+                       getattr(dep.handler, "__name__", "") == "prune_out_channels":
+                        pruned_idxs.setdefault(_id2name.get(id(tm), str(id(tm))), sorted(idxs))
+                g.prune()
+            if is_main():
+                torch.save({"scores": {k: v.detach().cpu() for k, v in scores.items()},
+                            "pruned_idxs": pruned_idxs, "ratio": ratio,
+                            "imp_normalizer": args.imp_normalizer}, args.dump_prune)
+                log_info(f"dump_prune: saved scores + pruned_idxs → {args.dump_prune}")
+        else:
+            _pruner.step()
         model.to(device)
         per_layer_dist, global_kept = log_prune_distribution(pre_w, _layer_widths(model))
         # reinsert fresh BN at the PRUNED widths (the native BN we folded is gone) so FT has
@@ -1073,6 +1091,9 @@ def parse_args(argv):
                         "--no_bn_recalib to see the compensation effect cleanly.")
     p.add_argument("--no_save_preprune", action="store_true",
                    help="skip saving the pre-prune dense checkpoint (default: save it)")
+    p.add_argument("--dump_prune", default="",
+                   help="path to torch.save {raw per-channel scores, pruned out-channel idxs "
+                        "per layer, ratio} for cluster-vs-local mask diffing")
     p.add_argument("--max_prune_ratio", type=float, default=0.0,
                    help="per-layer floor: cap any single layer's prune fraction (e.g. 0.8 = "
                         "keep ≥20%% of every layer). Stops global pruning gutting cheap-but-"
