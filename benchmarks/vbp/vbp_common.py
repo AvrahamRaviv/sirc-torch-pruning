@@ -223,13 +223,18 @@ def build_calib_loader(args, use_ddp=True):
     (no DistributedSampler): calibration is a short read; every rank computing the same stats
     on the same shuffled stream is fine and avoids a sharded-stats sync."""
     calib_transform = get_val_transform(args.model_type, resize=getattr(args, "val_resize", 256))
-    train_pkl = os.path.join(args.data_path, "train_samples.pkl")
-    if os.path.exists(train_pkl):
-        with open(train_pkl, "rb") as f:
+    # calib split: 'train' (default, back-compat) or 'val'. The local research harness that
+    # produced the mnv2 0.346 leaderboard calibrates on VAL; train-calib gives different
+    # deep-layer covariance/measured-Var → a different (deep-gutting) prune mask. Use 'val'
+    # to reproduce the harness mask.
+    split = getattr(args, "calib_split", "train")
+    pkl = os.path.join(args.data_path, f"{split}_samples.pkl")
+    if os.path.exists(pkl):
+        with open(pkl, "rb") as f:
             samples = pickle.load(f)
         calib_dst = FastImageNet(samples, transform=calib_transform)
     else:
-        calib_dst = ImageFolder(os.path.join(args.data_path, "train"), transform=calib_transform)
+        calib_dst = ImageFolder(os.path.join(args.data_path, split), transform=calib_transform)
     return DataLoader(calib_dst, batch_size=args.val_batch_size, shuffle=True,
                       num_workers=args.num_workers, pin_memory=True, drop_last=True)
 

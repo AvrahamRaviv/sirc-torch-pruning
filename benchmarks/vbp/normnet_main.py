@@ -1094,6 +1094,9 @@ def parse_args(argv):
     p.add_argument("--dump_prune", default="",
                    help="path to torch.save {raw per-channel scores, pruned out-channel idxs "
                         "per layer, ratio} for cluster-vs-local mask diffing")
+    p.add_argument("--calib_split", default="train", choices=["train", "val"],
+                   help="data split for reparam σ/μ + cov + measured-Var calibration. "
+                        "'val' matches the research harness that built the mnv2 leaderboard")
     p.add_argument("--max_prune_ratio", type=float, default=0.0,
                    help="per-layer floor: cap any single layer's prune fraction (e.g. 0.8 = "
                         "keep ≥20%% of every layer). Stops global pruning gutting cheap-but-"
