@@ -893,7 +893,16 @@ def main(argv):
                         if mean is not None:
                             vi.means[m] = mean
                 return vi
-            return NormalizedNetImportance(mdl, scores, group_reduction="mean", normalizer=norm)
+            # fallback=False: groups the normnet scorer did NOT score (e.g. the classifier-
+            # adjacent head group — classifier is excluded from the reparam set, so the layer
+            # feeding it has no propagation score) return importance=None → the global pruner
+            # SKIPS them (base_pruner: `if imp is None: continue`) instead of ranking them by
+            # raw weight-magnitude on an incomparable scale. Without this, a per-layer cap
+            # (--max_prune_ratio) redistributes the MAC budget into that unscored head group and
+            # GUTS it (features.18.0 out → cap floor) → pre-FT collapse (~0.001). We only prune
+            # what the criterion actually scored.
+            return NormalizedNetImportance(mdl, scores, group_reduction="mean", normalizer=norm,
+                                           fallback=False)
 
         def _ignored(mdl):
             return _ignored_layers(mdl, args.model_type, interior_only=args.interior_only)
