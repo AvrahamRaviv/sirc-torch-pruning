@@ -329,6 +329,64 @@ def _iterative_propagation_scores(mgr, ex, extract_kwargs, *, model_type, normal
     return out, order
 
 
+class _FixedCalib:
+    """Re-iterable loader over a fixed list of (img, label) CPU batches. Used by --calib_tensor
+    to feed BYTE-IDENTICAL calibration input across machines (every stage that consumes the
+    calib loader — reparameterize / collect_input_covariance / join_cov / bias_comp — re-iterates
+    it, so the batches must replay each pass)."""
+    def __init__(self, batches):
+        self.batches = batches
+    def __iter__(self):
+        return iter(self.batches)
+    def __len__(self):
+        return len(self.batches)
+
+
+def _pin_calib(loader, path, max_batches, log):
+    """DEBUG: pin the calibration input. file missing → materialize first max_batches batches,
+    save, and replay them; file present → load and replay. Returns a _FixedCalib either way, so
+    the WHOLE run also becomes calib-deterministic (shuffle/order frozen)."""
+    import os as _os
+    if _os.path.exists(path):
+        batches = torch.load(path, map_location="cpu")
+        log(f"calib_tensor: LOADED {len(batches)} fixed calib batches ← {path}")
+    else:
+        batches = []
+        for bi, b in enumerate(loader):
+            if bi >= max_batches:
+                break
+            x = b[0] if isinstance(b, (list, tuple)) else b
+            y = b[1] if isinstance(b, (list, tuple)) and len(b) > 1 else torch.zeros(len(x), dtype=torch.long)
+            batches.append((x.cpu(), y.cpu()))
+        torch.save(batches, path)
+        log(f"calib_tensor: DUMPED {len(batches)} calib batches → {path} "
+            f"(sum={sum(float(x.sum()) for x, _ in batches):.4f})")
+    return _FixedCalib(batches)
+
+
+def _dump_artifacts(out_dir, stats, icov, scores, mean_dict, log):
+    """DEBUG: save per-layer reparam stats + input_cov + scores + mean_dict for cross-machine
+    diffing (probe_compare.py). Stats are the calib-derived quantities every score is built on;
+    comparing them per-layer localizes WHICH stage + layer first diverges across platforms.
+    `stats` is snapshotted by the caller BEFORE mgr.merge_back() clears the reparam modules."""
+    import os as _os
+    _os.makedirs(out_dir, exist_ok=True)
+    torch.save(stats or {}, _os.path.join(out_dir, "stats.pt"))
+    if icov is not None:
+        torch.save({k: v.detach().cpu() for k, v in icov.items()},
+                   _os.path.join(out_dir, "cov.pt"))
+    if scores is not None:
+        torch.save({k: v.detach().cpu() for k, v in scores.items()},
+                   _os.path.join(out_dir, "scores.pt"))
+    if mean_dict is not None:
+        torch.save({k: v.detach().cpu() for k, v in mean_dict.items()},
+                   _os.path.join(out_dir, "mean_dict.pt"))
+    log(f"dump_artifacts: saved stats({len(stats)}) "
+        f"cov({0 if icov is None else len(icov)}) "
+        f"scores({0 if scores is None else len(scores)}) "
+        f"mean_dict({0 if mean_dict is None else len(mean_dict)}) → {out_dir}")
+
+
 def _ignored_layers(model, model_type, interior_only=False):
     """Layers the global pruner must NOT touch.
 
@@ -672,6 +730,8 @@ def main(argv):
     # Calibrate σ/μ on CLEAN center-crop images, NOT the augmented train loader (scale-0.08
     # RandomResizedCrop distorts σ — and σ defines the normalized weight every score uses).
     calib_loader = build_calib_loader(args, use_ddp=use_ddp)
+    if args.calib_tensor:                              # DEBUG: pin calib input (see --calib_tensor)
+        calib_loader = _pin_calib(calib_loader, args.calib_tensor, args.calib_batches, log_info)
     if do_normalize:
         mgr.reparameterize(calib_loader)            # post-act BN(affine=False) + v_tilde=σW
         if use_ddp:
@@ -791,6 +851,11 @@ def main(argv):
         else:
             log_info(f"classical scorer ({args.scorer}) — stock tp importance, no normnet scores")
 
+        _stats_snap = None
+        if args.dump_artifacts:                 # snapshot reparam stats BEFORE merge_back clears them
+            _stats_snap = {name: {k: getattr(rp, k).detach().cpu()
+                                  for k in ("mu_x", "sigma_x", "sigma_out_x") if hasattr(rp, k)}
+                           for name, rp in getattr(mgr, "_reparam_modules", {}).items()}
         if do_normalize:
             mgr.merge_back()                    # back to plain modules for the tp pruner
         # Save the pre-prune (post-norm-ft, merged) DENSE net so a prune+FT can be retried
@@ -870,6 +935,14 @@ def main(argv):
                     mean_dict[k] = t / ws
             log_info(f"bias_comp: post-activation means on {len(mean_dict)} layers "
                      f"({args.calib_batches} calib batches)")
+
+        if args.dump_artifacts and is_main():          # DEBUG: cross-machine stage diffing
+            _name_by_mod = {m: n for n, m in model.named_modules()}
+            _md_named = (None if mean_dict is None else
+                         {_name_by_mod.get(k, str(k)): v for k, v in mean_dict.items()})
+            _dump_artifacts(args.dump_artifacts, _stats_snap,
+                            icov if args.scorer in _NORMNET_SCORERS else None,
+                            scores, _md_named, log_info)
 
         # GLOBAL pruning ranks all groups against ONE threshold (base_pruner cats every group's
         # importance). A per-group normalizer ("mean" → each layer forced to mean-1) ERASES the
@@ -1161,6 +1234,15 @@ def parse_args(argv):
     p.add_argument("--calib_split", default="train", choices=["train", "val"],
                    help="data split for reparam σ/μ + cov + measured-Var calibration. "
                         "'val' matches the research harness that built the mnv2 leaderboard")
+    # ---- cross-platform DEBUG instrumentation (default off → byte-identical behavior) ----
+    p.add_argument("--calib_tensor", default="",
+                   help="DEBUG: pin the calibration input. If file missing → dump the first "
+                        "--calib_batches post-transform calib batches there; if present → LOAD "
+                        "them and use as calib (bypass the loader). Lets you feed IDENTICAL calib "
+                        "input on local+cluster to split DATA-divergence from CODE/NUMERICS.")
+    p.add_argument("--dump_artifacts", default="",
+                   help="DEBUG: dir to save per-layer reparam stats (mu_x/sigma_x/sigma_out_x), "
+                        "input_cov, raw scores, mean_dict for cross-machine diffing (probe_compare.py).")
     p.add_argument("--max_prune_ratio", type=float, default=0.0,
                    help="per-layer floor: cap any single layer's prune fraction (e.g. 0.8 = "
                         "keep ≥20%% of every layer). Stops global pruning gutting cheap-but-"
