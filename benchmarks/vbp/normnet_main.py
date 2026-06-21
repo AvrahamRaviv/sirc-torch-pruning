@@ -930,24 +930,31 @@ def main(argv):
             model, ex, importance=_imp(model), global_pruning=args.global_pruning,
             pruning_ratio=ratio, max_pruning_ratio=mpr, ignored_layers=_ignored(model),
             mean_dict=mean_dict)
-        if args.dump_prune:
-            # capture exact pruned OUT-channel indices per layer (interactive == .step())
-            _id2name = {id(m): n for n, m in model.named_modules()}
-            pruned_idxs = {}
-            for g in _pruner.step(interactive=True):
-                for dep, idxs in g:
-                    tm = dep.target.module
-                    if isinstance(tm, (torch.nn.Conv2d, torch.nn.Linear)) and \
-                       getattr(dep.handler, "__name__", "") == "prune_out_channels":
-                        pruned_idxs.setdefault(_id2name.get(id(tm), str(id(tm))), sorted(idxs))
-                g.prune()
-            if is_main():
-                torch.save({"scores": {k: v.detach().cpu() for k, v in scores.items()},
-                            "pruned_idxs": pruned_idxs, "ratio": ratio,
-                            "imp_normalizer": args.imp_normalizer}, args.dump_prune)
-                log_info(f"dump_prune: saved scores + pruned_idxs → {args.dump_prune}")
-        else:
-            _pruner.step()
+        _pruner.step()                                    # normal global prune (TP records DG history)
+        if args.dump_prune and is_main():
+            # Dump the EXACT applied mask. TP records pruning_history DURING step(); read that.
+            # (Earlier this used step(interactive=True)+manual g.prune(), which produced a
+            # DIFFERENT, broken mask vs the normal global step() → dumped a dead net. Replaying
+            # that JSON gave 0.002 while the real step() gave 0.28. Use the recorded history.)
+            import json as _json
+            hist = [[n, bool(is_out), [int(i) for i in idxs]]
+                    for n, is_out, idxs in _pruner.pruning_history()]
+            pruned_idxs = {n: idxs for n, is_out, idxs in hist if is_out}   # out-ops (back-compat)
+            torch.save({"scores": {k: v.detach().cpu() for k, v in scores.items()},
+                        "pruned_idxs": pruned_idxs, "ratio": ratio,
+                        "imp_normalizer": args.imp_normalizer}, args.dump_prune)
+            log_info(f"dump_prune: saved scores + pruned_idxs → {args.dump_prune}")
+            # canonical, portable replay format (JSON): reconstructs the EXACT pruned model on a
+            # fresh net via DG.load_pruning_history (see apply_prune.py).
+            json_path = (args.dump_prune[:-4] if args.dump_prune.endswith(".pth")
+                         else args.dump_prune) + ".json"
+            with open(json_path, "w") as f:
+                _json.dump({"pruning_history": hist, "ratio": round(ratio, 6),
+                            "mac_target_g": args.mac_target_g,
+                            "imp_normalizer": args.imp_normalizer,
+                            "model_type": args.model_type, "cnn_arch": args.cnn_arch},
+                           f, indent=2)
+            log_info(f"dump_prune: saved pruning_history JSON ({len(hist)} ops) → {json_path}")
         model.to(device)
         per_layer_dist, global_kept = log_prune_distribution(pre_w, _layer_widths(model))
         # reinsert fresh BN at the PRUNED widths (the native BN we folded is gone) so FT has
