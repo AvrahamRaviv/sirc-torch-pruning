@@ -283,6 +283,11 @@ def _iterative_propagation_scores(mgr, ex, extract_kwargs, *, model_type, normal
     target = max(0, min(int(round(max_frac * total)), total))
     log(f"prop_iterative: {len(groups)} groups, {total} group-channels; "
         f"greedy target={target} (drop_per_round={drop_per_round})")
+    for _gi, _mem in enumerate(groups):                # gi → layer names + round-0 score stats
+        _s0 = _group_score(S0, _mem)
+        log(f"  group g{_gi}: n={len(_mem[0][1])} score0[min={float(_s0.min()):.3e} "
+            f"mean={float(_s0.mean()):.3e} max={float(_s0.max()):.3e}] "
+            f"members={[nm for nm, _ in _mem]}")
 
     order, milestone = [], max(1, target // 10)
     while len(order) < target:
