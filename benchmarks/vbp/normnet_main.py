@@ -706,9 +706,12 @@ def main(argv):
     if args.fold_native_bn:
         from torch_pruning.utils.reparam import fold_all_conv_bn
         n_fold, folded_bn_locations = fold_all_conv_bn(model)
-        a_pre, _ = validate(model, val_loader, device, args.model_type)
-        log_info(f"fold_native_bn: folded {n_fold} Conv->BN | post-fold acc={a_pre:.4f} "
-                 f"(function-preserving — should match pre-fold)")
+        if args.skip_norm_eval:
+            log_info(f"fold_native_bn: folded {n_fold} Conv->BN (post-fold eval skipped)")
+        else:
+            a_pre, _ = validate(model, val_loader, device, args.model_type)
+            log_info(f"fold_native_bn: folded {n_fold} Conv->BN | post-fold acc={a_pre:.4f} "
+                     f"(function-preserving — should match pre-fold)")
 
     # -- 2. NORMALIZE (one-shot transform) ----------------------------------------------
     # Classical baselines (magnitude / variance=VBP / tp_variance / bn_scale) must score the
@@ -737,9 +740,13 @@ def main(argv):
         if use_ddp:
             from vbp_common import broadcast_model_state
             broadcast_model_state(model)
-        acc, _ = validate(model, val_loader, device, args.model_type)
-        log_info(f"NORMALIZE: {len(names)} layers, post-transform acc={acc:.4f} "
-                 f"(function-preserving — should match post-train)")
+        if args.skip_norm_eval:
+            log_info(f"NORMALIZE: {len(names)} layers (post-transform eval SKIPPED "
+                     "— --skip_norm_eval fast-screen)")
+        else:
+            acc, _ = validate(model, val_loader, device, args.model_type)
+            log_info(f"NORMALIZE: {len(names)} layers, post-transform acc={acc:.4f} "
+                     f"(function-preserving — should match post-train)")
     else:
         log_info(f"classical scorer ({args.scorer}): SKIP normalize transform — "
                  f"prune original net (no reparam to norm form)")
@@ -850,6 +857,23 @@ def main(argv):
             log_info("nci_cov: covariance-aware NCI — scores computed post-merge on plain model")
         else:
             log_info(f"classical scorer ({args.scorer}) — stock tp importance, no normnet scores")
+
+        # W̄ mass diagnostics (Q2 cov colsum, Q3 recon-vs-measured) — read-only, before merge_back.
+        if args.dump_wbar and args.scorer == "propagation":
+            _icov_diag = icov if icov is not None else mgr.collect_input_covariance(
+                calib_loader, max_batches=args.calib_batches)
+            _diag = mgr.propagation_diagnostics(input_cov=_icov_diag)
+            if is_main():
+                os.makedirs(args.dump_wbar, exist_ok=True)
+                _wp = os.path.join(args.dump_wbar, f"{args.save_tag}_wbar.pt")
+                torch.save(_diag, _wp)
+                _cov_n = sum(1 for r in _diag.values() if r.get("has_cov"))
+                _leaks = [float(r["leak"].median()) for r in _diag.values() if "leak" in r]
+                _cols = [float(r["cov_colsum"].mean()) for r in _diag.values() if "cov_colsum" in r]
+                log_info(f"dump_wbar: {len(_diag)} layers, {_cov_n} with cov numerator "
+                         f"({len(_diag)-_cov_n} independence-fallback, e.g. depthwise); "
+                         f"median leak(recon/meas)={sorted(_leaks)[len(_leaks)//2] if _leaks else float('nan'):.3f} "
+                         f"mean cov_colsum={(sum(_cols)/len(_cols)) if _cols else float('nan'):.3f} → {_wp}")
 
         _stats_snap = None
         if args.dump_artifacts:                 # snapshot reparam stats BEFORE merge_back clears them
@@ -1032,7 +1056,10 @@ def main(argv):
         per_layer_dist, global_kept = log_prune_distribution(pre_w, _layer_widths(model))
         # reinsert fresh BN at the PRUNED widths (the native BN we folded is gone) so FT has
         # working normalization; _recalibrate_bn below then populates its running stats.
-        if folded_bn_locations is not None:
+        if folded_bn_locations is not None and args.fold_no_reinsert:
+            log_info("fold_no_reinsert: BN stays folded into conv → BN-FREE FT (folded scale "
+                     "baked in; keeps BN gain in the propagation score, no fresh-BN reset).")
+        elif folded_bn_locations is not None:
             from torch_pruning.utils.reparam import reinsert_bn
             n_re = reinsert_bn(model, folded_bn_locations)
             model.to(device)
@@ -1044,7 +1071,7 @@ def main(argv):
         else:
             log_info("BN recalibration SKIPPED (--no_bn_recalib)")
         pr_macs, pr_params = _count(model, ex)
-        acc, _ = validate(model, val_loader, device, args.model_type)
+        acc, pre_ft_nll = validate(model, val_loader, device, args.model_type)
         tgt = f"mac={args.mac_target_g}G" if args.mac_target_g > 0 else f"ratio={args.pruning_ratio}"
         log_info(f"PRUNE ({args.scorer}, {tgt}): pre-FT acc={acc:.4f}  "
                  f"{pr_macs:.2f}G ({100*pr_macs/dense_macs:.0f}%) {pr_params:.2f}M params")
@@ -1064,7 +1091,7 @@ def main(argv):
     else:
         mgr.merge_back()
         # no prune: still must restore the folded BN before FT (else FT runs BN-less).
-        if folded_bn_locations is not None:
+        if folded_bn_locations is not None and not args.fold_no_reinsert:
             from torch_pruning.utils.reparam import reinsert_bn
             n_re = reinsert_bn(model, folded_bn_locations)
             model.to(device)
@@ -1077,6 +1104,27 @@ def main(argv):
     # -- 4. FINE-TUNE (plain post-prune / post-normalize recovery) ----------------------
     best = _run_phase(model, None, loaders, args, device, use_ddp,
                       epochs=args.epochs_ft, lr=args.lr_ft, tag="FINE-TUNE", teacher=teacher)
+
+    # -- autoresearch ledger: one row per run (Karpathy results.tsv) --------------------
+    if args.results_tsv and is_main():
+        if best is None and "pre_ft_nll" in locals():   # no FT → score = retention (skip dup eval)
+            score, val_nll = float(locals().get("acc")), float(pre_ft_nll)
+        else:
+            score, val_nll = validate(model, val_loader, device, args.model_type)
+        _ret = float(locals().get("acc", float("nan")))            # pre-FT retention (prune branch)
+        _macs = float(locals().get("pr_macs", float("nan")))
+        _pld = locals().get("per_layer_dist", {}) or {}
+        _min_kept = min((v.get("kept_pct", 100.0) for v in _pld.values()), default=float("nan"))
+        _desc = getattr(args, "run_desc", "") or args.save_tag
+        _new = not os.path.exists(args.results_tsv)
+        with open(args.results_tsv, "a") as f:
+            if _new:
+                f.write("tag\tscore\tval_nll\tretention\tmac_g\tmin_kept_pct\t"
+                        "ft_batches\tstatus\tdesc\n")
+            f.write(f"{args.save_tag}\t{score:.6f}\t{val_nll:.6f}\t{_ret:.6f}\t{_macs:.4f}\t"
+                    f"{_min_kept:.1f}\t{int(getattr(args,'ft_proxy_batches',0))}\t\t{_desc}\n")
+        log_info(f"results.tsv += {args.save_tag}  score={score:.4f} nll={val_nll:.4f} "
+                 f"ret={_ret:.4f} mac={_macs:.3f}G minkept={_min_kept:.1f}% → {args.results_tsv}")
 
     # -- save (rank 0) -------------------------------------------------------------------
     if is_main():
@@ -1135,6 +1183,11 @@ def parse_args(argv):
                         "(sigma_out) is measured POST-BN. Without it the native post-conv BN is "
                         "absent from the score (it only shows up as the NEXT layer's input sigma). "
                         "Fresh BN is reinserted after prune (recalibrated + FT'd).")
+    p.add_argument("--fold_no_reinsert", action="store_true",
+                   help="with --fold_native_bn: do NOT reinsert fresh BN after prune → FT a "
+                        "BN-FREE net (folded scale baked into conv). Keeps the BN gain in the "
+                        "propagation score WITHOUT the fresh-BN reset that hurts recovery. "
+                        "No-op without --fold_native_bn.")
     # 3. prune
     p.add_argument("--no_prune", action="store_true")
     p.add_argument("--scorer", default="per_layer",
@@ -1247,6 +1300,25 @@ def parse_args(argv):
                    help="per-layer floor: cap any single layer's prune fraction (e.g. 0.8 = "
                         "keep ≥20%% of every layer). Stops global pruning gutting cheap-but-"
                         "critical layers (stem/early). 0 = off.")
+    # autoresearch (Karpathy-style) FT proxy harness — all default-off → no behavior change
+    p.add_argument("--ft_proxy_batches", type=int, default=0,
+                   help="FT-proxy budget: stop FT after this many train batches (epoch 1). "
+                        "0 = full FT. The fixed compute budget for the autoresearch ledger.")
+    p.add_argument("--results_tsv", default="",
+                   help="append one ledger row (tag, score, val_nll, retention, mac, min_kept%%, "
+                        "ft_batches, status, desc) per run — the autoresearch results.tsv.")
+    p.add_argument("--run_desc", default="", help="one-line description of THIS run's single change "
+                   "(for the results.tsv ledger). Defaults to save_tag.")
+    p.add_argument("--dump_wbar", default="",
+                   help="DEBUG dir: per-layer W̄ mass diagnostics (indep/recon/measured var, cov "
+                        "colsum, leak) for the cov(Q2)/measured-vs-recon(Q3) audit.")
+    p.add_argument("--val_limit", type=int, default=0,
+                   help="use only the first N val samples (deterministic proxy subset). 0 = all.")
+    p.add_argument("--skip_norm_eval", action="store_true",
+                   help="fast-screen: skip the function-preserving post-fold/post-transform "
+                        "validates (sanity checks). Keeps only the pre-FT acc (the ledger score).")
+    p.add_argument("--seed", type=int, default=0,
+                   help="seed the train-shuffle generator → reproducible K-batch FT proxy. 0 = off.")
     # 4. fine-tune
     p.add_argument("--epochs_ft", type=int, default=0, help="post-prune plain FT (0=skip)")
     p.add_argument("--lr_ft", type=float, default=0.02)
