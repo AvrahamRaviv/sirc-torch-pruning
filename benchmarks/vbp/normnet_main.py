@@ -85,14 +85,18 @@ def _ratio_for_mac(model, ex, imp_factory, ignored_factory, target_g, global_pru
     max_pruning_ratio caps how much ANY single layer may be pruned (per-layer floor)."""
     import copy
     best = hi
+    # MAC count is device-agnostic & deterministic → run the throwaway search trials on CPU.
+    # On MPS the per-iter deepcopy+prune+count_ops sync is ~2 min/iter (≈30 min for the search);
+    # on CPU it is <1 s/iter. The real prune (post-search) still runs on the original device.
+    ex_cpu = ex.cpu() if torch.is_tensor(ex) else ex
     for _ in range(iters):
         mid = (lo + hi) / 2.0
-        trial = copy.deepcopy(model)
+        trial = copy.deepcopy(model).cpu()
         tp.pruner.MagnitudePruner(
-            trial, ex, importance=imp_factory(trial), global_pruning=global_pruning,
+            trial, ex_cpu, importance=imp_factory(trial), global_pruning=global_pruning,
             pruning_ratio=mid, max_pruning_ratio=max_pruning_ratio,
             ignored_layers=ignored_factory(trial)).step()
-        g = tp.utils.count_ops_and_params(trial, ex)[0] / 1e9
+        g = tp.utils.count_ops_and_params(trial, ex_cpu)[0] / 1e9
         del trial
         if g <= target_g:
             best, hi = mid, mid          # feasible → tighten downward (less pruning)

@@ -1,6 +1,13 @@
 __pycache__
 data
 *.pth
+# local FT-proxy autoresearch harness + research artifacts (keep local, not pushed)
+benchmarks/vbp/ft_proxy_screen.py
+benchmarks/vbp/retention_matrix.py
+benchmarks/vbp/analyze_ft_proxy.py
+benchmarks/vbp/summarize_runs.py
+benchmarks/vbp/_verify_iterative_convnext.py
+benchmarks/vbp/research/
 .vscode
 *.egg-info
 dist
