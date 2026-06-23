@@ -596,6 +596,23 @@ def log_contribution_norms(mgr, args, stage):
     return glob
 
 
+def dump_channel_scores(path, model, scorer, layer_scores, stage=None, kept=None,
+                        higher_is_better=True):
+    """Write one channel_scores/v1 JSON for the ExpHandler 'Channels' viz (globs
+    **/*_channel_scores.json). layer_scores: dict[name -> 1-D iterable of RAW per-channel
+    scores] (no normalization; the app normalizes per-layer / per-network). kept:
+    dict[name -> bool iterable] (optional; enables Kept-vs-pruned view)."""
+    import json as _json
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    layers = [{"name": n, "scores": [float(x) for x in s],
+               **({"kept": [bool(x) for x in kept[n]]} if kept and n in kept else {})}
+              for n, s in layer_scores.items()]
+    with open(path, "w") as f:
+        _json.dump({"schema": "channel_scores/v1", "model": model, "scorer": scorer,
+                    "stage": stage, "higher_is_better": higher_is_better, "layers": layers}, f)
+    return path
+
+
 def log_score_distribution(scores, args):
     """Per-layer propagation/per_layer SCORE stats (BEFORE pruning) → log + <tag>_scores.json.
     This is the real-data measurement: the per-layer MEAN reveals depth-compounding (does the
@@ -626,6 +643,14 @@ def log_score_distribution(scores, args):
     with open(os.path.join(args.save_dir, f"{args.save_tag}_scores.json"), "w") as f:
         _json.dump({"scorer": args.scorer, "relative": not args.prop_non_relative,
                     "cross_layer_span": span, "per_layer": per_layer}, f, indent=2)
+    # ExpHandler 'Channels' viz: raw per-channel scores (pre-prune, kept=None → Ridgeline +
+    # Rank views). Kept-vs-pruned needs real post-prune surviving indices — follow-up.
+    dump_channel_scores(
+        os.path.join(args.save_dir, f"{args.save_tag}_{args.scorer}_channel_scores.json"),
+        model=args.model_name, scorer=args.scorer, stage="pre_prune",
+        layer_scores={n: s.float().cpu().tolist() for n, s in scores.items()},
+        higher_is_better=True,
+    )
 
 
 def _run_phase(model, mgr, loaders, args, device, use_ddp, *, epochs, lr, tag, teacher=None):
