@@ -1045,6 +1045,30 @@ def main(argv):
             model, ex, importance=_imp(model), global_pruning=args.global_pruning,
             pruning_ratio=ratio, max_pruning_ratio=mpr, ignored_layers=_ignored(model),
             mean_dict=mean_dict)
+        # ExpHandler Channels viz for classical / nci_cov scorers (normnet scorers already
+        # dumped in log_score_distribution). Read per-channel importance from the pruner's
+        # groups BEFORE step() prunes the weights; nci_cov has a precomputed scores dict.
+        # Keyed by group-root layer name; per-layer-constant normalizers wash out under the
+        # app's per-layer normalization so the configured importance is fine.
+        if is_main() and args.scorer not in _NORMNET_SCORERS:
+            if scores is not None:                       # nci_cov
+                _ch = {n: s.float().cpu().tolist() for n, s in scores.items()}
+            else:                                        # magnitude / variance / tp_variance / bn_scale
+                _name_of = {mod: n for n, mod in model.named_modules()}
+                _ch = {}
+                for _g in _pruner.DG.get_all_groups(ignored_layers=_pruner.ignored_layers,
+                                                    root_module_types=_pruner.root_module_types):
+                    _iv = _pruner.estimate_importance(_g)
+                    if _iv is None:
+                        continue
+                    _nm = _name_of.get(_g[0][0].target.module)
+                    if _nm:
+                        _ch[_nm] = _iv.detach().float().cpu().tolist()
+            if _ch:
+                dump_channel_scores(
+                    os.path.join(args.save_dir, f"{args.save_tag}_{args.scorer}_channel_scores.json"),
+                    model=args.model_name, scorer=args.scorer, stage="pre_prune",
+                    layer_scores=_ch, higher_is_better=True)
         _pruner.step()                                    # normal global prune (TP records DG history)
         if args.dump_prune and is_main():
             # Dump the EXACT applied mask. TP records pruning_history DURING step(); read that.
