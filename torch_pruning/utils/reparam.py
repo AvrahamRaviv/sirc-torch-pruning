@@ -1395,6 +1395,53 @@ class MeanResidualManager(BaseReparamManager):
 
         return topology
 
+    def propagation_diagnostics(self, input_cov=None, conv_reduction="frobenius"):
+        """Per-layer W̄ mass diagnostics for the cov/measured debug (read-only, p=2).
+
+        For each reparam layer returns scalars + per-output-channel tensors:
+          indep_var    = Σ_i M_ij²              (independence colsum = plain-prop denom)
+          recon_var    = Σ_i clamp(N_ij, ≥0)    (cov-reconstructed Var(Z_j) = N.sum)
+          measured_var = σ_out_x_j²             (directly measured post-act output var)
+          leak         = recon_var / measured_var   (=1 ⇔ recon==measured; Q3 measured≈recon)
+          cov_colsum   = (N / N.sum).sum         (=1 ⇔ recon W̄ column-stochastic; Q2 mass)
+          has_cov      = whether a cov numerator applied (False ⇒ independence fallback, e.g.
+                         depthwise where Σ̂[in,in] ≠ M's in/groups dim → shape-guard skip).
+        Mirrors _layer_M / _layer_N exactly so the numbers match the live scorer.
+        """
+        out = OrderedDict()
+        for name, rp in self._reparam_modules.items():
+            w = _contribution_weight(rp).detach()
+            if w.dim() == 4:
+                w_red = (w.flatten(2).norm(p=2, dim=2) if conv_reduction == "frobenius"
+                         else w.abs().flatten(2).sum(dim=2))
+            else:
+                w_red = w
+            M = w_red.t().abs()                              # [in, out]
+            indep_var = M.pow(2).sum(dim=0)                  # [out]
+            rec = {"width_in": int(M.shape[0]), "width_out": int(M.shape[1]),
+                   "indep_var": indep_var.detach().cpu(), "has_cov": False}
+            S = input_cov.get(name) if input_cov else None
+            if S is not None and S.shape[0] == M.shape[0]:
+                S = S.to(w.device, w.dtype)
+                if w.dim() == 4:
+                    V = w.flatten(2)
+                    T = torch.einsum('odk,dc->ock', V, S)
+                    N = (V * T).sum(-1)
+                else:
+                    N = w * (w @ S)
+                N = N.t().clamp_min(0.0)                     # [in, out]
+                recon_var = N.sum(dim=0)                     # [out]
+                rec["has_cov"] = True
+                rec["recon_var"] = recon_var.detach().cpu()
+                rec["cov_colsum"] = (N / recon_var.clamp(min=1e-8)).sum(dim=0).detach().cpu()
+            if hasattr(rp, "sigma_out_x"):
+                meas = rp.sigma_out_x.detach().pow(2).cpu()
+                rec["measured_var"] = meas
+                if "recon_var" in rec:
+                    rec["leak"] = rec["recon_var"] / meas.clamp(min=1e-8)
+            out[name] = rec
+        return out
+
     def propagation_importance(self, I_out=None, *,
                                conv_reduction="frobenius",
                                on_mismatch="warn",
@@ -1487,16 +1534,26 @@ class MeanResidualManager(BaseReparamManager):
                 w_red = w                                          # [out, in]
             return w_red.t().abs()                                 # [in, out]
 
-        def _layer_N(rp, S):
+        def _layer_N(rp, S, k=None):
             """SIGNED covariance numerator N [in, out]: N[c,j] = w̃_jc · (w̃ Σ̂)_jc.
             Row-sums over c reconstruct the true Var(Z_j) = w̃Σ̂w̃ᵀ (off-diagonals kept;
             the independence M² numerator is the diag(Σ̂)=1 special case). Conv uses the
             channel-stationary kernel-aligned form N[c,j] = Σ_c' ⟨v_jc,·,v_jc',·⟩ Σ̂_cc'
             (same approximation as nci_cov's Gram). Negative entries (removing the
             channel would INCREASE Var) clamp to 0; the column normalizer is taken
-            AFTER the clamp so W̄ stays exactly column-stochastic."""
+            AFTER the clamp so W̄ stays exactly column-stochastic.
+
+            k: optional input-channel keep mask (iterative). Zeroing w's pruned input
+            columns BEFORE the (w̃ Σ̂) product excludes pruned channels from the Σ_c' cov
+            sum — a survivor no longer couples to an already-pruned channel — AND zeros
+            their rows in the result. Masking the result N afterwards (the old path) left
+            survivors leaking covariance through pruned k. One op covers [out,in] and
+            [out,in,kH,kW]."""
             w = _contribution_weight(rp).detach()
             S = S.to(w.device, w.dtype)
+            if k is not None:
+                w = w.clone()
+                w[:, ~k.to(w.device)] = 0                     # exclude pruned in-channels from Σ_c'
             if w.dim() == 4:
                 V = w.flatten(2)                              # [out, in, kHkW]
                 T = torch.einsum('odk,dc->ock', V, S)         # (w̃ Σ̂) kernel-aligned
@@ -1539,8 +1596,22 @@ class MeanResidualManager(BaseReparamManager):
         # replaces the computed independence denominator Σ_i(σ_i W_ij)^p in _Wbar.
         meas_denom = ({name: rp.sigma_out_x.detach().pow(p) for name, rp in layers}
                       if use_measured_var else {})
-        # input_cov: covariance numerators (full cov fix). Layers missing from input_cov
-        # (or with a stale shape) fall back to the independence M^p numerator.
+        # keep: iterative-pruning input-channel mask (v2 "variances forced to 1" update).
+        # A pruned hidden channel is an INPUT (row of M [in,out]) of its consumer; zero that
+        # row so the column denominator Σ_i M^p re-normalizes over the survivors. Its producer
+        # side is handled implicitly — the consumer's I^l[c]=0 flows back as the producer's
+        # output seed. Default None ⇒ byte-identical to one-shot.
+        def _keep_mask(name):
+            if not keep:
+                return None
+            k = keep.get(name)
+            return None if k is None else k.to(Ms[name].device).bool().reshape(-1)
+        masks = {name: _keep_mask(name) for name, _ in layers} if keep else {}
+
+        # input_cov: covariance numerators (full cov fix). The keep mask is passed INTO
+        # _layer_N so pruned in-channels are zeroed in w̃ BEFORE the Σ_c' cov sum (a survivor
+        # stops leaking covariance through already-pruned k — exact iterative update). Layers
+        # missing from input_cov (or with a stale shape) fall back to the independence M^p num.
         cov_num = {}
         if input_cov:
             for name, rp in layers:
@@ -1552,25 +1623,13 @@ class MeanResidualManager(BaseReparamManager):
                                  f"{Ms[name].shape[0]} input channels — skipping cov "
                                  f"numerator for this layer (independence fallback)")
                     continue
-                cov_num[name] = _layer_N(rp, S)
+                cov_num[name] = _layer_N(rp, S, masks.get(name))
 
-        # keep: iterative-pruning input-channel mask (v2 "variances forced to 1" update).
-        # A pruned hidden channel is an INPUT (row of M [in,out]) of its consumer; zero that
-        # row so the column denominator Σ_i M^p re-normalizes over the survivors. Its producer
-        # side is handled implicitly — the consumer's I^l[c]=0 flows back as the producer's
-        # output seed. Default None ⇒ byte-identical to one-shot.
-        def _keep_mask(name):
-            if not keep:
-                return None
-            k = keep.get(name)
-            return None if k is None else k.to(Ms[name].device).bool().reshape(-1)
         if keep:
             for name in Ms:
-                k = _keep_mask(name)
+                k = masks.get(name)
                 if k is not None:
                     Ms[name] = Ms[name].clone(); Ms[name][~k] = 0
-                    if name in cov_num:
-                        cov_num[name] = cov_num[name].clone(); cov_num[name][~k] = 0
 
         # ---- DAG walk path (M3): topology provided ----
         if topology is not None:
