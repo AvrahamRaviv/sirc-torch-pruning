@@ -53,9 +53,7 @@ def _log_warning(msg):
     if _is_main_rank():
         logger.warning(msg)
 
-# Numerical stability constants
-MIN_VARIANCE = 1e-12
-MIN_SIGMA = 1e-6
+# Numerical stability constant
 EPSILON = 1e-8
 
 
@@ -887,14 +885,6 @@ class BaseReparamManager(ABC):
                 _log_warning(f"{cls_name}: skipping '{name}' "
                                f"({type(module).__name__}, groups={getattr(module, 'groups', 'N/A')})")
         return targets
-
-    def _calibrate_mu(self, targets, loader):
-        """Back-compat shim: returns dict[name → μ_x tensor] only.
-
-        Prefer _calibrate_stats for new code (returns (μ, σ_in, σ_out) tuples).
-        """
-        stats = self._calibrate_stats(targets, loader)
-        return OrderedDict((name, mu) for name, (mu, _si, _so) in stats.items())
 
     def _calibrate_stats(self, targets, loader, eps=1e-5):
         """Estimate (μ_x, σ_x, σ_out_x) for each target module via forward hooks (one pass).

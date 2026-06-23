@@ -171,17 +171,6 @@ def _residual_blocks(model):
     return blocks
 
 
-def _prunable_input_layers(model_type, score_names):
-    """The layers whose INPUT channels the pruner actually removes — the greedy candidate pool.
-    convnext: pwconv2 inputs (= pwconv1 outputs, the only pruned dim, matches _ignored_layers).
-    Other model types: all scored layers (the TP ignored_layers filter still applies at prune)."""
-    if model_type == "convnext":
-        return [n for n in score_names if n.endswith(".pwconv2")]
-    if model_type == "vit":
-        return [n for n in score_names if _vit_fc2(n)]   # fc2 inputs = the pruned hidden dim
-    return list(score_names)
-
-
 def _apply_imp_normalizer(s, normalizer):
     """Per-layer importance normalizer matching NormalizedNetImportance/_normalize, applied
     to the greedy candidate scores so the greedy ranks channels the SAME way the global
