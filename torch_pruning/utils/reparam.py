@@ -1543,24 +1543,27 @@ class MeanResidualManager(BaseReparamManager):
             channel would INCREASE Var) clamp to 0; the column normalizer is taken
             AFTER the clamp so W̄ stays exactly column-stochastic.
 
-            k: optional input-channel keep mask (iterative). Zeroing w's pruned input
-            columns BEFORE the (w̃ Σ̂) product excludes pruned channels from the Σ_c' cov
-            sum — a survivor no longer couples to an already-pruned channel — AND zeros
-            their rows in the result. Masking the result N afterwards (the old path) left
-            survivors leaking covariance through pruned k. One op covers [out,in] and
-            [out,in,kH,kW]."""
+            k: optional input-channel keep mask (iterative). The pruned channels' RESULT rows
+            are zeroed AFTER the Σ_c' cov sum (post-hoc), keeping each SURVIVING channel's share
+            computed against the original (full) couplings. This is deliberate: the keep= path is
+            the v2 §"Importance score updating" footnote* "variances forced to 1 — updated variance
+            does NOT forward-propagate" simplification, so the recon denom D_j=Σ_c N[c,j] stays the
+            stable full Var(Z_j) reference (no per-round variance update). Excluding pruned k from a
+            survivor's Σ_c' sum (the 2026-06-23 "cov-leak fix", reverted) imposes a partial variance
+            update inconsistent with forced-to-1 and empirically degrades the greedy ranking
+            (cov-iter 0.27→0.20 @ 66% MAC, mnv2). One op covers [out,in] and [out,in,kH,kW]."""
             w = _contribution_weight(rp).detach()
             S = S.to(w.device, w.dtype)
-            if k is not None:
-                w = w.clone()
-                w[:, ~k.to(w.device)] = 0                     # exclude pruned in-channels from Σ_c'
             if w.dim() == 4:
                 V = w.flatten(2)                              # [out, in, kHkW]
                 T = torch.einsum('odk,dc->ock', V, S)         # (w̃ Σ̂) kernel-aligned
                 N = (V * T).sum(-1)                           # [out, in]
             else:
                 N = w * (w @ S)                               # [out, in]
-            return N.t().clamp_min(0.0)                       # [in, out]
+            Nt = N.t().clamp_min(0.0)                         # [in, out]
+            if k is not None:
+                Nt = Nt.clone(); Nt[~k.to(Nt.device)] = 0    # forced-to-1: zero pruned rows only
+            return Nt
 
         def _Wbar(M, measured_denom=None, N=None):
             """Column-normalized W̄ = M^p · D (no σ transfer — σ is already in M).
