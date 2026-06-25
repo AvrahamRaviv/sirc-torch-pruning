@@ -7,7 +7,14 @@ benchmarks/vbp/retention_matrix.py
 benchmarks/vbp/analyze_ft_proxy.py
 benchmarks/vbp/summarize_runs.py
 benchmarks/vbp/_verify_iterative_convnext.py
-benchmarks/vbp/research/
+# research/: TRACK the per-arch harness code, IGNORE all journals/results/leaderboards/logs/data
+benchmarks/vbp/research/*.md
+benchmarks/vbp/research/*.jsonl
+benchmarks/vbp/research/*.tsv
+benchmarks/vbp/research/*.log
+benchmarks/vbp/research/*.csv
+benchmarks/vbp/research/logdist/
+benchmarks/vbp/research/__pycache__/
 .vscode
 *.egg-info
 dist
