@@ -356,7 +356,7 @@ def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
     # local shard. Sync once per epoch to keep ranks coherent. Cheap (few
     # all-reduces of small vectors) compared to per-step sync.
     ddp_active = use_ddp and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
-    sync_each_epoch = (normalized and lam_train >= 0 and ddp_active and
+    sync_each_epoch = (normalized and ddp_active and
                        getattr(args, "mu_ema_momentum", 0.0) > 0)
 
     best_acc = 0.0

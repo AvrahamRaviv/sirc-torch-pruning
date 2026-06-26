@@ -190,7 +190,7 @@ def _apply_imp_normalizer(s, normalizer):
     return s                                       # gaussian/standarization: leave (rare here)
 
 
-def _iterative_propagation_scores(mgr, ex, extract_kwargs, *, model_type, normalizer,
+def _iterative_propagation_scores(mgr, ex, extract_kwargs, *, normalizer,
                                   drop_per_round=1, max_frac=1.0, ignored_names=frozenset(),
                                   log=print):
     """Greedy iterative propagation pruning (v2 §'Importance score updating'), GROUP-aware.
@@ -844,7 +844,7 @@ def main(argv):
                                              interior_only=args.interior_only)}
                 _prot_names = {n for n, m in model.named_modules() if id(m) in _prot_ids}
                 scores, _iter_order = _iterative_propagation_scores(
-                    mgr, ex, _extract_kwargs, model_type=args.model_type,
+                    mgr, ex, _extract_kwargs,
                     normalizer=args.imp_normalizer, drop_per_round=args.prop_iter_drop,
                     max_frac=args.prop_iter_max_frac, ignored_names=_prot_names, log=log_info)
                 # the normalizer is now folded into the greedy removal order (rank scores) →
@@ -1377,7 +1377,6 @@ def parse_args(argv):
     p.add_argument("--val_batch_size", type=int, default=256)
     p.add_argument("--val_resize", type=int, default=232)
     p.add_argument("--num_workers", type=int, default=8)
-    p.add_argument("--log_interval", type=int, default=50)
     p.add_argument("--mu_ema_momentum", type=float, default=0.0)
     # io / ddp
     p.add_argument("--save_dir", required=True)
