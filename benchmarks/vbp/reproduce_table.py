@@ -111,7 +111,8 @@ ARCHS = OrderedDict([
                   "--max_prune_ratio", "0.8"])),   # per-layer cap from the proven mnv2 recipe
     ("deit_tiny", dict(
         model_type="vit", cnn_arch="deit_tiny", model_name="facebook/deit-tiny-patch16-224",
-        weights=None, cluster_weights="facebook/deit-tiny-patch16-224",
+        # local HF dir (config.json + *.safetensors) → from_pretrained(dir, local_files_only=True). EDIT.
+        weights=None, cluster_weights="/algo/NetOptimization/outputs/NORMNET/DeiT/deit_tiny",
         mac_target_g=0.95, val_resize=224, protocol=[])),
 ])
 
