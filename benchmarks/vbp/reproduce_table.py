@@ -41,7 +41,6 @@ import argparse
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -60,30 +59,28 @@ CLUSTER = dict(
     data_path="/algo/NetOptimization/outputs/VBP/",                 # ImageNet root on the cluster
     out_root="/algo/NetOptimization/outputs/NORMNET/REPRO_TABLE",   # all cells land under here/<run_name>
     nproc=1,                                                        # GPUs per job (retention = calib+eval, 1 GPU is enough)
-    # remote-gpu submission envelope — built as an argv LIST (subprocess shell=False) so values with
-    # spaces (-R "select[g_model != RTXA5000]", -A "") stay intact. Building a flat string + shell=True
-    # let /bin/sh strip the quotes before run_docker_gpu.sh saw them → malformed bsub → job not sent.
+    # remote-gpu submission envelope — mirrors the PROVEN-working run_ddp.py command EXACTLY
+    # (shell=True flat string). Two things run_docker_gpu.sh requires that earlier versions broke:
+    #   * resources = ONE -R blob with a nested ` -R ` joiner: -R 'select[gpu_hm] -R select[...]'
+    #     (separate -R flags get mishandled → malformed bsub → job never submitted)
+    #   * -E value quoted: -E 'force_python_3=yes'
     submit_sh="/algo/ws/shared/remote-gpu/run_docker_gpu.sh",
     img="gitlab-srv:4567/od-alg/od_next_gen:v1.7.7_tp2",
     queue="gpu_deep_train_low_q",
     mem="50gb", ncpu="10", runlimit="60000", project="VISION",
     mount="/algo/NetOptimization:/algo/NetOptimization",
-    resources=["select[gpu_hm]", "select[g_model != RTXA5000]"],
+    resources=["select[gpu_hm]", "select[g_model != RTXA5000]"],     # joined into one -R blob below
     ngpu=1,
 )
 
 
-def submit_argv(sh_path, desc):
-    """argv list for run_docker_gpu.sh (shell=False — no quote stripping). desc must be space-free."""
+def submit_cmd(sh_path, desc):
+    """Flat shell command for run_docker_gpu.sh — verbatim run_ddp.py shape (shell=True)."""
     c = CLUSTER
-    argv = [c["submit_sh"], "-d", c["img"], "-C", "execute", "-q", c["queue"],
-            "-W", "working_dir", "-M", sh_path,
-            "-s", c["mem"], "-n", c["ncpu"], "-o", c["runlimit"],
-            "-A", "", "-p", c["project"], "-v", c["mount"]]
-    for r in c["resources"]:
-        argv += ["-R", r]
-    argv += ["-E", "force_python_3=yes", "-x", str(c["ngpu"]), "-D", desc]
-    return argv
+    res_blob = " -R ".join(c["resources"])      # 'select[gpu_hm] -R select[g_model != RTXA5000]'
+    return (f"{c['submit_sh']} -d {c['img']} -C execute -q {c['queue']} -W working_dir -M {sh_path}"
+            f"  -s {c['mem']} -n {c['ncpu']} -o {c['runlimit']} -A '' -p {c['project']}"
+            f" -v {c['mount']} -R '{res_blob}' -E 'force_python_3=yes' -x {c['ngpu']} -D '{desc}'")
 
 # --------------------------------------------------------------------- per-arch config
 # protocol = the established per-arch recipe (same as the 5×7 table):
@@ -95,12 +92,12 @@ ARCHS = OrderedDict([
     ("convnext_t", dict(
         model_type="convnext", cnn_arch="convnext_tiny", model_name="convnext_tiny",
         weights="convnext_tiny_1k_224_ema.pth",
-        cluster_weights="/algo/NetOptimization/outputs/NORMNET/ConvNeXt-T/convnext_tiny_weights.pth",
+        cluster_weights="/algo/NetOptimization/outputs/NORMNET/ConvNeXt_tiny/convnext_tiny_22k_1k_224.pth",
         mac_target_g=2.94, val_resize=232, protocol=[])),
     ("resnet50", dict(
         model_type="cnn", cnn_arch="resnet50", model_name="resnet50",
         weights="resnet50-0676ba61.pth",
-        cluster_weights="/algo/NetOptimization/outputs/NORMNET/ResNet50/resnet50_weights.pth",
+        cluster_weights="/algo/NetOptimization/outputs/NORMNET/ResNet50/resnet50_imagenet1k.pth",
         mac_target_g=2.72, val_resize=256, protocol=[])),           # native BN → recalib ON (default)
     ("mobilenet_v2", dict(
         model_type="cnn", cnn_arch="mobilenet_v2", model_name="mobilenet_v2",
@@ -173,11 +170,11 @@ def submit_cell(arch, scorer, args):
     tag = save_tag(arch, scorer)
     out_dir = os.path.join(CLUSTER["out_root"], args.run_name, tag)
     sh_path = os.path.join(out_dir, "run_ddp.sh")
-    argv = submit_argv(sh_path, f"REPRO_{tag}")     # space-free desc → no quoting needed
+    cmd = submit_cmd(sh_path, f"REPRO {arch} {scorer}")
     if args.dry_run:                          # pure: render, touch no filesystem (cluster paths RO on laptop)
         print(f"\n# ===== {tag} =====\n# sh: {sh_path}")
         print(build_sh(arch, scorer, args, out_dir))
-        print("# submit:\n" + shlex.join(argv))
+        print("# submit:\n" + cmd)
         return
     if not args.force and os.path.exists(os.path.join(out_dir, f"{tag}_prune.json")):
         print(f"[skip] {tag} (prune.json exists)")
@@ -191,7 +188,7 @@ def submit_cell(arch, scorer, args):
         f.write(build_sh(arch, scorer, args, out_dir))
     os.chmod(sh_path, 0o777)
     print(f"[submit] {tag}")
-    subprocess.run(argv)
+    subprocess.run(cmd, shell=True)
 
 
 def mode_submit(args):
