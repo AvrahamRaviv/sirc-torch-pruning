@@ -41,6 +41,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -59,15 +60,30 @@ CLUSTER = dict(
     data_path="/algo/NetOptimization/outputs/VBP/",                 # ImageNet root on the cluster
     out_root="/algo/NetOptimization/outputs/NORMNET/REPRO_TABLE",   # all cells land under here/<run_name>
     nproc=1,                                                        # GPUs per job (retention = calib+eval, 1 GPU is enough)
-    # remote-gpu submission envelope (from run_ddp.py; -x = GPUs requested, matched to nproc)
-    cmd_a=("/algo/ws/shared/remote-gpu/run_docker_gpu.sh "
-           "-d gitlab-srv:4567/od-alg/od_next_gen:v1.7.7_tp2 "
-           "-C execute -q gpu_deep_train_med_q -W working_dir -M "),
-    cmd_b=("  -s 50gb -n 10 -o 75000 -A '' -p VISION "
-           "-v /algo/NetOptimization:/algo/NetOptimization "
-           "-R 'select[gpu_hm]' -R 'select[g_model != RTXA5000]' "
-           "-E force_python_3=yes -x 1"),
+    # remote-gpu submission envelope — built as an argv LIST (subprocess shell=False) so values with
+    # spaces (-R "select[g_model != RTXA5000]", -A "") stay intact. Building a flat string + shell=True
+    # let /bin/sh strip the quotes before run_docker_gpu.sh saw them → malformed bsub → job not sent.
+    submit_sh="/algo/ws/shared/remote-gpu/run_docker_gpu.sh",
+    img="gitlab-srv:4567/od-alg/od_next_gen:v1.7.7_tp2",
+    queue="gpu_deep_train_low_q",
+    mem="50gb", ncpu="10", runlimit="60000", project="VISION",
+    mount="/algo/NetOptimization:/algo/NetOptimization",
+    resources=["select[gpu_hm]", "select[g_model != RTXA5000]"],
+    ngpu=1,
 )
+
+
+def submit_argv(sh_path, desc):
+    """argv list for run_docker_gpu.sh (shell=False — no quote stripping). desc must be space-free."""
+    c = CLUSTER
+    argv = [c["submit_sh"], "-d", c["img"], "-C", "execute", "-q", c["queue"],
+            "-W", "working_dir", "-M", sh_path,
+            "-s", c["mem"], "-n", c["ncpu"], "-o", c["runlimit"],
+            "-A", "", "-p", c["project"], "-v", c["mount"]]
+    for r in c["resources"]:
+        argv += ["-R", r]
+    argv += ["-E", "force_python_3=yes", "-x", str(c["ngpu"]), "-D", desc]
+    return argv
 
 # --------------------------------------------------------------------- per-arch config
 # protocol = the established per-arch recipe (same as the 5×7 table):
@@ -157,11 +173,11 @@ def submit_cell(arch, scorer, args):
     tag = save_tag(arch, scorer)
     out_dir = os.path.join(CLUSTER["out_root"], args.run_name, tag)
     sh_path = os.path.join(out_dir, "run_ddp.sh")
-    cmd = CLUSTER["cmd_a"] + sh_path + CLUSTER["cmd_b"] + f" -D 'REPRO {arch} {scorer}'"
+    argv = submit_argv(sh_path, f"REPRO_{tag}")     # space-free desc → no quoting needed
     if args.dry_run:                          # pure: render, touch no filesystem (cluster paths RO on laptop)
         print(f"\n# ===== {tag} =====\n# sh: {sh_path}")
         print(build_sh(arch, scorer, args, out_dir))
-        print("# submit:\n" + cmd)
+        print("# submit:\n" + shlex.join(argv))
         return
     if not args.force and os.path.exists(os.path.join(out_dir, f"{tag}_prune.json")):
         print(f"[skip] {tag} (prune.json exists)")
@@ -175,7 +191,7 @@ def submit_cell(arch, scorer, args):
         f.write(build_sh(arch, scorer, args, out_dir))
     os.chmod(sh_path, 0o777)
     print(f"[submit] {tag}")
-    subprocess.run(cmd, shell=True)
+    subprocess.run(argv)
 
 
 def mode_submit(args):
