@@ -180,6 +180,15 @@ def build_dataloaders(args, use_ddp=True):
         train_dst = ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
         val_dst = ImageFolder(os.path.join(args.data_path, "val"), transform=val_transform)
 
+    # --val_limit: cap the validation set to the first N samples (smoke / quick eval). 0 = full
+    # val (default). Eval-side only — does not touch training. The val set is unshuffled so the
+    # first N is a deterministic fixed subset.
+    val_limit = int(getattr(args, "val_limit", 0) or 0)
+    if val_limit and val_limit < len(val_dst):
+        from torch.utils.data import Subset
+        val_dst = Subset(val_dst, list(range(val_limit)))
+        log_info(f"--val_limit: evaluating on first {val_limit} val samples (smoke/quick subset)")
+
     # Create samplers
     if use_ddp:
         train_sampler = DistributedSampler(train_dst, shuffle=True)

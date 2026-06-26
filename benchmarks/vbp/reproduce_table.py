@@ -30,8 +30,18 @@ import time
 from collections import OrderedDict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.abspath(os.path.join(HERE, "..", ".."))      # torch_pruning package root
 MAIN = os.path.join(HERE, "normnet_main.py")
 LEDGER = os.path.join(HERE, "results_table.jsonl")
+
+
+def _subenv():
+    """Child env with the repo root + benchmarks/vbp on PYTHONPATH so the subprocess imports
+    `torch_pruning` and the sibling vbp modules even when the package isn't pip-installed."""
+    env = dict(os.environ)
+    extra = os.pathsep.join([REPO, HERE])
+    env["PYTHONPATH"] = extra + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    return env
 
 # --------------------------------------------------------------------- per-arch config
 # protocol encodes the established per-arch recipe used by the 5×7 table:
@@ -79,7 +89,7 @@ def common_flags(args):
         "--data_path", args.data_path, "--global_pruning",
         "--reparam_variant", "mean", "--imp_normalizer", "width", "--bias_comp",
         "--calib_batches", str(args.calib_batches), "--val_batch_size", str(args.val_batch_size),
-        "--num_workers", str(args.num_workers),
+        "--val_limit", str(args.val_limit), "--num_workers", str(args.num_workers),
         "--epochs_train", "0", "--epochs_ft", "0", "--epochs_norm_ft", "0",
         "--skip_norm_eval", "--disable_ddp",
     ]
@@ -124,7 +134,7 @@ def run_cell(arch, scorer, args):
             print("  " + " ".join(argv[1:]))
             return None
         t0 = time.time()
-        p = subprocess.run(argv, capture_output=True, text=True)
+        p = subprocess.run(argv, capture_output=True, text=True, env=_subenv())
         out = p.stdout + "\n" + p.stderr
         accs = [m for m in PRE_FT_RE.finditer(out)]
         if not accs:
@@ -165,11 +175,27 @@ def main():
     ap.add_argument("--scorers", default="", help="comma subset of " + ",".join(SCORERS))
     ap.add_argument("--calib_batches", type=int, default=50)
     ap.add_argument("--val_batch_size", type=int, default=256)
+    ap.add_argument("--val_limit", type=int, default=0, help="cap val to first N (0=full)")
     ap.add_argument("--num_workers", type=int, default=8)
-    ap.add_argument("--dry_run", action="store_true")
+    ap.add_argument("--smoke", action="store_true",
+                    help="fast end-to-end test: 2 calib batches + 512 val samples per cell "
+                         "(overrides --calib_batches/--val_limit unless you set them). Run this "
+                         "FIRST on the cluster to verify every arch×scorer cell loads/calibs/"
+                         "prunes/evals before the full table. Uses a separate ledger.")
+    ap.add_argument("--dry_run", action="store_true", help="print commands, run nothing")
     ap.add_argument("--print_only", action="store_true")
     ap.add_argument("--force", action="store_true", help="re-run even if in the ledger")
     args = ap.parse_args()
+
+    global LEDGER
+    if args.smoke:
+        if args.calib_batches == 50:
+            args.calib_batches = 2
+        if args.val_limit == 0:
+            args.val_limit = 512
+        LEDGER = os.path.join(HERE, "results_table_smoke.jsonl")
+        print(f"[SMOKE] calib_batches={args.calib_batches} val_limit={args.val_limit} "
+              f"ledger={os.path.basename(LEDGER)}", flush=True)
 
     archs = [a for a in (args.archs.split(",") if args.archs else ARCHS) if a in ARCHS]
     scorers = [s for s in (args.scorers.split(",") if args.scorers else SCORERS) if s in SCORERS]

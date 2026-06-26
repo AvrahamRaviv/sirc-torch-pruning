@@ -806,9 +806,9 @@ def main(argv):
                     raise SystemExit("--prop_cov requires --prop_p 2 (variance decomposition)")
                 icov = mgr.collect_input_covariance(calib_loader, max_batches=args.calib_batches)
                 off = [float((s - torch.eye(s.shape[0], device=s.device, dtype=s.dtype)).abs().sum() / s.abs().sum()) for s in icov.values()]
+                _med = f"{sorted(off)[len(off) // 2]:.2f}" if off else "n/a (no cov layers)"
                 log_info(f"prop_cov: input correlation on {len(icov)} layers "
-                         f"({args.calib_batches} calib batches), "
-                         f"median offdiag mass={sorted(off)[len(off) // 2]:.2f}")
+                         f"({args.calib_batches} calib batches), median offdiag mass={_med}")
             elif args.scorer == "propagation" and args.prop_measured_var:
                 log_info("WARNING: --prop_measured_var without --prop_cov = denominator-only "
                          "(numerator stays independence) → mass leaks → depth bias returns. "
