@@ -84,11 +84,11 @@ def submit_cmd(sh_path, desc):
 
 # --------------------------------------------------------------------- per-arch config
 # protocol = the established per-arch recipe (same as the 5×7 table):
-#   convnext/deit : LayerNorm           → no fold
-#   resnet50      : native BN           → no fold (pure pre-FT; recalib is OFF — it re-fits BN stats
-#                                         = effectively FT, irrelevant to a retention table)
-#   mobilenet_v2  : fold native BN free → --fold_native_bn --fold_no_reinsert
-# --no_bn_recalib is applied to EVERY cell via core_flags() (no recalib anywhere = pure pre-FT).
+#   convnext/deit       : LayerNorm     → no fold
+#   resnet50 / mnv2     : native BN      → fold BN into conv (--fold_native_bn --fold_no_reinsert) →
+#                                          BN-free, no stale stats. This is the meaningful no-recalib
+#                                          path for a BN net (native+no-recalib = stale BN = trivial collapse).
+# --no_bn_recalib is applied to EVERY cell via core_flags() — recalib re-fits BN ≈ FT, never in a retention table.
 # cluster_weights = path on the CLUSTER (EDIT). weights = laptop filename under --weights_dir (local mode).
 ARCHS = OrderedDict([
     ("convnext_t", dict(
@@ -100,7 +100,8 @@ ARCHS = OrderedDict([
         model_type="cnn", cnn_arch="resnet50", model_name="resnet50",
         weights="resnet50-0676ba61.pth",
         cluster_weights="/algo/NetOptimization/outputs/NORMNET/ResNet50/resnet50_imagenet1k.pth",
-        mac_target_g=2.72, val_resize=256, protocol=[])),           # native BN, NO recalib (core_flags)
+        mac_target_g=2.72, val_resize=256,
+        protocol=["--fold_native_bn", "--fold_no_reinsert"])),       # BN-free (fold), NO recalib — like mnv2
     ("mobilenet_v2", dict(
         model_type="cnn", cnn_arch="mobilenet_v2", model_name="mobilenet_v2",
         weights="mobilenet_v2-7ebf99e0.pth",
