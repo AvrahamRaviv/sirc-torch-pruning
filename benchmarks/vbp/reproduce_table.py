@@ -1,41 +1,38 @@
-"""Reproduce the cross-arch × scorer retention table — 4 native archs × 8 scorers.
+"""Cross-arch × scorer pruning SWEEP — retention vs compression frontier + targeted ablations.
 
-Three modes:
+Scales from the 4×8 table to ~1000 isolated jobs to exploit idle cluster time. Each job = one
+normnet_main run (pure pre-FT retention: --no_bn_recalib, epochs_ft 0), submitted as its own .sh to
+the GPU queue (run_docker_gpu.sh envelope, single GPU). Resumable: a cell is skipped if its
+<tag>_prune.json already exists. collect reads every prune.json → one rich ledger (results_table.jsonl)
+with all sweep axes per row → plot_table.py draws the per-arch retention-vs-MAC curves.
 
-  --mode submit   (CLUSTER) write one run_ddp.sh per arch×scorer cell and submit each as an
-                  isolated docker/DDP job via /algo/ws/shared/remote-gpu/run_docker_gpu.sh
-                  (same envelope as run_ddp.py). Jobs run async on the queue; each writes
-                  <out_dir>/<save_tag>_prune.json (holds pre_ft_val_acc + macs_pct).
-  --mode collect  (CLUSTER) once jobs finished: scan the out_dirs, read every <save_tag>_prune.json,
-                  build the ledger (results_table.jsonl) + print the markdown table. Then plot with
-                  plot_table.py.
-  --mode local    (LAPTOP) run each cell as a plain subprocess (single GPU/MPS, --disable_ddp), full
-                  in-process; for smoke/quick checks only. --smoke = 2 calib batches + 512 val.
+Axes (a spec = one point in this grid):
+  arch        convnext_t, resnet50, mobilenet_v2, deit_tiny
+  scorer base magnitude vbp nci  | prop cov iter   (last three = the variance-propagation family = focus)
+  measured    cov/iter only: computed (w̃Σ̂w̃ᵀ) vs measured (÷ σ_out²)
+  prop_p      1 vs 2 (mass-conservation: p=2 column-stochastic)
+  fold        BN nets only: fold Conv→BN (BN-free, no recalib) vs native
+  mac_frac    fraction of dense MACs (the compression curve)
+  normalizer  width vs none      (ablation)
+  relative    relative vs --prop_non_relative   (ablation)
+  iter knobs  --prop_iter_drop / --prop_iter_max_frac   (ablation, iter only)
 
-The cluster has NO direct-python entrypoint — every run is a .sh submitted to the GPU queue — so the
-table is two phases on the cluster: submit all 32 jobs, wait, then collect. Local mode keeps the old
-self-contained behavior for laptop smoke.
-
-Scorers (8):
-  magnitude  vbp(=variance)  prop(=prop_rel_p2)  cov_comp  cov_meas  iter_comp  iter_meas  nci(=tp_variance)
+Blocks:
+  curve     : every arch × fold × all 8 scorer variants × the full mac_frac grid (the headline frontier)
+  ablation  : at --ref_frac, focus scorers only, vary ONE knob at a time (p=1, normalizer=none,
+              non-relative, iter drop/max_frac)
 
 Cluster usage:
-  # 0. dry-run: print the .sh + submission command for every cell, submit nothing
-  python reproduce_table.py --mode submit --run_name REPRO_v1 --dry_run
-  # 1. submit all 32 jobs (skips cells whose _prune.json already exists)
-  python reproduce_table.py --mode submit --run_name REPRO_v1
-  # 2. after the queue drains, collect + table
-  python reproduce_table.py --mode collect --run_name REPRO_v1
-  python plot_table.py --out cluster.png --title "CLUSTER 4x8"
+  python reproduce_table.py --mode submit  --run_name SWEEP_v1 --list        # print specs + total, submit nothing
+  python reproduce_table.py --mode submit  --run_name SWEEP_v1 --dry_run      # print every .sh + cmd
+  python reproduce_table.py --mode submit  --run_name SWEEP_v1                # submit all (skips done)
+  python reproduce_table.py --mode collect --run_name SWEEP_v1                # prune.json → ledger + summary
+  python plot_table.py --curves --out sweep.png                              # per-arch frontier figure
 
-EDIT the CLUSTER dict + ARCHS[...]['cluster_weights'] paths to match your filesystem before submit.
+Tune size: --mac_points (curve density), --blocks curve,ablation, --archs, --max_runs.
+EDIT the CLUSTER dict + ARCHS[...]['cluster_weights'] before submit.
 
-Local usage:
-  python reproduce_table.py --mode local --smoke --data_path /tmp/in --weights_dir ~/.cache/torch/hub/checkpoints
-  python plot_table.py --ledger results_table_smoke.jsonl --out smoke.png --title "LOCAL smoke"
-
-mobilenet_v1 is timm-only (BatchNormAct2d fused-ReLU6), not buildable by normnet_main — run separately
-via research/harness_mbv1.py.
+mobilenet_v1 is timm-only (not buildable by normnet_main) — run via research/harness_mbv1.py separately.
 """
 import argparse
 import json
@@ -53,187 +50,294 @@ MAIN = os.path.join(HERE, "normnet_main.py")
 LEDGER = os.path.join(HERE, "results_table.jsonl")
 
 # --------------------------------------------------------------------- CLUSTER config (EDIT THESE)
-# Mirrors run_ddp.py. The submit mode writes a run_ddp.sh per cell and submits it with this envelope.
 CLUSTER = dict(
     repo="/home/avrahamra/PycharmProjects/sirc-torch-pruning",      # cd target inside the .sh
     data_path="/algo/NetOptimization/outputs/VBP/",                 # ImageNet root on the cluster
     out_root="/algo/NetOptimization/outputs/NORMNET/REPRO_TABLE",   # all cells land under here/<run_name>
-    nproc=1,                                                        # GPUs per job (retention = calib+eval, 1 GPU is enough)
     # remote-gpu submission envelope — mirrors the PROVEN-working run_ddp.py command EXACTLY
-    # (shell=True flat string). Two things run_docker_gpu.sh requires that earlier versions broke:
-    #   * resources = ONE -R blob with a nested ` -R ` joiner: -R 'select[gpu_hm] -R select[...]'
-    #     (separate -R flags get mishandled → malformed bsub → job never submitted)
-    #   * -E value quoted: -E 'force_python_3=yes'
+    # (shell=True flat string). run_docker_gpu.sh needs: resources as ONE -R blob with a nested ` -R `
+    # joiner (-R 'select[gpu_hm] -R select[...]'), and a quoted -E. Separate -R flags break bsub.
     submit_sh="/algo/ws/shared/remote-gpu/run_docker_gpu.sh",
     img="gitlab-srv:4567/od-alg/od_next_gen:v1.7.7_tp2",
     queue="gpu_deep_train_low_q",
     mem="50gb", ncpu="10", runlimit="60000", project="VISION",
     mount="/algo/NetOptimization:/algo/NetOptimization",
     resources=["select[gpu_hm]", "select[g_model != RTXA5000]"],     # joined into one -R blob below
-    ngpu=1,
+    ngpu=1,                                                          # 1 GPU/job (retention = calib+eval)
 )
 
 
 def submit_cmd(sh_path, desc):
     """Flat shell command for run_docker_gpu.sh — verbatim run_ddp.py shape (shell=True)."""
     c = CLUSTER
-    res_blob = " -R ".join(c["resources"])      # 'select[gpu_hm] -R select[g_model != RTXA5000]'
+    res_blob = " -R ".join(c["resources"])
     return (f"{c['submit_sh']} -d {c['img']} -C execute -q {c['queue']} -W working_dir -M {sh_path}"
             f"  -s {c['mem']} -n {c['ncpu']} -o {c['runlimit']} -A '' -p {c['project']}"
             f" -v {c['mount']} -R '{res_blob}' -E 'force_python_3=yes' -x {c['ngpu']} -D '{desc}'")
 
+
 # --------------------------------------------------------------------- per-arch config
-# protocol = the established per-arch recipe (same as the 5×7 table):
-#   convnext/deit       : LayerNorm     → no fold
-#   resnet50 / mnv2     : native BN      → fold BN into conv (--fold_native_bn --fold_no_reinsert) →
-#                                          BN-free, no stale stats. This is the meaningful no-recalib
-#                                          path for a BN net (native+no-recalib = stale BN = trivial collapse).
-# --no_bn_recalib is applied to EVERY cell via core_flags() — recalib re-fits BN ≈ FT, never in a retention table.
-# cluster_weights = path on the CLUSTER (EDIT). weights = laptop filename under --weights_dir (local mode).
+# cluster_weights = path on the CLUSTER (EDIT). weights = laptop filename under --weights_dir (local).
+# val_resize = eval preprocessing. FOLDABLE/DENSE_MAC drive the fold axis + mac_frac → mac_target_g.
 ARCHS = OrderedDict([
     ("convnext_t", dict(
         model_type="convnext", cnn_arch="convnext_tiny", model_name="convnext_tiny",
         weights="convnext_tiny_1k_224_ema.pth",
         cluster_weights="/algo/NetOptimization/outputs/NORMNET/ConvNeXt_tiny/convnext_tiny_22k_1k_224.pth",
-        mac_target_g=2.94, val_resize=232, protocol=[])),
+        val_resize=232)),
     ("resnet50", dict(
         model_type="cnn", cnn_arch="resnet50", model_name="resnet50",
         weights="resnet50-0676ba61.pth",
         cluster_weights="/algo/NetOptimization/outputs/NORMNET/ResNet50/resnet50_imagenet1k.pth",
-        mac_target_g=2.72, val_resize=256,
-        protocol=["--fold_native_bn", "--fold_no_reinsert"])),       # BN-free (fold), NO recalib — like mnv2
+        val_resize=256)),
     ("mobilenet_v2", dict(
         model_type="cnn", cnn_arch="mobilenet_v2", model_name="mobilenet_v2",
         weights="mobilenet_v2-7ebf99e0.pth",
         cluster_weights="/algo/NetOptimization/outputs/NORMNET/MNv2/mobilenet_v2_weights.pth",
-        mac_target_g=0.21, val_resize=232,
-        protocol=["--fold_native_bn", "--fold_no_reinsert",
-                  "--max_prune_ratio", "0.8"])),   # per-layer cap from the proven mnv2 recipe
+        val_resize=232)),
     ("deit_tiny", dict(
         model_type="vit", cnn_arch="deit_tiny", model_name="facebook/deit-tiny-patch16-224",
-        # local HF dir (config.json + *.safetensors) → from_pretrained(dir, local_files_only=True). EDIT.
         weights=None, cluster_weights="/algo/NetOptimization/outputs/NORMNET/DeiT/deit_tiny",
-        mac_target_g=0.95, val_resize=224, protocol=[])),
+        val_resize=224)),
 ])
 
-# --------------------------------------------------------------------- scorer flag sets
-ITER = ["--prop_iterative", "--prop_iter_drop", "128", "--prop_iter_max_frac", "0.6"]
-SCORERS = OrderedDict([
+DENSE_MAC = {"convnext_t": 4.45, "resnet50": 4.12, "mobilenet_v2": 0.32, "deit_tiny": 1.44}  # GMACs @224
+FOLDABLE = {"convnext_t": False, "resnet50": True, "mobilenet_v2": True, "deit_tiny": False}
+
+# --------------------------------------------------------------------- scorer families (composable)
+# base flags WITHOUT prop_p / measured / iter-knobs — those are separate axes added in spec_flags().
+BASES = OrderedDict([
     ("magnitude", ["--scorer", "magnitude"]),
     ("vbp",       ["--scorer", "variance"]),
-    ("prop",      ["--scorer", "propagation"]),
-    ("cov_comp",  ["--scorer", "propagation", "--prop_cov", "--prop_p", "2"]),
-    ("cov_meas",  ["--scorer", "propagation", "--prop_cov", "--prop_p", "2", "--prop_measured_var"]),
-    ("iter_comp", ["--scorer", "propagation", "--prop_cov", "--prop_p", "2"] + ITER),
-    ("iter_meas", ["--scorer", "propagation", "--prop_cov", "--prop_p", "2", "--prop_measured_var"] + ITER),
     ("nci",       ["--scorer", "tp_variance"]),
+    ("prop",      ["--scorer", "propagation"]),                  # relative independence (+ prop_p)
+    ("cov",       ["--scorer", "propagation", "--prop_cov"]),    # covariance (+ prop_p [+ measured])
+    ("iter",      ["--scorer", "propagation", "--prop_cov"]),    # iterative cov (+ prop_p [+ measured] + knobs)
 ])
+BASELINE = ["magnitude", "vbp", "nci"]
+FOCUS = ["prop", "cov", "iter"]
+ITER_DROP_DEFAULT, ITER_FRAC_DEFAULT = 128, 0.6
 
-PRE_FT_RE = re.compile(r"pre-FT acc=([0-9.]+).*?([0-9.]+)G\s*\((\d+)%\)")
+
+def scorer_label(base, p, measured):
+    if base in BASELINE:
+        return base
+    return f"{base}{'m' if measured else ''}p{p}"
 
 
-# ===================================================================== shared helpers
+# --------------------------------------------------------------------- spec generation
+def make_spec(arch, base, p, measured, fold, frac, norm="width", nonrel=False,
+              drop=ITER_DROP_DEFAULT, ifrac=ITER_FRAC_DEFAULT, block="curve"):
+    mac_g = round(DENSE_MAC[arch] * frac, 3)
+    tag = (f"{arch}__{scorer_label(base, p, measured)}__f{int(fold)}__n{norm}"
+           f"__nr{int(nonrel)}__d{drop}__x{ifrac}__mac{frac:.3f}")
+    return dict(arch=arch, base=base, p=p, measured=measured, fold=fold, frac=frac, mac_g=mac_g,
+                normalizer=norm, nonrel=nonrel, iter_drop=drop, iter_frac=ifrac, block=block, tag=tag)
+
+
+def gen_specs(args):
+    archs = [a for a in (args.archs.split(",") if args.archs else ARCHS) if a in ARCHS]
+    blocks = args.blocks.split(",")
+    n = max(args.mac_points, 2)
+    fracs = [round(0.30 + (0.90 - 0.30) * i / (n - 1), 3) for i in range(n)]
+    specs, seen = [], set()
+
+    def add(s):
+        if s["tag"] not in seen:
+            seen.add(s["tag"])
+            specs.append(s)
+
+    def scorer_variants(arch, fold, frac, **kw):
+        """The 8 canonical variants: 3 baselines + prop + cov{comp,meas} + iter{comp,meas}, all p=2."""
+        for b in BASELINE:
+            add(make_spec(arch, b, 2, False, fold, frac, **kw))
+        add(make_spec(arch, "prop", 2, False, fold, frac, **kw))
+        for b in ("cov", "iter"):
+            add(make_spec(arch, b, 2, False, fold, frac, **kw))
+            add(make_spec(arch, b, 2, True, fold, frac, **kw))
+
+    def focus_variants(arch, fold, frac, **kw):
+        """Focus family only (prop + cov{comp,meas} + iter{comp,meas}), p=2 — for ablations."""
+        add(make_spec(arch, "prop", 2, False, fold, frac, **kw))
+        for b in ("cov", "iter"):
+            add(make_spec(arch, b, 2, False, fold, frac, **kw))
+            add(make_spec(arch, b, 2, True, fold, frac, **kw))
+
+    for arch in archs:
+        folds = [True, False] if FOLDABLE[arch] else [False]
+        for fold in folds:
+            if "curve" in blocks:                                    # headline retention-vs-MAC frontier
+                for fr in fracs:
+                    scorer_variants(arch, fold, fr, block="curve")
+            if "ablation" in blocks:                                 # one-knob-at-a-time at ref_frac
+                fr = args.ref_frac
+                # p = 1 (vs the default p=2) — mass-conservation ablation
+                add(make_spec(arch, "prop", 1, False, fold, fr, block="abl_p1"))
+                for b in ("cov", "iter"):
+                    add(make_spec(arch, b, 1, False, fold, fr, block="abl_p1"))
+                    add(make_spec(arch, b, 1, True, fold, fr, block="abl_p1"))
+                focus_variants(arch, fold, fr, norm="none", block="abl_norm")     # normalizer none vs width
+                focus_variants(arch, fold, fr, nonrel=True, block="abl_nonrel")   # non-relative vs relative
+                for meas in (False, True):                                        # iter hyperparams
+                    for drop in (64, 256):
+                        add(make_spec(arch, "iter", 2, meas, fold, fr, drop=drop, block="abl_iter"))
+                    for ifr in (0.4, 0.8):
+                        add(make_spec(arch, "iter", 2, meas, fold, fr, ifrac=ifr, block="abl_iter"))
+
+    if args.max_runs and len(specs) > args.max_runs:
+        specs = specs[:args.max_runs]
+    return specs
+
+
+# --------------------------------------------------------------------- flag assembly
 def core_flags(args):
-    """normnet_main flags common to every cell (calib + eval + no-train, retention-only)."""
+    """normnet_main flags common to every cell: pure pre-FT retention (no recalib, no train)."""
     return [
-        "--global_pruning", "--reparam_variant", "mean", "--imp_normalizer", "width", "--bias_comp",
-        "--calib_batches", str(args.calib_batches), "--no_bn_recalib",   # recalib = re-fit BN ≈ FT → OFF
+        "--global_pruning", "--reparam_variant", "mean", "--bias_comp",
+        "--calib_batches", str(args.calib_batches), "--no_bn_recalib",      # recalib re-fits BN ≈ FT → OFF
         "--epochs_train", "0", "--epochs_ft", "0", "--epochs_norm_ft", "0", "--skip_norm_eval",
     ]
 
 
-def subset(args):
-    archs = [a for a in (args.archs.split(",") if args.archs else ARCHS) if a in ARCHS]
-    scorers = [s for s in (args.scorers.split(",") if args.scorers else SCORERS) if s in SCORERS]
-    return archs, scorers
-
-
-def save_tag(arch, scorer):
-    return f"{arch}_{scorer}"
+def spec_flags(spec):
+    """The per-spec normnet_main flags (mac target, fold, normalizer, scorer + all axes)."""
+    arch, base = spec["arch"], spec["base"]
+    a = ARCHS[arch]
+    f = ["--mac_target_g", str(spec["mac_g"]), "--val_resize", str(a["val_resize"]),
+         "--imp_normalizer", spec["normalizer"]]
+    if spec["fold"]:
+        f += ["--fold_native_bn", "--fold_no_reinsert"]
+    if arch == "mobilenet_v2":
+        f += ["--max_prune_ratio", "0.8"]                  # per-layer cap from the proven mnv2 recipe
+    f += list(BASES[base])
+    if base in ("prop", "cov", "iter"):
+        f += ["--prop_p", str(spec["p"])]
+    if base == "iter":
+        f += ["--prop_iterative", "--prop_iter_drop", str(spec["iter_drop"]),
+              "--prop_iter_max_frac", str(spec["iter_frac"])]
+    if spec["measured"] and base in ("cov", "iter"):
+        f += ["--prop_measured_var"]
+    if spec["nonrel"]:
+        f += ["--prop_non_relative"]
+    return f
 
 
 # ===================================================================== CLUSTER: submit
-def build_sh(arch, scorer, args, out_dir):
-    """The run_ddp.sh body for one cell: DDP normnet_main, retention-only (epochs_ft 0)."""
-    a = ARCHS[arch]
-    tag = save_tag(arch, scorer)
-    flags = [
-        "--model_type", a["model_type"], "--cnn_arch", a["cnn_arch"],
-        "--model_name", a["cluster_weights"],
-        "--data_path", CLUSTER["data_path"],
-        "--mac_target_g", str(a["mac_target_g"]), "--val_resize", str(a["val_resize"]),
-        "--save_dir", out_dir, "--save_tag", tag,
-    ] + core_flags(args) + a["protocol"] + SCORERS[scorer]
-    line = (f"python3 -m torch.distributed.launch --nproc_per_node={CLUSTER['nproc']} "
-            f"{CLUSTER['repo']}/benchmarks/vbp/normnet_main.py \\\n    "
-            + " ".join(flags))
+def build_sh(spec, args, out_dir):
+    a = ARCHS[spec["arch"]]
+    flags = ["--model_type", a["model_type"], "--cnn_arch", a["cnn_arch"],
+             "--model_name", a["cluster_weights"], "--data_path", CLUSTER["data_path"],
+             "--save_dir", out_dir, "--save_tag", spec["tag"]] + core_flags(args) + spec_flags(spec)
+    line = (f"python3 -m torch.distributed.launch --nproc_per_node={CLUSTER['ngpu']} "
+            f"{CLUSTER['repo']}/benchmarks/vbp/normnet_main.py \\\n    " + " ".join(flags))
     return f"#!/bin/bash\nset -e\ncd {CLUSTER['repo']}\n{line}\n"
 
 
-def submit_cell(arch, scorer, args):
-    tag = save_tag(arch, scorer)
+def submit_spec(spec, args):
+    tag = spec["tag"]
     out_dir = os.path.join(CLUSTER["out_root"], args.run_name, tag)
     sh_path = os.path.join(out_dir, "run_ddp.sh")
-    cmd = submit_cmd(sh_path, f"REPRO {arch} {scorer}")
-    if args.dry_run:                          # pure: render, touch no filesystem (cluster paths RO on laptop)
-        print(f"\n# ===== {tag} =====\n# sh: {sh_path}")
-        print(build_sh(arch, scorer, args, out_dir))
+    cmd = submit_cmd(sh_path, f"SWEEP {tag}")
+    if args.dry_run:
+        print(f"\n# ===== {tag} =====")
+        print(build_sh(spec, args, out_dir))
         print("# submit:\n" + cmd)
         return
     if not args.force and os.path.exists(os.path.join(out_dir, f"{tag}_prune.json")):
-        print(f"[skip] {tag} (prune.json exists)")
-        return
+        return "skip"
     os.makedirs(out_dir, exist_ok=True)
     try:
         os.chmod(out_dir, 0o777)
     except OSError:
         pass
-    with open(sh_path, "w") as f:
-        f.write(build_sh(arch, scorer, args, out_dir))
+    with open(sh_path, "w") as fp:
+        fp.write(build_sh(spec, args, out_dir))
     os.chmod(sh_path, 0o777)
-    print(f"[submit] {tag}")
     subprocess.run(cmd, shell=True)
+    return "submit"
 
 
 def mode_submit(args):
-    archs, scorers = subset(args)
+    specs = gen_specs(args)
+    if args.list:
+        for s in specs:
+            print(f"{s['block']:11s} {s['tag']}")
+        print(f"\nTOTAL: {len(specs)} specs")
+        return
     if not args.dry_run:
         os.makedirs(os.path.join(CLUSTER["out_root"], args.run_name), exist_ok=True)
-    print(f"[SUBMIT] run_name={args.run_name}  {len(archs)}×{len(scorers)} cells  "
-          f"out={os.path.join(CLUSTER['out_root'], args.run_name)}")
-    for arch in archs:
-        for sc in scorers:
-            submit_cell(arch, sc, args)
+    print(f"[SUBMIT] run_name={args.run_name}  {len(specs)} specs  "
+          f"out={os.path.join(CLUSTER['out_root'], args.run_name)}", flush=True)
+    n_sub = n_skip = 0
+    for s in specs:
+        r = submit_spec(s, args)
+        if r == "submit":
+            n_sub += 1
+            print(f"[submit {n_sub}] {s['tag']}", flush=True)
+        elif r == "skip":
+            n_skip += 1
     if not args.dry_run:
-        print("\nAll submitted. Wait for the queue, then:\n  "
+        print(f"\nsubmitted {n_sub}, skipped {n_skip} (already done). Collect when the queue drains:\n  "
               f"python reproduce_table.py --mode collect --run_name {args.run_name}")
 
 
 # ===================================================================== CLUSTER: collect
-def collect_cell(arch, scorer, args):
-    tag = save_tag(arch, scorer)
-    pj = os.path.join(CLUSTER["out_root"], args.run_name, tag, f"{tag}_prune.json")
-    if not os.path.exists(pj):
-        return dict(arch=arch, scorer=scorer, acc=None, mac_pct=None, error="no prune.json")
-    d = json.load(open(pj))
-    return dict(arch=arch, scorer=scorer, acc=d.get("pre_ft_val_acc"),
-                mac_g=d.get("macs_g"), mac_pct=int(round(d.get("macs_pct", 0))))
-
-
-def mode_collect(args):
-    archs, scorers = subset(args)
-    done = {}
+def collect(args):
+    specs = gen_specs(args)
+    rows, n_found = [], 0
+    for s in specs:
+        pj = os.path.join(CLUSTER["out_root"], args.run_name, s["tag"], f"{s['tag']}_prune.json")
+        if not os.path.exists(pj):
+            continue
+        try:
+            d = json.load(open(pj))
+        except Exception:
+            continue
+        n_found += 1
+        rows.append(dict(arch=s["arch"], scorer=scorer_label(s["base"], s["p"], s["measured"]),
+                         base=s["base"], p=s["p"], measured=s["measured"], fold=s["fold"],
+                         frac=s["frac"], block=s["block"], normalizer=s["normalizer"],
+                         nonrel=s["nonrel"], iter_drop=s["iter_drop"], iter_frac=s["iter_frac"],
+                         acc=d.get("pre_ft_val_acc"), mac_g=d.get("macs_g"),
+                         mac_pct=d.get("macs_pct"), tag=s["tag"]))
     with open(LEDGER, "w") as f:
-        for arch in archs:
-            for sc in scorers:
-                rec = collect_cell(arch, sc, args)
-                done[(arch, sc)] = rec
-                if rec.get("acc") is not None:
-                    f.write(json.dumps(rec) + "\n")
-    n = sum(1 for v in done.values() if v.get("acc") is not None)
-    print(f"[COLLECT] {n}/{len(done)} cells found → {LEDGER}")
-    print_table(done, archs, scorers)
-    print(f"\nplot:  python plot_table.py --ledger {os.path.basename(LEDGER)} --out cluster.png")
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    print(f"[COLLECT] {n_found}/{len(specs)} cells found → {LEDGER}")
+    summarize(rows)
+
+
+def summarize(rows):
+    """Quick per-arch table at the reference fraction (curve block, default axes) + best-per-arch."""
+    if not rows:
+        print("no results yet.")
+        return
+    canon = [r for r in rows if r["block"] == "curve" and r["normalizer"] == "width"
+             and not r["nonrel"] and r["p"] == 2]
+    fracs = sorted({r["frac"] for r in canon})
+    ref = min(fracs, key=lambda x: abs(x - 0.65)) if fracs else None
+    print(f"\n{'='*80}\nRETENTION @ mac_frac≈{ref} (curve, width, p2)  [fold=arch-default]\n{'='*80}")
+    scorers = ["magnitude", "vbp", "prop", "covp2", "covmp2", "iterp2", "itermp2", "nci"]
+    print("| arch | " + " | ".join(scorers) + " |")
+    print("|" + "---|" * (len(scorers) + 1))
+    for arch in ARCHS:
+        af = [r for r in canon if r["arch"] == arch and r["frac"] == ref]
+        if not af:
+            continue
+        fold_def = FOLDABLE[arch]
+        cells = []
+        for sc in scorers:
+            m = [r for r in af if r["scorer"] == sc and r["fold"] == fold_def]
+            cells.append(f"{m[0]['acc']:.3f}" if m and m[0]["acc"] is not None else "·")
+        mac = next((r["mac_pct"] for r in af if r.get("mac_pct")), "?")
+        print(f"| {arch} ({mac}%) | " + " | ".join(cells) + " |")
+    print("\nBest scorer per arch (any axis):")
+    for arch in ARCHS:
+        ar = [r for r in rows if r["arch"] == arch and r["acc"] is not None]
+        if ar:
+            b = max(ar, key=lambda r: r["acc"])
+            print(f"  {arch:14s} {b['acc']:.3f}  ({b['tag']})")
+    print(f"\ncurves figure:  python plot_table.py --curves --out sweep.png")
 
 
 # ===================================================================== LOCAL: subprocess
@@ -244,51 +348,7 @@ def _subenv():
     return env
 
 
-def build_argv_local(arch, scorer, args, save_dir):
-    a = ARCHS[arch]
-    model_name = a["model_name"]
-    if a["weights"] and args.weights_dir:
-        wp = os.path.join(os.path.expanduser(args.weights_dir), a["weights"])
-        if os.path.exists(wp):
-            model_name = wp
-    argv = [sys.executable, MAIN,
-            "--model_type", a["model_type"], "--cnn_arch", a["cnn_arch"], "--model_name", model_name,
-            "--data_path", args.data_path,
-            "--mac_target_g", str(a["mac_target_g"]), "--val_resize", str(a["val_resize"]),
-            "--save_dir", save_dir, "--save_tag", save_tag(arch, scorer),
-            "--val_batch_size", str(args.val_batch_size), "--val_limit", str(args.val_limit),
-            "--num_workers", str(args.num_workers), "--disable_ddp"]
-    return argv + core_flags(args) + a["protocol"] + SCORERS[scorer]
-
-
-def run_cell_local(arch, scorer, args):
-    with tempfile.TemporaryDirectory() as sd:
-        argv = build_argv_local(arch, scorer, args, sd)
-        if args.dry_run:
-            print("  " + " ".join(argv[1:]))
-            return None
-        t0 = time.time()
-        p = subprocess.run(argv, capture_output=True, text=True, env=_subenv())
-        out = p.stdout + "\n" + p.stderr
-        accs = list(PRE_FT_RE.finditer(out))
-        if not accs:
-            tail = "\n".join(out.strip().splitlines()[-12:])
-            return dict(arch=arch, scorer=scorer, acc=None, mac_pct=None,
-                        secs=round(time.time() - t0), error=tail[:2000])
-        m = accs[-1]
-        return dict(arch=arch, scorer=scorer, acc=float(m.group(1)),
-                    mac_g=float(m.group(2)), mac_pct=int(m.group(3)), secs=round(time.time() - t0))
-
-
-def load_ledger():
-    done = {}
-    if os.path.exists(LEDGER):
-        for line in open(LEDGER):
-            line = line.strip()
-            if line:
-                d = json.loads(line)
-                done[(d["arch"], d["scorer"])] = d
-    return done
+PRE_FT_RE = re.compile(r"pre-FT acc=([0-9.]+).*?([0-9.]+)G\s*\((\d+)%\)")
 
 
 def mode_local(args):
@@ -299,45 +359,43 @@ def mode_local(args):
         if args.val_limit == 0:
             args.val_limit = 512
         LEDGER = os.path.join(HERE, "results_table_smoke.jsonl")
-        print(f"[SMOKE] calib_batches={args.calib_batches} val_limit={args.val_limit} "
-              f"ledger={os.path.basename(LEDGER)}", flush=True)
-    archs, scorers = subset(args)
-    done = load_ledger()
+    specs = gen_specs(args)
     if not args.data_path and not args.dry_run:
-        sys.exit("--data_path required for local mode (or use --dry_run)")
-    for arch in archs:
-        for sc in scorers:
-            if not args.force and (arch, sc) in done and done[(arch, sc)].get("acc") is not None:
-                print(f"[skip] {arch}/{sc} = {done[(arch, sc)]['acc']:.4f}", flush=True)
+        sys.exit("--data_path required for local mode")
+    done = set()
+    if os.path.exists(LEDGER):
+        done = {json.loads(l)["tag"] for l in open(LEDGER) if l.strip()}
+    print(f"[LOCAL] {len(specs)} specs, {len(done)} already in ledger", flush=True)
+    for s in specs:
+        if not args.force and s["tag"] in done:
+            continue
+        a = ARCHS[s["arch"]]
+        model_name = a["model_name"]
+        if a["weights"] and args.weights_dir:
+            wp = os.path.join(os.path.expanduser(args.weights_dir), a["weights"])
+            if os.path.exists(wp):
+                model_name = wp
+        with tempfile.TemporaryDirectory() as sd:
+            argv = [sys.executable, MAIN, "--model_type", a["model_type"], "--cnn_arch", a["cnn_arch"],
+                    "--model_name", model_name, "--data_path", args.data_path,
+                    "--save_dir", sd, "--save_tag", s["tag"], "--disable_ddp",
+                    "--val_batch_size", str(args.val_batch_size), "--val_limit", str(args.val_limit),
+                    "--num_workers", str(args.num_workers)] + core_flags(args) + spec_flags(s)
+            if args.dry_run:
+                print("  " + " ".join(argv[1:]))
                 continue
-            print(f"\n##### {arch} / {sc} #####", flush=True)
-            rec = run_cell_local(arch, sc, args)
-            if rec is None:
-                continue
-            if rec.get("acc") is not None:
-                print(f"  -> acc={rec['acc']:.4f}  {rec.get('mac_pct')}% MAC  ({rec['secs']}s)", flush=True)
-            else:
-                print(f"  -> FAILED ({rec['secs']}s)\n{rec.get('error', '')}", flush=True)
+            t0 = time.time()
+            p = subprocess.run(argv, capture_output=True, text=True, env=_subenv())
+            out = p.stdout + "\n" + p.stderr
+            m = list(PRE_FT_RE.finditer(out))
+            acc = float(m[-1].group(1)) if m else None
+            rec = dict(arch=s["arch"], scorer=scorer_label(s["base"], s["p"], s["measured"]),
+                       fold=s["fold"], frac=s["frac"], block=s["block"], acc=acc,
+                       mac_pct=int(m[-1].group(3)) if m else None, tag=s["tag"],
+                       secs=round(time.time() - t0))
+            print(f"  {s['tag']}: acc={acc}  ({rec['secs']}s)", flush=True)
             with open(LEDGER, "a") as f:
                 f.write(json.dumps(rec) + "\n")
-            done[(arch, sc)] = rec
-    if not args.dry_run:
-        print_table(done, archs, scorers)
-
-
-# ===================================================================== table print
-def print_table(done, archs, scorers):
-    print("\n" + "=" * 80 + "\nRETENTION TABLE (pre-FT top-1, width norm)\n" + "=" * 80)
-    print("| arch | " + " | ".join(scorers) + " |")
-    print("|" + "---|" * (len(scorers) + 1))
-    for arch in archs:
-        cells = []
-        for sc in scorers:
-            d = done.get((arch, sc))
-            cells.append("·" if d is None else ("ERR" if d.get("acc") is None else f"{d['acc']:.3f}"))
-        mac = next((done[(arch, s)].get("mac_pct") for s in scorers
-                    if done.get((arch, s)) and done[(arch, s)].get("mac_pct")), "?")
-        print(f"| {arch} ({mac}%) | " + " | ".join(cells) + " |")
 
 
 # ===================================================================== main
@@ -345,12 +403,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["submit", "collect", "local"], default="submit")
     ap.add_argument("--archs", default="", help="comma subset of " + ",".join(ARCHS))
-    ap.add_argument("--scorers", default="", help="comma subset of " + ",".join(SCORERS))
+    ap.add_argument("--blocks", default="curve,ablation", help="curve and/or ablation")
+    ap.add_argument("--mac_points", type=int, default=18, help="number of mac_frac points (curve density)")
+    ap.add_argument("--ref_frac", type=float, default=0.65, help="mac_frac for the ablation block")
+    ap.add_argument("--max_runs", type=int, default=0, help="cap total specs (0=all)")
     ap.add_argument("--calib_batches", type=int, default=50)
     # cluster
-    ap.add_argument("--run_name", default="REPRO_v1", help="subdir under CLUSTER out_root")
+    ap.add_argument("--run_name", default="SWEEP_v1")
     ap.add_argument("--force", action="store_true", help="re-submit / re-run even if result exists")
-    ap.add_argument("--dry_run", action="store_true", help="print commands/.sh, submit/run nothing")
+    ap.add_argument("--dry_run", action="store_true", help="print .sh/commands, run nothing")
+    ap.add_argument("--list", action="store_true", help="print specs + total count, submit nothing")
     # local only
     ap.add_argument("--data_path", default="")
     ap.add_argument("--weights_dir", default="~/.cache/torch/hub/checkpoints")
@@ -363,7 +425,7 @@ def main():
     if args.mode == "submit":
         mode_submit(args)
     elif args.mode == "collect":
-        mode_collect(args)
+        collect(args)
     else:
         mode_local(args)
 
