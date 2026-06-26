@@ -84,9 +84,11 @@ def submit_cmd(sh_path, desc):
 
 # --------------------------------------------------------------------- per-arch config
 # protocol = the established per-arch recipe (same as the 5×7 table):
-#   convnext/deit : LayerNorm           → no fold, no recalib
-#   resnet50      : native BN           → recalib ON post-prune (default; omit --no_bn_recalib)
-#   mobilenet_v2  : fold native BN free → --fold_native_bn --fold_no_reinsert --no_bn_recalib
+#   convnext/deit : LayerNorm           → no fold
+#   resnet50      : native BN           → no fold (pure pre-FT; recalib is OFF — it re-fits BN stats
+#                                         = effectively FT, irrelevant to a retention table)
+#   mobilenet_v2  : fold native BN free → --fold_native_bn --fold_no_reinsert
+# --no_bn_recalib is applied to EVERY cell via core_flags() (no recalib anywhere = pure pre-FT).
 # cluster_weights = path on the CLUSTER (EDIT). weights = laptop filename under --weights_dir (local mode).
 ARCHS = OrderedDict([
     ("convnext_t", dict(
@@ -98,13 +100,13 @@ ARCHS = OrderedDict([
         model_type="cnn", cnn_arch="resnet50", model_name="resnet50",
         weights="resnet50-0676ba61.pth",
         cluster_weights="/algo/NetOptimization/outputs/NORMNET/ResNet50/resnet50_imagenet1k.pth",
-        mac_target_g=2.72, val_resize=256, protocol=[])),           # native BN → recalib ON (default)
+        mac_target_g=2.72, val_resize=256, protocol=[])),           # native BN, NO recalib (core_flags)
     ("mobilenet_v2", dict(
         model_type="cnn", cnn_arch="mobilenet_v2", model_name="mobilenet_v2",
         weights="mobilenet_v2-7ebf99e0.pth",
         cluster_weights="/algo/NetOptimization/outputs/NORMNET/MNv2/mobilenet_v2_weights.pth",
         mac_target_g=0.21, val_resize=232,
-        protocol=["--fold_native_bn", "--fold_no_reinsert", "--no_bn_recalib",
+        protocol=["--fold_native_bn", "--fold_no_reinsert",
                   "--max_prune_ratio", "0.8"])),   # per-layer cap from the proven mnv2 recipe
     ("deit_tiny", dict(
         model_type="vit", cnn_arch="deit_tiny", model_name="facebook/deit-tiny-patch16-224",
@@ -133,7 +135,7 @@ def core_flags(args):
     """normnet_main flags common to every cell (calib + eval + no-train, retention-only)."""
     return [
         "--global_pruning", "--reparam_variant", "mean", "--imp_normalizer", "width", "--bias_comp",
-        "--calib_batches", str(args.calib_batches),
+        "--calib_batches", str(args.calib_batches), "--no_bn_recalib",   # recalib = re-fit BN ≈ FT → OFF
         "--epochs_train", "0", "--epochs_ft", "0", "--epochs_norm_ft", "0", "--skip_norm_eval",
     ]
 
