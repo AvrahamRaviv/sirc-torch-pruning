@@ -58,15 +58,15 @@ CLUSTER = dict(
     repo="/home/avrahamra/PycharmProjects/sirc-torch-pruning",      # cd target inside the .sh
     data_path="/algo/NetOptimization/outputs/VBP/",                 # ImageNet root on the cluster
     out_root="/algo/NetOptimization/outputs/NORMNET/REPRO_TABLE",   # all cells land under here/<run_name>
-    nproc=4,                                                        # GPUs per job (torch.distributed.launch)
-    # remote-gpu submission envelope (verbatim from run_ddp.py)
+    nproc=1,                                                        # GPUs per job (retention = calib+eval, 1 GPU is enough)
+    # remote-gpu submission envelope (from run_ddp.py; -x = GPUs requested, matched to nproc)
     cmd_a=("/algo/ws/shared/remote-gpu/run_docker_gpu.sh "
            "-d gitlab-srv:4567/od-alg/od_next_gen:v1.7.7_tp2 "
            "-C execute -q gpu_deep_train_med_q -W working_dir -M "),
     cmd_b=("  -s 50gb -n 10 -o 75000 -A '' -p VISION "
            "-v /algo/NetOptimization:/algo/NetOptimization "
            "-R 'select[gpu_hm]' -R 'select[g_model != RTXA5000]' "
-           "-E force_python_3=yes -x 4"),
+           "-E force_python_3=yes -x 1"),
 )
 
 # --------------------------------------------------------------------- per-arch config
