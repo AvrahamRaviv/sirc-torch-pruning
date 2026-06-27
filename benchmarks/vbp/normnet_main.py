@@ -1108,8 +1108,8 @@ def main(argv):
             log_info(f"fold_native_bn: reinserted {n_re} fresh BN at pruned widths (pre-FT)")
         if not args.no_bn_recalib:
             _rcb = args.recalib_batches if args.recalib_batches > 0 else args.calib_batches
-            log_info(f"recalibrating BN running stats ({_rcb} batches)...")
-            _recalibrate_bn(model, train_loader, device, max_batches=_rcb)
+            log_info(f"recalibrating BN running stats ({_rcb} batches, clean calib transform)...")
+            _recalibrate_bn(model, calib_loader, device, max_batches=_rcb)   # clean val-transform stats
             log_info("BN recalibration done")
         else:
             log_info("BN recalibration SKIPPED (--no_bn_recalib)")
