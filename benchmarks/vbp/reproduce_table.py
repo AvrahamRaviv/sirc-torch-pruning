@@ -135,6 +135,48 @@ def make_spec(arch, base, p, measured, fold, frac, norm="width", nonrel=False,
                 normalizer=norm, nonrel=nonrel, iter_drop=drop, iter_frac=ifrac, block=block, tag=tag)
 
 
+def make_bnfold_spec(arch, base, frac, protocol, recalib_k):
+    """BN-fold validation cell: scorer fixed at computed p=2, BN handling = protocol(+k)."""
+    mac_g = round(DENSE_MAC[arch] * frac, 3)
+    sc = scorer_label(base, 2, False)
+    tag = f"bnf__{arch}__{sc}__{protocol}__k{recalib_k}__mac{frac:.3f}"
+    return dict(arch=arch, base=base, p=2, measured=False, fold=False, frac=frac, mac_g=mac_g,
+                normalizer="width", nonrel=False, iter_drop=ITER_DROP_DEFAULT, iter_frac=ITER_FRAC_DEFAULT,
+                block="bnfold", protocol=protocol, recalib_k=recalib_k, tag=tag)
+
+
+def bnfold_specs():
+    """~50 cluster runs to validate the BN-fold fix on the native-BN nets (resnet50, mnv2).
+    Tests whether a no-grad measure-pass lifts the collapsed cells (resnet50 cov@65%≈0.02) toward
+    the recalib ceiling, and whether fold_no_reinsert is dominated. Computed cov/iter only."""
+    specs, seen = [], set()
+    def add(arch, base, fr, proto, k):
+        s = make_bnfold_spec(arch, base, fr, proto, k)
+        if s["tag"] not in seen:
+            seen.add(s["tag"]); specs.append(s)
+    macs = [0.50, 0.65, 0.80]
+    for arch in ("resnet50", "mobilenet_v2"):
+        # cov: A(collapse) + D(fold+reinsert+measure50) at all MAC; B(native stale) at all MAC;
+        #      C(native+measure) k-sweep {1,5,50}@0.65 + k50@{0.50,0.80}
+        for fr in macs:
+            add(arch, "cov", fr, "A_foldnoreinsert", 0)
+            add(arch, "cov", fr, "D_foldreinsert_recal", 50)
+            add(arch, "cov", fr, "B_native", 0)
+        for k in (1, 5, 50):
+            add(arch, "cov", 0.65, "C_native_recal", k)
+        add(arch, "cov", 0.50, "C_native_recal", 50)
+        add(arch, "cov", 0.80, "C_native_recal", 50)
+        # iter: A + D(measure50) + C(native measure50) at all MAC
+        for fr in macs:
+            add(arch, "iter", fr, "A_foldnoreinsert", 0)
+            add(arch, "iter", fr, "D_foldreinsert_recal", 50)
+            add(arch, "iter", fr, "C_native_recal", 50)
+        # magnitude control (bad scorer: BN fix should NOT rescue it) @0.65
+        add(arch, "magnitude", 0.65, "A_foldnoreinsert", 0)
+        add(arch, "magnitude", 0.65, "C_native_recal", 50)
+    return specs
+
+
 def gen_specs(args):
     archs = [a for a in (args.archs.split(",") if args.archs else ARCHS) if a in ARCHS]
     blocks = args.blocks.split(",")
@@ -184,6 +226,11 @@ def gen_specs(args):
                     for ifr in (0.4, 0.8):
                         add(make_spec(arch, "iter", 2, meas, fold, fr, ifrac=ifr, block="abl_iter"))
 
+    if "bnfold" in blocks:
+        for s in bnfold_specs():
+            if s["arch"] in archs and s["tag"] not in seen:
+                seen.add(s["tag"]); specs.append(s)
+
     if args.max_runs and len(specs) > args.max_runs:
         specs = specs[:args.max_runs]
     return specs
@@ -191,22 +238,42 @@ def gen_specs(args):
 
 # --------------------------------------------------------------------- flag assembly
 def core_flags(args):
-    """normnet_main flags common to every cell: pure pre-FT retention (no recalib, no train)."""
+    """normnet_main flags common to every cell (BN/fold handling lives in bn_flags)."""
     return [
         "--global_pruning", "--reparam_variant", "mean", "--bias_comp",
-        "--calib_batches", str(args.calib_batches), "--no_bn_recalib",      # recalib re-fits BN ≈ FT → OFF
+        "--calib_batches", str(args.calib_batches),
         "--epochs_train", "0", "--epochs_ft", "0", "--epochs_norm_ft", "0", "--skip_norm_eval",
     ]
 
 
+def bn_flags(spec):
+    """BN/fold/recalib handling. curve+ablation = pure pre-FT, no recalib. bnfold block = per
+    protocol (the 50-run BN-fold validation): A fold-no-reinsert+no-recalib (collapse baseline),
+    B native+no-recalib (stale guard), C native+measure-pass(k), D fold+reinsert+measure-pass(k).
+    Measure-pass = no-grad BN re-estimation (k≈1 suffices ⇒ calibration, not FT)."""
+    if spec.get("block") == "bnfold":
+        proto, k = spec["protocol"], spec.get("recalib_k", 0)
+        if proto == "A_foldnoreinsert":
+            return ["--fold_native_bn", "--fold_no_reinsert", "--no_bn_recalib"]
+        if proto == "B_native":
+            return ["--no_bn_recalib"]
+        if proto == "C_native_recal":
+            return ["--recalib_batches", str(k)]
+        if proto == "D_foldreinsert_recal":
+            return ["--fold_native_bn", "--recalib_batches", str(k)]
+        raise ValueError(f"unknown protocol {proto!r}")
+    f = ["--no_bn_recalib"]                                  # default: pure pre-FT, recalib OFF
+    if spec.get("fold"):
+        f += ["--fold_native_bn", "--fold_no_reinsert"]
+    return f
+
+
 def spec_flags(spec):
-    """The per-spec normnet_main flags (mac target, fold, normalizer, scorer + all axes)."""
+    """The per-spec normnet_main flags (mac target, normalizer, scorer + all axes). Fold/BN in bn_flags."""
     arch, base = spec["arch"], spec["base"]
     a = ARCHS[arch]
     f = ["--mac_target_g", str(spec["mac_g"]), "--val_resize", str(a["val_resize"]),
          "--imp_normalizer", spec["normalizer"]]
-    if spec["fold"]:
-        f += ["--fold_native_bn", "--fold_no_reinsert"]
     if arch == "mobilenet_v2":
         f += ["--max_prune_ratio", "0.8"]                  # per-layer cap from the proven mnv2 recipe
     f += list(BASES[base])
@@ -227,7 +294,7 @@ def build_sh(spec, args, out_dir):
     a = ARCHS[spec["arch"]]
     flags = ["--model_type", a["model_type"], "--cnn_arch", a["cnn_arch"],
              "--model_name", a["cluster_weights"], "--data_path", CLUSTER["data_path"],
-             "--save_dir", out_dir, "--save_tag", spec["tag"]] + core_flags(args) + spec_flags(spec)
+             "--save_dir", out_dir, "--save_tag", spec["tag"]] + core_flags(args) + bn_flags(spec) + spec_flags(spec)
     line = (f"python3 -m torch.distributed.launch --nproc_per_node={CLUSTER['ngpu']} "
             f"{CLUSTER['repo']}/benchmarks/vbp/normnet_main.py \\\n    " + " ".join(flags))
     return f"#!/bin/bash\nset -e\ncd {CLUSTER['repo']}\n{line}\n"
@@ -298,6 +365,7 @@ def collect(args):
                          base=s["base"], p=s["p"], measured=s["measured"], fold=s["fold"],
                          frac=s["frac"], block=s["block"], normalizer=s["normalizer"],
                          nonrel=s["nonrel"], iter_drop=s["iter_drop"], iter_frac=s["iter_frac"],
+                         protocol=s.get("protocol"), recalib_k=s.get("recalib_k"),
                          acc=d.get("pre_ft_val_acc"), mac_g=d.get("macs_g"),
                          mac_pct=d.get("macs_pct"), tag=s["tag"]))
     with open(LEDGER, "w") as f:
@@ -307,37 +375,64 @@ def collect(args):
     summarize(rows)
 
 
+SUMMARY_SCORERS = ["magnitude", "vbp", "propp2", "covp2", "covmp2", "iterp2", "itermp2", "nci"]
+
+
 def summarize(rows):
-    """Quick per-arch table at the reference fraction (curve block, default axes) + best-per-arch."""
+    """Per-arch retention-vs-MAC table (ALL mac_frac points) + best-per-arch + BN-fold block."""
     if not rows:
         print("no results yet.")
         return
     canon = [r for r in rows if r["block"] == "curve" and r["normalizer"] == "width"
              and not r["nonrel"] and r["p"] == 2]
-    fracs = sorted({r["frac"] for r in canon})
-    ref = min(fracs, key=lambda x: abs(x - 0.65)) if fracs else None
-    print(f"\n{'='*80}\nRETENTION @ mac_frac≈{ref} (curve, width, p2)  [fold=arch-default]\n{'='*80}")
-    scorers = ["magnitude", "vbp", "prop", "covp2", "covmp2", "iterp2", "itermp2", "nci"]
-    print("| arch | " + " | ".join(scorers) + " |")
-    print("|" + "---|" * (len(scorers) + 1))
     for arch in ARCHS:
-        af = [r for r in canon if r["arch"] == arch and r["frac"] == ref]
-        if not af:
+        ar = [r for r in canon if r["arch"] == arch and r["fold"] == FOLDABLE[arch]]
+        if not ar:
             continue
-        fold_def = FOLDABLE[arch]
-        cells = []
-        for sc in scorers:
-            m = [r for r in af if r["scorer"] == sc and r["fold"] == fold_def]
-            cells.append(f"{m[0]['acc']:.3f}" if m and m[0]["acc"] is not None else "·")
-        mac = next((r["mac_pct"] for r in af if r.get("mac_pct")), "?")
-        print(f"| {arch} ({mac}%) | " + " | ".join(cells) + " |")
+        fracs = sorted({r["frac"] for r in ar})
+        print(f"\n{'='*100}\n{arch}  (fold={int(FOLDABLE[arch])}, width, p2) — retention vs MAC "
+              f"[{len(fracs)} points]\n{'='*100}")
+        print("| mac_frac | mac% | " + " | ".join(SUMMARY_SCORERS) + " |")
+        print("|" + "---|" * (len(SUMMARY_SCORERS) + 2))
+        for fr in fracs:
+            fa = [r for r in ar if r["frac"] == fr]
+            mac = next((r["mac_pct"] for r in fa if r.get("mac_pct") is not None), "?")
+            cells = []
+            for sc in SUMMARY_SCORERS:
+                m = [r for r in fa if r["scorer"] == sc]
+                cells.append(f"{m[0]['acc']:.3f}" if m and m[0]["acc"] is not None else "·")
+            print(f"| {fr:.3f} | {mac} | " + " | ".join(cells) + " |")
     print("\nBest scorer per arch (any axis):")
     for arch in ARCHS:
         ar = [r for r in rows if r["arch"] == arch and r["acc"] is not None]
         if ar:
             b = max(ar, key=lambda r: r["acc"])
             print(f"  {arch:14s} {b['acc']:.3f}  ({b['tag']})")
+    summarize_bnfold(rows)
     print(f"\ncurves figure:  python plot_table.py --curves --out sweep.png")
+
+
+def summarize_bnfold(rows):
+    """BN-fold validation: for each arch×scorer×MAC, the protocol/measure-pass columns side by side."""
+    br = [r for r in rows if r.get("block") == "bnfold" and r["acc"] is not None]
+    if not br:
+        return
+    cols = [("A_foldnoreinsert", 0, "A:fold-noreinsert"), ("B_native", 0, "B:native-stale"),
+            ("C_native_recal", 1, "C:native+m1"), ("C_native_recal", 5, "C:native+m5"),
+            ("C_native_recal", 50, "C:native+m50"), ("D_foldreinsert_recal", 50, "D:fold+reins+m50")]
+    print(f"\n{'='*100}\nBN-FOLD VALIDATION  (pre-FT top-1; measure-pass = no-grad BN re-estimation, "
+          f"k batches)\n{'='*100}")
+    print("| arch | scorer | mac% | " + " | ".join(c[2] for c in cols) + " |")
+    print("|" + "---|" * (len(cols) + 3))
+    keys = sorted({(r["arch"], r["scorer"], r["frac"]) for r in br})
+    for arch, sc, fr in keys:
+        grp = [r for r in br if r["arch"] == arch and r["scorer"] == sc and r["frac"] == fr]
+        mac = next((r["mac_pct"] for r in grp if r.get("mac_pct") is not None), "?")
+        cells = []
+        for proto, k, _ in cols:
+            m = [r for r in grp if r["protocol"] == proto and (r.get("recalib_k") or 0) == k]
+            cells.append(f"{m[0]['acc']:.3f}" if m else "·")
+        print(f"| {arch} | {sc} | {mac} | " + " | ".join(cells) + " |")
 
 
 # ===================================================================== LOCAL: subprocess
@@ -380,7 +475,7 @@ def mode_local(args):
                     "--model_name", model_name, "--data_path", args.data_path,
                     "--save_dir", sd, "--save_tag", s["tag"], "--disable_ddp",
                     "--val_batch_size", str(args.val_batch_size), "--val_limit", str(args.val_limit),
-                    "--num_workers", str(args.num_workers)] + core_flags(args) + spec_flags(s)
+                    "--num_workers", str(args.num_workers)] + core_flags(args) + bn_flags(s) + spec_flags(s)
             if args.dry_run:
                 print("  " + " ".join(argv[1:]))
                 continue
@@ -403,7 +498,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["submit", "collect", "local"], default="submit")
     ap.add_argument("--archs", default="", help="comma subset of " + ",".join(ARCHS))
-    ap.add_argument("--blocks", default="curve,ablation", help="curve and/or ablation")
+    ap.add_argument("--blocks", default="curve,ablation",
+                    help="curve, ablation, and/or bnfold (the ~50-run BN-fold validation block)")
     ap.add_argument("--mac_points", type=int, default=18, help="number of mac_frac points (curve density)")
     ap.add_argument("--ref_frac", type=float, default=0.65, help="mac_frac for the ablation block")
     ap.add_argument("--max_runs", type=int, default=0, help="cap total specs (0=all)")

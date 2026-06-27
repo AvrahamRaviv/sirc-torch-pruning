@@ -1107,8 +1107,9 @@ def main(argv):
             model.to(device)
             log_info(f"fold_native_bn: reinserted {n_re} fresh BN at pruned widths (pre-FT)")
         if not args.no_bn_recalib:
-            log_info(f"recalibrating BN running stats ({args.calib_batches} batches)...")
-            _recalibrate_bn(model, train_loader, device, max_batches=args.calib_batches)
+            _rcb = args.recalib_batches if args.recalib_batches > 0 else args.calib_batches
+            log_info(f"recalibrating BN running stats ({_rcb} batches)...")
+            _recalibrate_bn(model, train_loader, device, max_batches=_rcb)
             log_info("BN recalibration done")
         else:
             log_info("BN recalibration SKIPPED (--no_bn_recalib)")
@@ -1315,6 +1316,10 @@ def parse_args(argv):
                         "KEEPING the cross-layer mass signal — the fix for global pruning "
                         "gutting the widest layers (convnext stage3 pwconv1=3072).")
     p.add_argument("--no_bn_recalib", action="store_true")
+    p.add_argument("--recalib_batches", type=int, default=0,
+                   help="batches for post-prune BN re-estimation (0 ⇒ use --calib_batches). "
+                        "Lets the measure-pass depth be set independent of scoring calibration; "
+                        "k=1 ≈ k=50 (calibration, not FT).")
     p.add_argument("--bias_comp", action="store_true",
                    help="bias compensation: add E[Δy]=W[:,c]·μ_c to each consumer bias before "
                         "removing channel c, preserving the expected output. μ = per-channel "
