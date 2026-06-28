@@ -145,12 +145,12 @@ def make_spec(arch, base, p, measured, fold, frac, norm="width", nonrel=False,
                 normalizer=norm, nonrel=nonrel, iter_drop=drop, iter_frac=ifrac, block=block, tag=tag)
 
 
-def make_bnfold_spec(arch, base, frac, protocol, recalib_k):
-    """BN-fold validation cell: scorer fixed at computed p=2, BN handling = protocol(+k)."""
+def make_bnfold_spec(arch, base, frac, protocol, recalib_k, measured=False):
+    """BN-fold validation cell: scorer p=2 (measured-var optional for cov/iter), BN handling = protocol(+k)."""
     mac_g = round(DENSE_MAC[arch] * frac, 3)
-    sc = scorer_label(base, 2, False)
+    sc = scorer_label(base, 2, measured)
     tag = f"bnf__{arch}__{sc}__{protocol}__k{recalib_k}__mac{frac:.3f}"
-    return dict(arch=arch, base=base, p=2, measured=False, fold=False, frac=frac, mac_g=mac_g,
+    return dict(arch=arch, base=base, p=2, measured=measured, fold=False, frac=frac, mac_g=mac_g,
                 normalizer="width", nonrel=False, iter_drop=ITER_DROP_DEFAULT, iter_frac=ITER_FRAC_DEFAULT,
                 block="bnfold", protocol=protocol, recalib_k=recalib_k, tag=tag)
 
@@ -221,16 +221,25 @@ def bnrecal_specs():
     mnv1 = timm-only, built by load_model via _unfuse_bn_act (see vbp_common). Cells carry
     block='bnfold' so bn_flags + summarize_bnfold render them (B vs C:native+m50)."""
     specs, seen = [], set()
-    def add(arch, base, fr, proto, k):
-        s = make_bnfold_spec(arch, base, fr, proto, k)
+    def add(arch, base, fr, proto, k, measured=False):
+        s = make_bnfold_spec(arch, base, fr, proto, k, measured)
         if s["tag"] not in seen:
             seen.add(s["tag"]); specs.append(s)
     fr = 0.67                                                # -33% MAC
+    ARCHS5 = ("resnet50", "mobilenet_v2", "mobilenet_v1", "convnext_t", "deit_tiny")
     SCORERS = ["magnitude", "vbp", "nci", "prop", "cov", "iter"]
-    for arch in ("resnet50", "mobilenet_v2", "mobilenet_v1", "convnext_t", "deit_tiny"):
+    # COMPUTED-var grid: 5 archs x 6 scorers x {B,C} = 60
+    for arch in ARCHS5:
         for base in SCORERS:
             add(arch, base, fr, "B_native", 0)               # recalib OFF (stale)
             add(arch, base, fr, "C_native_recal", 50)        # recalib ON  (measure-pass k50)
+    # MEASURED-var grid: 5 archs x {cov,iter} x {B,C} = 20. Measured-var is the arch-fragile lever
+    # (helps convnext: iter-meas ~0.71 vs computed 0.68; neutral deit; craters mnv1/mnv2 — that
+    # contrast is exactly what this block measures). Distinct scorer label (covmp2/itermp2) → own rows.
+    for arch in ARCHS5:
+        for base in ("cov", "iter"):
+            add(arch, base, fr, "B_native", 0, measured=True)
+            add(arch, base, fr, "C_native_recal", 50, measured=True)
     return specs
 
 
