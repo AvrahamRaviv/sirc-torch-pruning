@@ -357,6 +357,29 @@ def _pin_calib(loader, path, max_batches, log):
     return _FixedCalib(batches)
 
 
+@torch.no_grad()
+def _fast_bn_recalib(model, loader, device, max_batches, log=None):
+    """Fast BN recalibration: reuse the EXISTING calib loader (its workers already forked
+    pre-prune ⇒ no new-DataLoader CUDA-fork crash, and parallel decode) instead of the nw=0
+    rebuild in _recalibrate_bn (serial JPEG decode = the C/E recalib tax). Reset BN running
+    stats, train-mode forward of ≤max_batches calib batches on `device`, no grad/weight update."""
+    import torch.nn as _nn
+    for m in model.modules():
+        if isinstance(m, _nn.modules.batchnorm._BatchNorm):
+            m.reset_running_stats()
+    model.train()
+    n = 0
+    for batch in loader:
+        if n >= max_batches:
+            break
+        x = batch[0] if isinstance(batch, (list, tuple)) else batch
+        model(x.to(device, non_blocking=True))
+        n += 1
+    model.eval()
+    if log:
+        log(f"fast BN recalibration done ({n} calib batches, reused loader workers)")
+
+
 def _dump_artifacts(out_dir, stats, icov, scores, mean_dict, log):
     """DEBUG: save per-layer reparam stats + input_cov + scores + mean_dict for cross-machine
     diffing (probe_compare.py). Stats are the calib-derived quantities every score is built on;
@@ -1109,7 +1132,7 @@ def main(argv):
         if not args.no_bn_recalib:
             _rcb = args.recalib_batches if args.recalib_batches > 0 else args.calib_batches
             log_info(f"recalibrating BN running stats ({_rcb} batches, clean calib transform)...")
-            _recalibrate_bn(model, calib_loader, device, max_batches=_rcb)   # clean val-transform stats
+            _fast_bn_recalib(model, calib_loader, device, max_batches=_rcb, log=log_info)  # reuse loader workers
             log_info("BN recalibration done")
         else:
             log_info("BN recalibration SKIPPED (--no_bn_recalib)")
