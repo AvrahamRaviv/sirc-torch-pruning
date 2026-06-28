@@ -99,10 +99,20 @@ ARCHS = OrderedDict([
         model_type="vit", cnn_arch="deit_tiny", model_name="facebook/deit-tiny-patch16-224",
         weights=None, cluster_weights="/algo/NetOptimization/outputs/NORMNET/DeiT/deit_tiny",
         val_resize=224)),
+    ("mobilenet_v1", dict(
+        # timm-only (torchvision has no v1); load_model builds timm mobilenetv1_100 + un-fuses
+        # BatchNormAct2d. cluster_weights="" ⇒ use timm pretrained (HF cache; stage the cache or
+        # allow net access on the cluster). BN net → foldable.
+        model_type="cnn", cnn_arch="mobilenet_v1", model_name="",
+        weights=None,
+        cluster_weights="/algo/NetOptimization/outputs/NORMNET/MNv1/mobilenet_v1.safetensors",
+        val_resize=256)),
 ])
 
-DENSE_MAC = {"convnext_t": 4.45, "resnet50": 4.12, "mobilenet_v2": 0.32, "deit_tiny": 1.44}  # GMACs @224
-FOLDABLE = {"convnext_t": False, "resnet50": True, "mobilenet_v2": True, "deit_tiny": False}
+DENSE_MAC = {"convnext_t": 4.45, "resnet50": 4.12, "mobilenet_v2": 0.32, "deit_tiny": 1.44,
+             "mobilenet_v1": 0.584}  # GMACs @224
+FOLDABLE = {"convnext_t": False, "resnet50": True, "mobilenet_v2": True, "deit_tiny": False,
+            "mobilenet_v1": True}
 
 # --------------------------------------------------------------------- scorer families (composable)
 # base flags WITHOUT prop_p / measured / iter-knobs — those are separate axes added in spec_flags().
@@ -201,6 +211,27 @@ def bnfix_specs():
     return specs
 
 
+def bnrecal_specs():
+    """Recalib on/off across ALL 6 scorers — the isolated measure-pass lift, native BN, no fold.
+    Single MAC target (-33% ⇒ keep 0.67), 2 native-BN nets (resnet50, mnv2). Per cell:
+      B  native + no-recalib  (stale BN — recalib OFF)
+      C  native + measure-pass(k50)  (recalib ON)
+    mnv1 (timm-only, normnet_main can't build it) runs separately via research/harness_mbv1.py.
+    Cells carry block='bnfold' so bn_flags + summarize_bnfold render them (B vs C:native+m50)."""
+    specs, seen = [], set()
+    def add(arch, base, fr, proto, k):
+        s = make_bnfold_spec(arch, base, fr, proto, k)
+        if s["tag"] not in seen:
+            seen.add(s["tag"]); specs.append(s)
+    fr = 0.67                                                # -33% MAC
+    SCORERS = ["magnitude", "vbp", "nci", "prop", "cov", "iter"]
+    for arch in ("resnet50", "mobilenet_v2", "mobilenet_v1"):
+        for base in SCORERS:
+            add(arch, base, fr, "B_native", 0)               # recalib OFF (stale)
+            add(arch, base, fr, "C_native_recal", 50)        # recalib ON  (measure-pass k50)
+    return specs
+
+
 def gen_specs(args):
     archs = [a for a in (args.archs.split(",") if args.archs else ARCHS) if a in ARCHS]
     blocks = args.blocks.split(",")
@@ -260,6 +291,11 @@ def gen_specs(args):
             if s["arch"] in archs and s["tag"] not in seen:
                 seen.add(s["tag"]); specs.append(s)
 
+    if "bnrecal" in blocks:                                  # recalib on/off × 6 scorers @ -33%
+        for s in bnrecal_specs():
+            if s["arch"] in archs and s["tag"] not in seen:
+                seen.add(s["tag"]); specs.append(s)
+
     if args.max_runs and len(specs) > args.max_runs:
         specs = specs[:args.max_runs]
     return specs
@@ -310,8 +346,8 @@ def spec_flags(spec):
     a = ARCHS[arch]
     f = ["--mac_target_g", str(spec["mac_g"]), "--val_resize", str(a["val_resize"]),
          "--imp_normalizer", spec["normalizer"]]
-    if arch == "mobilenet_v2":
-        f += ["--max_prune_ratio", "0.8"]                  # per-layer cap from the proven mnv2 recipe
+    if arch in ("mobilenet_v2", "mobilenet_v1"):
+        f += ["--max_prune_ratio", "0.8"]                  # per-layer cap (narrow mobilenet layers)
     f += list(BASES[base])
     if base in ("prop", "cov", "iter"):
         f += ["--prop_p", str(spec["p"])]
@@ -536,7 +572,8 @@ def main():
     ap.add_argument("--mode", choices=["submit", "collect", "local"], default="submit")
     ap.add_argument("--archs", default="", help="comma subset of " + ",".join(ARCHS))
     ap.add_argument("--blocks", default="curve,ablation",
-                    help="curve, ablation, and/or bnfold (the ~50-run BN-fold validation block)")
+                    help="curve, ablation, bnfold (~50-run BN-fold validation), bnfix (BN-free deploy "
+                         "@ -33%), bnrecal (recalib on/off × 6 scorers @ -33%, r50+mnv2)")
     ap.add_argument("--mac_points", type=int, default=18, help="number of mac_frac points (curve density)")
     ap.add_argument("--ref_frac", type=float, default=0.65, help="mac_frac for the ablation block")
     ap.add_argument("--max_runs", type=int, default=0, help="cap total specs (0=all)")

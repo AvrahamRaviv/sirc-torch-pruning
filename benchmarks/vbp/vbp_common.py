@@ -322,6 +322,26 @@ def _merge_vnr_state_dict(state, eps=1e-5):
     return new_state
 
 
+def _unfuse_bn_act(model):
+    """Replace each timm BatchNormAct2d (fused BN+activation) with Sequential(plain BatchNorm2d,
+    drop, act). normnet_main's fold path replaces BN with Identity; if the activation is fused
+    inside the BN module it would be silently dropped (→ dense collapses to 0.0). Splitting it out
+    keeps the activation as a standalone module. Function-preserving (verified max|Δ|=0). Returns
+    the number of modules converted."""
+    import timm.layers as TL
+    n = 0
+    for parent in model.modules():
+        for name, child in list(parent.named_children()):
+            if isinstance(child, TL.BatchNormAct2d):
+                bn = nn.BatchNorm2d(child.num_features, eps=child.eps, momentum=child.momentum,
+                                    affine=child.affine, track_running_stats=child.track_running_stats)
+                bn.load_state_dict({k: v for k, v in child.state_dict().items()
+                                    if k in bn.state_dict()})
+                setattr(parent, name, nn.Sequential(bn, child.drop, child.act))
+                n += 1
+    return n
+
+
 def load_model(args, device):
     """Load model architecture, optionally overriding weights from --checkpoint.
 
@@ -393,6 +413,39 @@ def load_model(args, device):
         else:
             log_info(f"Random init ConvNeXt (no checkpoint at {ckpt})")
             args.is_pruned_checkpoint = False
+        model = model.to(device)
+
+    elif args.model_type == "cnn" and args.cnn_arch == "mobilenet_v1":
+        # MobileNetV1 lives only in timm (torchvision has v2/v3 only). timm fuses BN+act into
+        # BatchNormAct2d, which normnet_main's fold path would eat (fold replaces BN with Identity
+        # → the fused ReLU6 is lost → dense 0.0). Un-fuse into Sequential(plain BN, ReLU6) so the
+        # rest of the pipeline (fold / reparam / recalib) sees standard nn modules. Verified
+        # function-preserving (max|Δlogits|=0 on the dense net).
+        import timm
+        ckpt = checkpoint or args.model_name
+        has_file = bool(ckpt) and os.path.isfile(ckpt)
+        # Offline clusters: build the arch WITHOUT downloading, then load explicit weights from a
+        # .safetensors / .pth file. With no file (local, HF cache present) fall back to timm pretrained.
+        model = timm.create_model("mobilenetv1_100", pretrained=not has_file)
+        if has_file:
+            if ckpt.endswith(".safetensors"):
+                from safetensors.torch import load_file
+                state = load_file(ckpt)
+            else:
+                state = torch.load(ckpt, map_location="cpu", weights_only=True)
+            state = _merge_vnr_state_dict(state)
+            try:
+                model.load_state_dict(state, strict=True)      # raw timm keys (pre-unfuse) match
+                log_info(f"Loaded mobilenet_v1 weights from {ckpt}")
+            except RuntimeError:
+                from torch_pruning.utils import load_state_dict_pruned
+                model, _, _ = load_state_dict_pruned(model, state)
+                log_info(f"Loaded pruned mobilenet_v1 from {ckpt} (load_state_dict_pruned)")
+                args.is_pruned_checkpoint = True
+        else:
+            log_info("mobilenet_v1: timm pretrained weights (no checkpoint file)")
+        n_unfused = _unfuse_bn_act(model)                       # AFTER load (keys match raw timm)
+        log_info(f"un-fused {n_unfused} BatchNormAct2d → (BN, ReLU6)")
         model = model.to(device)
 
     elif args.model_type == "cnn":
