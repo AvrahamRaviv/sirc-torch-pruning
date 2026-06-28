@@ -81,15 +81,22 @@ class BasePruner:
 
         # Bias compensation
         mean_dict: typing.Optional[typing.Dict[nn.Module, torch.Tensor]] = None, # per-channel activation means for bias compensation
+        # Variance compensation (var_comp): per-CONSUMER raw input covariance [in,in]. When set,
+        # each consumer's surviving output channels are rescaled so output variance returns to the
+        # dense value (analytic dual of bias_comp). Composed jointly with the bias delta.
+        cov_dict: typing.Optional[typing.Dict[nn.Module, torch.Tensor]] = None,
+        var_comp_s_max: float = 8.0, # clamp on the per-channel variance-restore scale s_j
 
         # deprecated
         channel_groups: typing.Dict[nn.Module, int] = dict(), # channel grouping
         ch_sparsity: float = None,
-        ch_sparsity_dict: typing.Dict[nn.Module, float] = None, 
+        ch_sparsity_dict: typing.Dict[nn.Module, float] = None,
     ):
         self.model = model
         self.importance = importance
         self.mean_dict = mean_dict
+        self.cov_dict = cov_dict
+        self.var_comp_s_max = var_comp_s_max
 
         # Handle deprecated parameters
         if ch_sparsity is not None:
@@ -276,6 +283,11 @@ class BasePruner:
         self.mean_dict = mean_dict
 
     @torch.no_grad()
+    def set_cov_dict(self, cov_dict):
+        """Set or update per-consumer input covariance for variance compensation (var_comp)."""
+        self.cov_dict = cov_dict
+
+    @torch.no_grad()
     def _add_bias(self, module, delta):
         """Create or update a bias parameter on module."""
         if module.bias is None:
@@ -284,22 +296,48 @@ class BasePruner:
             module.bias.data += delta
 
     @torch.no_grad()
+    def _var_recon(self, W, C, rem):
+        """Per-output-channel output variance diag(W̃ C W̃ᵀ) with the SAME kernel-aligned form the
+        propagation scorer uses (reparam.py:_layer_N). Returns (var_full, var_kept) where var_kept
+        zeros the pruned input columns (the exact kept-kept submatrix variance). W is the consumer
+        weight (2D linear or 4D conv), C the raw input covariance [in,in], rem the pruned input idx."""
+        C = C.to(dtype=W.dtype, device=W.device)
+        if W.dim() == 4:                                   # conv [out,in,kH,kW]
+            V = W.flatten(2)                               # [out,in,K]
+            def quad(Vx):
+                T = torch.einsum('odk,dc->ock', Vx, C)     # (Vx C) kernel-aligned [out,in,K]
+                return (Vx * T).sum(-1).sum(1).clamp_min(0.0)   # [out]
+            var_full = quad(V)
+            Vk = V.clone(); Vk[:, rem, :] = 0.0
+            var_kept = quad(Vk)
+        else:                                              # linear [out,in]
+            def quad(Wx):
+                return (Wx * (Wx @ C)).sum(1).clamp_min(0.0)
+            var_full = quad(W)
+            Wk = W.clone(); Wk[:, rem] = 0.0
+            var_kept = quad(Wk)
+        return var_full, var_kept
+
+    @torch.no_grad()
     def _apply_compensation(self, group, idx_to_prune):
-        """Compensate consumer biases for pruned channels using calibration means.
+        """Compensate consumers for pruned input channels, jointly in MEAN and (optionally) VARIANCE.
 
-        For any linear layer y = Wx + b, removing input channels causes
-        E[Δy] = W_pruned @ E[x_pruned]. This method adds that correction
-        to the consumer's bias before the channels are actually removed.
-
-        Works with Linear, Conv2d (standard), and Conv2d (depthwise).
+        Removing input channels of a consumer y = Wx + b shifts its output mean by W_rem·μ_rem and
+        drops its output variance from diag(W C Wᵀ) to the kept-submatrix value. bias_comp (mean_dict)
+        fixes the mean; var_comp (cov_dict) rescales each surviving output row by
+        s_j = sqrt(var_full_j / var_kept_j) so variance returns to dense, with the bias term carrying
+        the (1−s_j) correction so the mean is preserved jointly:
+            W[j,:] *= s_j ;  Δb_j = Σ_rem W[j,c]μ_c + (1−s_j)·Σ_kept W[j,c]μ_c.
+        s_j=1 (no cov_dict, or degenerate) reduces EXACTLY to the original bias-only delta = W_rem·μ_rem.
+        Works for Linear, Conv2d (standard), and Conv2d (depthwise; var restoration degenerate → s=1).
         """
         dep0, _ = group[0]
         root = dep0.target.module
 
         # Look up calibration mean for root; fall back to group search
         # (handles DW conv in MobileNetV2 where stats are on expand conv)
-        mu = self.mean_dict.get(root)
-        if mu is None:
+        mu = self.mean_dict.get(root) if self.mean_dict is not None else None
+        if mu is None and self.mean_dict is not None:
             for dep_i, _ in group:
                 candidate = dep_i.target.module
                 if candidate in self.mean_dict and len(self.mean_dict[candidate]) == root.weight.shape[0]:
@@ -319,21 +357,52 @@ class BasePruner:
                 continue
 
             if handler == function.prune_linear_in_channels:
-                W = consumer.weight[:, rem]
-                delta_b = (W * mu[rem]).sum(dim=1)
+                W = consumer.weight                         # [out,in]
+                s = self._var_scale(consumer, W, rem)       # [out], ones if no cov_dict
+                W_sp = W                                    # linear: no spatial
+                delta_b = self._joint_delta_b(W_sp, mu, rem, s)
+                if s is not None:
+                    consumer.weight.data.mul_(s[:, None])
                 self._add_bias(consumer, delta_b)
 
             elif handler == function.prune_conv_in_channels:
                 if consumer.groups == consumer.in_channels:
-                    # depthwise
+                    # depthwise: one input per output → variance restoration degenerate (s≡1)
                     delta_b = torch.zeros(consumer.out_channels, device=consumer.weight.device)
                     delta_b[rem] = consumer.weight[rem, 0].sum(dim=(1, 2)) * mu[rem]
                     self._add_bias(consumer, delta_b)
                 else:
-                    W = consumer.weight[:, rem, :, :]
-                    W_sp = W.sum(dim=(2, 3))
-                    delta_b = (W_sp * mu[rem]).sum(dim=1)
+                    W = consumer.weight                     # [out,in,kH,kW]
+                    s = self._var_scale(consumer, W, rem)   # [out], ones if no cov_dict
+                    W_sp = W.sum(dim=(2, 3))                 # [out,in]
+                    delta_b = self._joint_delta_b(W_sp, mu, rem, s)
+                    if s is not None:
+                        consumer.weight.data.mul_(s[:, None, None, None])
                     self._add_bias(consumer, delta_b)
+
+    @torch.no_grad()
+    def _var_scale(self, consumer, W, rem):
+        """Per-output-channel variance-restore scale s_j (or None if var_comp off / inapplicable)."""
+        if self.cov_dict is None:
+            return None
+        C = self.cov_dict.get(consumer)
+        if C is None or C.shape[0] != W.shape[1]:
+            return None
+        var_full, var_kept = self._var_recon(W, C, rem)
+        eps = 1e-8 * var_full.max().clamp_min(1e-12)
+        s = (var_full / var_kept.clamp_min(eps)).sqrt()
+        return s.clamp_(1.0, self.var_comp_s_max)
+
+    @torch.no_grad()
+    def _joint_delta_b(self, W_sp, mu, rem, s):
+        """Δb_j = Σ_rem W[j,c]μ_c + (1−s_j)·Σ_kept W[j,c]μ_c  (s=None ⇒ s_j=1 ⇒ pure bias_comp)."""
+        m_rem = (W_sp[:, rem] * mu[rem]).sum(dim=1)
+        if s is None:
+            return m_rem
+        kept = torch.ones(W_sp.shape[1], dtype=torch.bool, device=W_sp.device)
+        kept[rem] = False
+        m_kept = (W_sp[:, kept] * mu[kept]).sum(dim=1)
+        return m_rem + (1.0 - s) * m_kept
 
     def step(self, interactive: bool = False) -> typing.Union[typing.Generator, None]:
         """Execute one step of pruning.
@@ -348,7 +417,7 @@ class BasePruner:
         self.current_step += 1
         if interactive:  # yield groups for interactive pruning
             return self._prune()
-        if self.mean_dict is None:
+        if self.mean_dict is None and self.cov_dict is None:
             for group in self._prune():
                 group.prune()
         else:

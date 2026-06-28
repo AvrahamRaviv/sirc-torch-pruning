@@ -193,7 +193,8 @@ def bnfix_specs():
         for base in ("cov", "iter"):
             add(arch, base, fr, "A_foldnoreinsert", 0)       # collapse reference
             add(arch, base, fr, "C_native_recal", 50)        # champion (BN kept)
-            add(arch, base, fr, "E_native_recal_fold", 50)   # form (b): BN-free deploy
+            add(arch, base, fr, "E_native_recal_fold", 50)   # form (b): measure-pass + fold
+            add(arch, base, fr, "F_varcomp", 0)              # form (b): ANALYTIC, zero forward
     return specs
 
 
@@ -288,6 +289,8 @@ def bn_flags(spec):
             return ["--fold_native_bn", "--recalib_batches", str(k)]
         if proto == "E_native_recal_fold":                  # var_comp form (b): C + fold-after-recalib
             return ["--recalib_batches", str(k), "--fold_after_recalib"]
+        if proto == "F_varcomp":                            # analytic var_comp: BN-free, ZERO forward
+            return ["--fold_native_bn", "--fold_no_reinsert", "--var_comp", "--no_bn_recalib"]
         raise ValueError(f"unknown protocol {proto!r}")
     f = ["--no_bn_recalib"]                                  # default: pure pre-FT, recalib OFF
     if spec.get("fold"):
@@ -447,7 +450,7 @@ def summarize_bnfold(rows):
     cols = [("A_foldnoreinsert", 0, "A:fold-noreinsert"), ("B_native", 0, "B:native-stale"),
             ("C_native_recal", 1, "C:native+m1"), ("C_native_recal", 5, "C:native+m5"),
             ("C_native_recal", 50, "C:native+m50"), ("D_foldreinsert_recal", 50, "D:fold+reins+m50"),
-            ("E_native_recal_fold", 50, "E:native+m50+fold")]
+            ("E_native_recal_fold", 50, "E:native+m50+fold"), ("F_varcomp", 0, "F:varcomp-analytic")]
     print(f"\n{'='*100}\nBN-FOLD VALIDATION  (pre-FT top-1; measure-pass = no-grad BN re-estimation, "
           f"k batches)\n{'='*100}")
     print("| arch | scorer | mac% | " + " | ".join(c[2] for c in cols) + " |")

@@ -921,6 +921,18 @@ def main(argv):
             _stats_snap = {name: {k: getattr(rp, k).detach().cpu()
                                   for k in ("mu_x", "sigma_x", "sigma_out_x") if hasattr(rp, k)}
                            for name, rp in getattr(mgr, "_reparam_modules", {}).items()}
+        # var_comp: snapshot per-channel input std (sigma_x) BEFORE merge_back clears the reparam
+        # modules; ensure input covariance is collected. Post-prune these build the analytic cov_dict
+        # (raw input cov C = σ Σ̂ σᵀ per consumer) that the pruner uses to restore output variance.
+        _vc_sig = None
+        if args.var_comp:
+            args.bias_comp = True               # var_comp needs the mean term for the joint bias delta
+            _vc_sig = {name: rp.sigma_x.detach().clone()
+                       for name, rp in getattr(mgr, "_reparam_modules", {}).items()
+                       if hasattr(rp, "sigma_x")}
+            if icov is None:
+                icov = mgr.collect_input_covariance(calib_loader, max_batches=args.calib_batches)
+                log_info(f"var_comp: collected input covariance on {len(icov)} layers")
         if do_normalize:
             mgr.merge_back()                    # back to plain modules for the tp pruner
         # Save the pre-prune (post-norm-ft, merged) DENSE net so a prune+FT can be retried
@@ -1001,6 +1013,26 @@ def main(argv):
             log_info(f"bias_comp: post-activation means on {len(mean_dict)} layers "
                      f"({args.calib_batches} calib batches)")
 
+        # var_comp: build per-consumer raw input covariance C = σ Σ̂ σᵀ, keyed by MODULE (same key
+        # space as mean_dict). icov[name] = input correlation Σ̂ (diag=1); _vc_sig[name] = sigma_x.
+        cov_dict = None
+        if args.var_comp and icov is not None and _vc_sig is not None:
+            name_to_mod = {n: m for n, m in model.named_modules()}
+            ddp = torch.distributed.is_available() and torch.distributed.is_initialized()
+            ws = torch.distributed.get_world_size() if ddp else 1
+            cov_dict = {}
+            for name, corr in icov.items():
+                sig = _vc_sig.get(name); mod = name_to_mod.get(name)
+                if sig is None or mod is None or corr.shape[0] != sig.shape[0]:
+                    continue
+                if ddp:                                  # DDP parity: average per-rank sigma_x
+                    t = sig.detach().to(device).contiguous()
+                    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+                    sig = (t / ws).cpu()
+                sig = sig.to(corr.dtype)
+                cov_dict[mod] = (corr.cpu() * torch.outer(sig, sig)).contiguous()
+            log_info(f"var_comp: built raw input covariance on {len(cov_dict)} consumer layers")
+
         if args.dump_artifacts and is_main():          # DEBUG: cross-machine stage diffing
             _name_by_mod = {m: n for n, m in model.named_modules()}
             _md_named = (None if mean_dict is None else
@@ -1067,7 +1099,7 @@ def main(argv):
         _pruner = tp.pruner.MagnitudePruner(
             model, ex, importance=_imp(model), global_pruning=args.global_pruning,
             pruning_ratio=ratio, max_pruning_ratio=mpr, ignored_layers=_ignored(model),
-            mean_dict=mean_dict)
+            mean_dict=mean_dict, cov_dict=cov_dict)
         # ExpHandler Channels viz for classical / nci_cov scorers (normnet scorers already
         # dumped in log_score_distribution). Read per-channel importance from the pruner's
         # groups BEFORE step() prunes the weights; nci_cov has a precomputed scores dict.
@@ -1272,6 +1304,13 @@ def parse_args(argv):
                         "--fold_native_bn) + recalib. Folds the CALIBRATED BN (folding stale BN is "
                         "the diagnosed collapse). NOTE: stats sourced from the post-prune recalib "
                         "forward; the pre-prune analytic var-comp (zero forward) is future work.")
+    p.add_argument("--var_comp", action="store_true",
+                   help="Analytic variance compensation (dual of --bias_comp, ZERO forward passes): "
+                        "after pruning input channels, rescale each consumer's surviving output rows "
+                        "by s_j=sqrt(var_full/var_kept) from the kept covariance submatrix "
+                        "diag(W̃ Σ_kept W̃ᵀ), with a joint (1−s_j) bias term preserving the mean. "
+                        "Restores output variance without a measure-pass/recalib. Implies --bias_comp. "
+                        "Pair with --fold_native_bn --fold_no_reinsert --no_bn_recalib for BN-free deploy.")
     # 3. prune
     p.add_argument("--no_prune", action="store_true")
     p.add_argument("--scorer", default="per_layer",
