@@ -1113,6 +1113,17 @@ def main(argv):
             log_info("BN recalibration done")
         else:
             log_info("BN recalibration SKIPPED (--no_bn_recalib)")
+        # var_comp form (b) — BN-free deployable export. After BN running stats are CORRECT
+        # (recalibrated / measured), fold each Conv->BN into the conv weight: the now-correct
+        # gamma/beta/running_mean/var are baked in and BN becomes Identity. Function-preserving
+        # on the calibrated net (local: loss-free, 0.558 native -> 0.558 folded), so the pruned
+        # net ships BN-FREE at champion accuracy. Must run AFTER recalib (folding stale BN = the
+        # collapse this whole line of work diagnosed). No-op if already folded+not-reinserted.
+        if args.fold_after_recalib:
+            from torch_pruning.utils.reparam import fold_all_conv_bn
+            n_fold2, _ = fold_all_conv_bn(model)
+            model.to(device)
+            log_info(f"fold_after_recalib: folded {n_fold2} calibrated Conv->BN → BN-FREE deploy")
         pr_macs, pr_params = _count(model, ex)
         acc, pre_ft_nll = validate(model, val_loader, device, args.model_type)
         tgt = f"mac={args.mac_target_g}G" if args.mac_target_g > 0 else f"ratio={args.pruning_ratio}"
@@ -1231,6 +1242,13 @@ def parse_args(argv):
                         "BN-FREE net (folded scale baked into conv). Keeps the BN gain in the "
                         "propagation score WITHOUT the fresh-BN reset that hurts recovery. "
                         "No-op without --fold_native_bn.")
+    p.add_argument("--fold_after_recalib", action="store_true",
+                   help="BN-free deployable export (var_comp form (b), measure-pass source): AFTER "
+                        "BN recalibration (correct running stats), fold Conv->BN into the conv "
+                        "weight → BN-FREE net at champion accuracy. Pair with native path (NO "
+                        "--fold_native_bn) + recalib. Folds the CALIBRATED BN (folding stale BN is "
+                        "the diagnosed collapse). NOTE: stats sourced from the post-prune recalib "
+                        "forward; the pre-prune analytic var-comp (zero forward) is future work.")
     # 3. prune
     p.add_argument("--no_prune", action="store_true")
     p.add_argument("--scorer", default="per_layer",
