@@ -1125,6 +1125,17 @@ def main(argv):
                     model=args.model_name, scorer=args.scorer, stage="pre_prune",
                     layer_scores=_ch, higher_is_better=True)
         _pruner.step()                                    # normal global prune (TP records DG history)
+        if args.var_comp:                                 # var_comp diagnostics (what actually fired)
+            _vlog = getattr(_pruner, "var_comp_log", [])
+            _hits = [r for _, r in _vlog if r is not None]
+            _miss = sum(1 for _, r in _vlog if r is None)
+            _smax = max((r[1] for r in _hits), default=0.0)
+            _sat = sum(r[3] for r in _hits); _nch = sum(r[4] for r in _hits)
+            _smean = (sum(r[2] * r[4] for r in _hits) / _nch) if _nch else 0.0
+            log_info(f"var_comp: calib_split={args.calib_split} cov_dict={len(cov_dict) if cov_dict else 0} "
+                     f"| layers scaled={len(_hits)} miss(no-cov)={_miss} | s: max={_smax:.2f} "
+                     f"mean={_smean:.2f} saturated@{args.var_comp_s_max if hasattr(args,'var_comp_s_max') else 8.0}"
+                     f"={_sat}/{_nch} ({100*_sat/max(_nch,1):.1f}%)")
         if args.dump_prune and is_main():
             # Dump the EXACT applied mask. TP records pruning_history DURING step(); read that.
             # (Earlier this used step(interactive=True)+manual g.prune(), which produced a

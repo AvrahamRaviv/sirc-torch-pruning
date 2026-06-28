@@ -265,11 +265,14 @@ def gen_specs(args):
 # --------------------------------------------------------------------- flag assembly
 def core_flags(args):
     """normnet_main flags common to every cell (BN/fold handling lives in bn_flags)."""
-    return [
+    f = [
         "--global_pruning", "--reparam_variant", "mean", "--bias_comp",
         "--calib_batches", str(args.calib_batches),
         "--epochs_train", "0", "--epochs_ft", "0", "--epochs_norm_ft", "0", "--skip_norm_eval",
     ]
+    if getattr(args, "calib_split", "train") != "train":
+        f += ["--calib_split", args.calib_split]            # val-calib (matches the harness mask)
+    return f
 
 
 def bn_flags(spec):
@@ -535,6 +538,9 @@ def main():
     ap.add_argument("--ref_frac", type=float, default=0.65, help="mac_frac for the ablation block")
     ap.add_argument("--max_runs", type=int, default=0, help="cap total specs (0=all)")
     ap.add_argument("--calib_batches", type=int, default=50)
+    ap.add_argument("--calib_split", default="train", choices=["train", "val"],
+                    help="calib split for reparam σ/μ + covariance. 'val' matches the local research "
+                         "harness mask (var_comp is sensitive to the cov source).")
     # cluster
     ap.add_argument("--run_name", default="SWEEP_v1")
     ap.add_argument("--force", action="store_true", help="re-submit / re-run even if result exists")

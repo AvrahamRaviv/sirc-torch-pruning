@@ -297,25 +297,19 @@ class BasePruner:
 
     @torch.no_grad()
     def _var_recon(self, W, C, rem):
-        """Per-output-channel output variance diag(W̃ C W̃ᵀ) with the SAME kernel-aligned form the
-        propagation scorer uses (reparam.py:_layer_N). Returns (var_full, var_kept) where var_kept
-        zeros the pruned input columns (the exact kept-kept submatrix variance). W is the consumer
-        weight (2D linear or 4D conv), C the raw input covariance [in,in], rem the pruned input idx."""
-        C = C.to(dtype=W.dtype, device=W.device)
-        if W.dim() == 4:                                   # conv [out,in,kH,kW]
-            V = W.flatten(2)                               # [out,in,K]
-            def quad(Vx):
-                T = torch.einsum('odk,dc->ock', Vx, C)     # (Vx C) kernel-aligned [out,in,K]
-                return (Vx * T).sum(-1).sum(1).clamp_min(0.0)   # [out]
-            var_full = quad(V)
-            Vk = V.clone(); Vk[:, rem, :] = 0.0
-            var_kept = quad(Vk)
-        else:                                              # linear [out,in]
-            def quad(Wx):
-                return (Wx * (Wx @ C)).sum(1).clamp_min(0.0)
-            var_full = quad(W)
-            Wk = W.clone(); Wk[:, rem] = 0.0
-            var_kept = quad(Wk)
+        """Per-output-channel output variance under the INDEPENDENCE assumption — the paper's
+        score-updating form (v2 §"Score Updating Under Iterative Pruning"): a removed input no longer
+        contributes its variance, so var_j = Σ_c W_jc² σ_c² and the update is just the sum-of-squares
+        ratio f_j = √(Σ_kept)/√(Σ_all). This is "just a matrix multiply" on the per-channel variances
+        σ² = diag(C) — NOT the full covariance quadratic form, which is fragile: off-diagonal
+        cancellation can drive var_kept→0 and over-amplify (the V2/cluster resnet50 crater).
+        Returns (var_full, var_kept); var_kept zeros the pruned input channels. W: 2D linear / 4D conv."""
+        d = C.to(dtype=W.dtype, device=W.device).diagonal().clamp_min(0.0)   # per-input-channel σ²
+        Wsq = (W * W).sum(dim=(2, 3)) if W.dim() == 4 else (W * W)           # [out,in] (sum spatial)
+        contrib = Wsq * d                                                    # [out,in] var contribution
+        var_full = contrib.sum(dim=1).clamp_min(0.0)
+        ck = contrib.clone(); ck[:, rem] = 0.0
+        var_kept = ck.sum(dim=1).clamp_min(0.0)
         return var_full, var_kept
 
     @torch.no_grad()
@@ -387,11 +381,19 @@ class BasePruner:
             return None
         C = self.cov_dict.get(consumer)
         if C is None or C.shape[0] != W.shape[1]:
+            if not hasattr(self, "var_comp_log"):
+                self.var_comp_log = []
+            self.var_comp_log.append((tuple(W.shape), None))   # record a MISS (no cov entry)
             return None
         var_full, var_kept = self._var_recon(W, C, rem)
         eps = 1e-8 * var_full.max().clamp_min(1e-12)
-        s = (var_full / var_kept.clamp_min(eps)).sqrt()
-        return s.clamp_(1.0, self.var_comp_s_max)
+        s = (var_full / var_kept.clamp_min(eps)).sqrt().clamp_(1.0, self.var_comp_s_max)
+        if not hasattr(self, "var_comp_log"):
+            self.var_comp_log = []
+        sat = int((s >= self.var_comp_s_max - 1e-3).sum())
+        self.var_comp_log.append((tuple(W.shape), (float(s.min()), float(s.max()),
+                                                   float(s.mean()), sat, s.numel())))
+        return s
 
     @torch.no_grad()
     def _joint_delta_b(self, W_sp, mu, rem, s):
