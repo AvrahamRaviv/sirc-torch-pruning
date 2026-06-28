@@ -367,6 +367,9 @@ def _fast_bn_recalib(model, loader, device, max_batches, log=None):
     for m in model.modules():
         if isinstance(m, _nn.modules.batchnorm._BatchNorm):
             m.reset_running_stats()
+            m.momentum = None          # cumulative EXACT average, not the default 0.1 EMA: an EMA
+                                       # left ~20% short of the true post-prune stats at small k,
+                                       # which compounds across deep chains (mnv1: 0.001 vs 0.49).
     model.train()
     n = 0
     for batch in loader:
