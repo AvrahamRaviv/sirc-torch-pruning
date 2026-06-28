@@ -213,11 +213,13 @@ def bnfix_specs():
 
 def bnrecal_specs():
     """Recalib on/off across ALL 6 scorers — the isolated measure-pass lift, native BN, no fold.
-    Single MAC target (-33% ⇒ keep 0.67), 2 native-BN nets (resnet50, mnv2). Per cell:
+    Single MAC target (-33% ⇒ keep 0.67), all 5 archs × 6 scorers × {B,C} = 60 runs. Per cell:
       B  native + no-recalib  (stale BN — recalib OFF)
       C  native + measure-pass(k50)  (recalib ON)
-    mnv1 (timm-only, normnet_main can't build it) runs separately via research/harness_mbv1.py.
-    Cells carry block='bnfold' so bn_flags + summarize_bnfold render them (B vs C:native+m50)."""
+    The 3 BN nets (resnet50, mnv2, mnv1) have a real recalib axis; convnext_t/deit_tiny are BN-free
+    (LayerNorm) so the recalib pass is a no-op ⇒ B==C (the grid is filled for symmetry).
+    mnv1 = timm-only, built by load_model via _unfuse_bn_act (see vbp_common). Cells carry
+    block='bnfold' so bn_flags + summarize_bnfold render them (B vs C:native+m50)."""
     specs, seen = [], set()
     def add(arch, base, fr, proto, k):
         s = make_bnfold_spec(arch, base, fr, proto, k)
@@ -225,7 +227,7 @@ def bnrecal_specs():
             seen.add(s["tag"]); specs.append(s)
     fr = 0.67                                                # -33% MAC
     SCORERS = ["magnitude", "vbp", "nci", "prop", "cov", "iter"]
-    for arch in ("resnet50", "mobilenet_v2", "mobilenet_v1"):
+    for arch in ("resnet50", "mobilenet_v2", "mobilenet_v1", "convnext_t", "deit_tiny"):
         for base in SCORERS:
             add(arch, base, fr, "B_native", 0)               # recalib OFF (stale)
             add(arch, base, fr, "C_native_recal", 50)        # recalib ON  (measure-pass k50)
