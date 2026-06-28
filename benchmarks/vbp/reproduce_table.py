@@ -178,23 +178,26 @@ def bnfold_specs():
 
 
 def bnfix_specs():
-    """var_comp form (b) validation — BN-free deployable export. Single MAC target (-33% ⇒ keep
-    0.67), 2 native-BN nets (resnet50, mnv2), cov+iter. Per cell compare:
-      C  native + measure-pass(k50)               = champion (keeps BN)
-      E  native + measure-pass(k50) + fold        = form (b), BN-FREE deploy (folds CALIBRATED BN)
-    E≈C ⇒ folding the calibrated BN is loss-free (local: 0.558→0.558). A = collapse reference."""
+    """Champion (measure-pass) validation — BN-free deployable export across ALL scorers.
+    Single MAC target (-33% ⇒ keep 0.67), 2 native-BN nets (resnet50, mnv2), all 6 scorers
+    (magnitude, vbp, nci, prop, cov, iter). Per cell compare:
+      A  fold-no-reinsert + no-recalib             = collapse reference (BN-free, stale)
+      C  native + measure-pass(k50)                = champion (keeps BN)
+      E  native + measure-pass(k50) + fold         = BN-FREE deploy (folds CALIBRATED BN)
+    E≈C ⇒ folding the calibrated BN is loss-free. (var_comp F dropped — checkpoint-fragile, see
+    FOLD_FIX.md; champion is measure-pass E.)"""
     specs, seen = [], set()
     def add(arch, base, fr, proto, k):
         s = make_bnfold_spec(arch, base, fr, proto, k)
         if s["tag"] not in seen:
             seen.add(s["tag"]); specs.append(s)
     fr = 0.67                                                # -33% MAC
+    SCORERS = ["magnitude", "vbp", "nci", "prop", "cov", "iter"]
     for arch in ("resnet50", "mobilenet_v2"):
-        for base in ("cov", "iter"):
+        for base in SCORERS:
             add(arch, base, fr, "A_foldnoreinsert", 0)       # collapse reference
             add(arch, base, fr, "C_native_recal", 50)        # champion (BN kept)
-            add(arch, base, fr, "E_native_recal_fold", 50)   # form (b): measure-pass + fold
-            add(arch, base, fr, "F_varcomp", 0)              # form (b): ANALYTIC, zero forward
+            add(arch, base, fr, "E_native_recal_fold", 50)   # BN-free deploy (measure-pass + fold)
     return specs
 
 
