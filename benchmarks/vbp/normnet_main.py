@@ -1032,7 +1032,8 @@ def main(argv):
                     t = sig.detach().to(device).contiguous()
                     torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
                     sig = (t / ws).cpu()
-                sig = sig.to(corr.dtype)
+                sig = sig.to(corr.dtype).cpu()          # keep on CPU (corr is .cpu()): sigma_x may be
+                                                        # on device (MPS/CUDA) → outer() device mismatch
                 cov_dict[mod] = (corr.cpu() * torch.outer(sig, sig)).contiguous()
             log_info(f"var_comp: built raw input covariance on {len(cov_dict)} consumer layers")
 
@@ -1127,6 +1128,13 @@ def main(argv):
                     os.path.join(args.save_dir, f"{args.save_tag}_{args.scorer}_channel_scores.json"),
                     model=args.model_name, scorer=args.scorer, stage="pre_prune",
                     layer_scores=_ch, higher_is_better=True)
+        _ln_dense_ovar = None                             # --ln_measure_pass: dense consumer output var
+        if args.ln_measure_pass:
+            from measure_comp import collect_dense_output_var, apply_measured_var_comp
+            _lnk = args.recalib_batches if args.recalib_batches > 0 else args.calib_batches
+            _ln_dense_ovar = collect_dense_output_var(model, calib_loader, device, _lnk)
+            log_info(f"ln_measure_pass: snapshot dense output var on {len(_ln_dense_ovar)} layers "
+                     f"({_lnk} calib batches)")
         _pruner.step()                                    # normal global prune (TP records DG history)
         if args.var_comp:                                 # var_comp diagnostics (what actually fired)
             _vlog = getattr(_pruner, "var_comp_log", [])
@@ -1193,6 +1201,10 @@ def main(argv):
             n_fold2, _ = fold_all_conv_bn(model)
             model.to(device)
             log_info(f"fold_after_recalib: folded {n_fold2} calibrated Conv->BN → BN-FREE deploy")
+        if args.ln_measure_pass and _ln_dense_ovar is not None:
+            _lnk = args.recalib_batches if args.recalib_batches > 0 else args.calib_batches
+            apply_measured_var_comp(model, _ln_dense_ovar, calib_loader, device, _lnk,
+                                    s_max=args.ln_s_max, log=log_info)
         pr_macs, pr_params = _count(model, ex)
         acc, pre_ft_nll = validate(model, val_loader, device, args.model_type)
         tgt = f"mac={args.mac_target_g}G" if args.mac_target_g > 0 else f"ratio={args.pruning_ratio}"
@@ -1325,6 +1337,16 @@ def parse_args(argv):
                         "diag(W̃ Σ_kept W̃ᵀ), with a joint (1−s_j) bias term preserving the mean. "
                         "Restores output variance without a measure-pass/recalib. Implies --bias_comp. "
                         "Pair with --fold_native_bn --fold_no_reinsert --no_bn_recalib for BN-free deploy.")
+    p.add_argument("--ln_measure_pass", action="store_true",
+                   help="MEASURED variance compensation (robust dual of --var_comp; the measure-pass "
+                        "champion generalized to BN-free nets like convnext/deit). Snapshots each "
+                        "consumer's dense pre-bias output var BEFORE pruning, then MEASURES the actual "
+                        "pruned output var (post-compounding) and rescales output rows by "
+                        "s_j=clamp(sqrt(var_full/var_kept),1,ln_s_max), bias-shifted to hold the mean. "
+                        "Forward-measured → captures the depth-compounded shift that per-layer "
+                        "--var_comp omits (and which makes it crater on deep nets). 2 extra calib passes.")
+    p.add_argument("--ln_s_max", type=float, default=8.0,
+                   help="clamp on the measured variance-restore scale s_j (--ln_measure_pass).")
     # 3. prune
     p.add_argument("--no_prune", action="store_true")
     p.add_argument("--scorer", default="per_layer",

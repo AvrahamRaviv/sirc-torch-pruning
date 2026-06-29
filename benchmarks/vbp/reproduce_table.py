@@ -211,7 +211,7 @@ def bnfix_specs():
     return specs
 
 
-def bnrecal_specs():
+def bnrecal_specs(recalib_k=50):
     """Recalib on/off across ALL 6 scorers — the isolated measure-pass lift, native BN, no fold.
     Single MAC target (-33% ⇒ keep 0.67), all 5 archs × 6 scorers × {B,C} = 60 runs. Per cell:
       B  native + no-recalib  (stale BN — recalib OFF)
@@ -232,14 +232,14 @@ def bnrecal_specs():
     for arch in ARCHS5:
         for base in SCORERS:
             add(arch, base, fr, "B_native", 0)               # recalib OFF (stale)
-            add(arch, base, fr, "C_native_recal", 50)        # recalib ON  (measure-pass k50)
+            add(arch, base, fr, "C_native_recal", recalib_k) # recalib ON  (measure-pass, full epoch)
     # MEASURED-var grid: 5 archs x {cov,iter} x {B,C} = 20. Measured-var is the arch-fragile lever
     # (helps convnext: iter-meas ~0.71 vs computed 0.68; neutral deit; craters mnv1/mnv2 — that
     # contrast is exactly what this block measures). Distinct scorer label (covmp2/itermp2) → own rows.
     for arch in ARCHS5:
         for base in ("cov", "iter"):
             add(arch, base, fr, "B_native", 0, measured=True)
-            add(arch, base, fr, "C_native_recal", 50, measured=True)
+            add(arch, base, fr, "C_native_recal", recalib_k, measured=True)
     return specs
 
 
@@ -303,7 +303,7 @@ def gen_specs(args):
                 seen.add(s["tag"]); specs.append(s)
 
     if "bnrecal" in blocks:                                  # recalib on/off × 6 scorers @ -33%
-        for s in bnrecal_specs():
+        for s in bnrecal_specs(recalib_k=args.calib_batches):  # measure-pass k = full-epoch knob
             if s["arch"] in archs and s["tag"] not in seen:
                 seen.add(s["tag"]); specs.append(s)
 
@@ -366,7 +366,15 @@ def spec_flags(spec):
         f += ["--prop_iterative", "--prop_iter_drop", str(spec["iter_drop"]),
               "--prop_iter_max_frac", str(spec["iter_frac"])]
     if spec["measured"] and base in ("cov", "iter"):
-        f += ["--prop_measured_var"]
+        # measured-var lever is arch-split: BN nets use --prop_measured_var (measured σ in the
+        # propagation SCORER denom). Never-BN nets (convnext/deit, no BN to recalibrate) instead get
+        # --ln_measure_pass: the robust post-prune COMPENSATION that measures dense vs actual-pruned
+        # consumer output var by forward passes (captures depth-compounding the analytic --var_comp
+        # craters on). Same covmp2/itermp2 labels; the cell now = computed scorer + measured comp.
+        if arch in ("convnext_t", "deit_tiny"):
+            f += ["--ln_measure_pass"]
+        else:
+            f += ["--prop_measured_var"]
     if spec["nonrel"]:
         f += ["--prop_non_relative"]
     return f
