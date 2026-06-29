@@ -508,10 +508,13 @@ def summarize_bnfold(rows):
     br = [r for r in rows if r.get("block") == "bnfold" and r["acc"] is not None]
     if not br:
         return
-    cols = [("A_foldnoreinsert", 0, "A:fold-noreinsert"), ("B_native", 0, "B:native-stale"),
-            ("C_native_recal", 1, "C:native+m1"), ("C_native_recal", 5, "C:native+m5"),
-            ("C_native_recal", 50, "C:native+m50"), ("D_foldreinsert_recal", 50, "D:fold+reins+m50"),
-            ("E_native_recal_fold", 50, "E:native+m50+fold"), ("F_varcomp", 0, "F:varcomp-analytic")]
+    # C column is data-driven on the actual recalib_k present (bnfold sweeps {1,5,50}; bnrecal uses
+    # --calib_batches, e.g. 1000) — otherwise a k not in a hardcoded bucket renders blank.
+    recal_ks = sorted({(r.get("recalib_k") or 0) for r in br if r["protocol"] == "C_native_recal"})
+    cols = [("A_foldnoreinsert", 0, "A:fold-noreinsert"), ("B_native", 0, "B:native-stale")]
+    cols += [("C_native_recal", k, f"C:native+m{k}") for k in recal_ks]
+    cols += [("D_foldreinsert_recal", 50, "D:fold+reins+m50"),
+             ("E_native_recal_fold", 50, "E:native+m50+fold"), ("F_varcomp", 0, "F:varcomp-analytic")]
     print(f"\n{'='*100}\nBN-FOLD VALIDATION  (pre-FT top-1; measure-pass = no-grad BN re-estimation, "
           f"k batches)\n{'='*100}")
     print("| arch | scorer | mac% | " + " | ".join(c[2] for c in cols) + " |")
