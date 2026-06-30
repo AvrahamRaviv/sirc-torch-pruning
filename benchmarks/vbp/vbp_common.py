@@ -476,7 +476,14 @@ def load_model(args, device):
                 args._folded_bn_locations = locs
                 log_info(f"[fold_bn_init] Folded {n} BNs before loading checkpoint")
                 args.bn_recalibration = False
-            state = torch.load(ckpt, map_location='cpu', weights_only=True)
+            try:
+                state = torch.load(ckpt, map_location='cpu', weights_only=True)
+            except Exception:
+                # retained ckpts wrap the state_dict with metadata (epoch/val_acc) that can
+                # trip weights_only on older torch — fall back (our own trusted dumps).
+                state = torch.load(ckpt, map_location='cpu', weights_only=False)
+            if isinstance(state, dict) and isinstance(state.get("model"), dict):
+                state = state["model"]               # unwrap retained ckpt {model, epoch, ...}
             state = _merge_vnr_state_dict(state)
             try:
                 model.load_state_dict(state, strict=True)

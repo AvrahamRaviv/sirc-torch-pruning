@@ -440,8 +440,9 @@ def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
             if epoch_ckpt_interval > 0 and (epoch + 1) % epoch_ckpt_interval == 0:
                 state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 ck_path = os.path.join(args.save_dir, f"ckpt_epoch_{epoch+1}.pth")
-                torch.save({"model": state, "epoch": epoch + 1, "arm": arm,
-                            "val_acc": round(acc, 6), "best_val_acc": round(best_acc, 6)}, ck_path)
+                torch.save({"model": state, "epoch": int(epoch + 1), "arm": str(arm),
+                            "val_acc": round(float(acc), 6),
+                            "best_val_acc": round(float(best_acc), 6)}, ck_path)
                 log_info(f"Retained checkpoint @ epoch {epoch+1} -> {ck_path}")
         if use_ddp:
             dist.barrier()
