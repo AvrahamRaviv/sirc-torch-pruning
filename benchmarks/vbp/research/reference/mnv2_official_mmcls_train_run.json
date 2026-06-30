@@ -1,0 +1,23 @@
+{
+  "arm": "reference_train",
+  "status": "reference_train_only",
+  "source": "https://download.openmmlab.com/mmclassification/v0/mobilenet_v2/mobilenet_v2_batch256_imagenet_20200708-3b2dc3af.json",
+  "note": "mmcls log is TRAIN-ONLY (no per-epoch val published). Use train_loss for shape match; anchor final val on ~71.86-72.0%.",
+  "pre_train_val_acc": null,
+  "best_val_acc": null,
+  "final_val_anchor": 0.7186,
+  "best_train_acc": 0.724989,
+  "config": {
+    "model": "mobilenet_v2",
+    "dataset": "imagenet1k",
+    "lr": 0.045,
+    "schedule": "step x0.98 every epoch",
+    "lr_step_size": 1,
+    "lr_gamma": 0.98,
+    "optimizer": "sgd",
+    "momentum": 0.9,
+    "weight_decay": 4e-05,
+    "batch_size": 256,
+    "epochs": 301
+  }
+}
