@@ -46,7 +46,7 @@ try:
         logger, is_main, log_info, setup_logging,
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate, forward_logits,
-        train_one_epoch, build_ft_scheduler, broadcast_model_state,
+        train_one_epoch, build_ft_scheduler, build_step_scheduler, broadcast_model_state,
         build_whole_net_reparam_layers, attach_biases, _merge_vnr_state_dict,
     )
 except ImportError:
@@ -55,7 +55,7 @@ except ImportError:
         logger, is_main, log_info, setup_logging,
         setup_distributed, cleanup,
         build_dataloaders, load_model, validate, forward_logits,
-        train_one_epoch, build_ft_scheduler, broadcast_model_state,
+        train_one_epoch, build_ft_scheduler, build_step_scheduler, broadcast_model_state,
         build_whole_net_reparam_layers, attach_biases, _merge_vnr_state_dict,
     )
 
@@ -326,9 +326,20 @@ def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
     """
     normalized = mgr is not None and mgr.is_active
     optimizer = build_optimizer(model, args, mgr)
-    scheduler, step_per_batch = build_ft_scheduler(
-        optimizer, args.epochs, len(train_loader),
-        eta_min=args.ft_eta_min, warmup_epochs=args.ft_warmup_epochs)
+    if getattr(args, "lr_schedule", "cosine") == "step":
+        # Epoch-wise step decay to match official from-scratch recipes
+        # (R50 mmpretrain: milestones 30/60/90 ×0.1; MNv2 torchvision: step_size 1 ×0.98).
+        scheduler, step_per_batch = build_step_scheduler(
+            optimizer, args.epochs,
+            milestones=getattr(args, "lr_milestones", None),
+            gamma=getattr(args, "lr_gamma", 0.1),
+            step_size=getattr(args, "lr_step_size", 0))
+        log_info(f"LR schedule=step (milestones={getattr(args,'lr_milestones',None)}, "
+                 f"step_size={getattr(args,'lr_step_size',0)}, gamma={getattr(args,'lr_gamma',0.1)})")
+    else:
+        scheduler, step_per_batch = build_ft_scheduler(
+            optimizer, args.epochs, len(train_loader),
+            eta_min=args.ft_eta_min, warmup_epochs=args.ft_warmup_epochs)
 
     train_model = model
     if use_ddp:
@@ -422,6 +433,16 @@ def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
                 state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 save_normnet_checkpoint(state, "vnr", resolved, args)
                 log_info(f"Periodic salvage vnr checkpoint @ epoch {epoch+1}")
+            # Retained per-N-epoch checkpoint (NON-overwriting, unique name). Works in the
+            # plain from-scratch arm (mgr=None) too — the salvage block above does not. Saves
+            # ckpt_epoch_{e}.pth so intermediate checkpoints can later be continued in NN form.
+            epoch_ckpt_interval = int(getattr(args, "epoch_ckpt_interval", 0))
+            if epoch_ckpt_interval > 0 and (epoch + 1) % epoch_ckpt_interval == 0:
+                state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                ck_path = os.path.join(args.save_dir, f"ckpt_epoch_{epoch+1}.pth")
+                torch.save({"model": state, "epoch": epoch + 1, "arm": arm,
+                            "val_acc": round(acc, 6), "best_val_acc": round(best_acc, 6)}, ck_path)
+                log_info(f"Retained checkpoint @ epoch {epoch+1} -> {ck_path}")
         if use_ddp:
             dist.barrier()
     return best_acc

@@ -822,6 +822,25 @@ def build_ft_scheduler(optimizer, epochs, steps_per_epoch, eta_min=1e-8,
     return scheduler, True
 
 
+def build_step_scheduler(optimizer, epochs, milestones=None, gamma=0.1, step_size=0):
+    """Epoch-wise step LR (for matching official from-scratch recipes).
+
+    step_size>0  -> StepLR(step_size, gamma): decay ×gamma every step_size epochs
+                    (e.g. MobileNetV2 torchvision: step_size=1, gamma=0.98).
+    step_size==0 -> MultiStepLR(milestones, gamma): decay ×gamma at given epochs
+                    (e.g. ResNet50 mmpretrain: milestones=[30,60,90], gamma=0.1).
+
+    Returns (scheduler, step_per_batch=False) — train_one_epoch steps it once per epoch.
+    """
+    if step_size and step_size > 0:
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=int(step_size), gamma=gamma)
+    else:
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer, milestones=list(milestones or []), gamma=gamma)
+    return scheduler, False
+
+
 def train_one_epoch(model, train_loader, train_sampler, optimizer,
                     scheduler, device, epoch, args,
                     teacher=None, fc1_modules=None,

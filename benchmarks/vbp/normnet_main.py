@@ -1305,6 +1305,17 @@ def parse_args(argv):
     # 1. train
     p.add_argument("--epochs_train", type=int, default=0, help="plain training epochs (0=skip)")
     p.add_argument("--lr_train", type=float, default=0.1)
+    # from-scratch schedule + retained checkpointing (match official recipes, verify control)
+    p.add_argument("--lr_schedule", default="cosine", choices=["cosine", "step"],
+                   help="cosine (default, existing) or step (official from-scratch recipes)")
+    p.add_argument("--lr_milestones", type=int, nargs="*", default=[30, 60, 90],
+                   help="step schedule: epochs to decay ×gamma (R50 mmpretrain: 30 60 90)")
+    p.add_argument("--lr_gamma", type=float, default=0.1,
+                   help="step schedule decay factor (R50: 0.1, MNv2: 0.98)")
+    p.add_argument("--lr_step_size", type=int, default=0,
+                   help="step schedule: if >0 use StepLR every N epochs (MNv2: 1) instead of milestones")
+    p.add_argument("--epoch_ckpt_interval", type=int, default=0,
+                   help="save a RETAINED ckpt_epoch_{e}.pth every N epochs (non-overwriting, 0=off)")
     # 2. normalize + optional normalized-FT
     p.add_argument("--reparam_variant", default="bn", choices=["bn", "mean"])
     p.add_argument("--norm_bn_momentum", type=float, default=0.01)
