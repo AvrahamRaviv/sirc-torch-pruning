@@ -97,7 +97,7 @@ ARCHS = OrderedDict([
         val_resize=232)),
     ("deit_tiny", dict(
         model_type="vit", cnn_arch="deit_tiny", model_name="facebook/deit-tiny-patch16-224",
-        weights=None, cluster_weights="/algo/NetOptimization/outputs/NORMNET/DeiT/deit_tiny",
+        weights=None, cluster_weights="/algo/NetOptimization/outputs/VBP/DeiT_tiny",
         val_resize=224)),
     ("mobilenet_v1", dict(
         # timm-only (torchvision has no v1); load_model builds timm mobilenetv1_100 + un-fuses
