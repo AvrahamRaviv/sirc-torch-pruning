@@ -206,11 +206,11 @@ class BNResidualLinear(nn.Module):
     """
 
     def __init__(self, in_features, out_features, v_tilde, m, bn_running_mean,
-                 bn_running_var, bn_momentum=0.1, sigma_out_x=None):
+                 bn_running_var, bn_momentum=0.1, sigma_out_x=None, bn_eps=1e-5):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.bn = nn.BatchNorm1d(in_features, affine=False, momentum=bn_momentum)
+        self.bn = nn.BatchNorm1d(in_features, affine=False, momentum=bn_momentum, eps=bn_eps)
         self.bn.running_mean.copy_(bn_running_mean)
         self.bn.running_var.copy_(bn_running_var)
         self.v_tilde = nn.Parameter(v_tilde)  # [out, in] — operates on normalized input
@@ -256,7 +256,7 @@ class BNResidualConv2d(nn.Module):
 
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
                  dilation, groups, v_tilde, m, bn_running_mean, bn_running_var,
-                 bn_momentum=0.1, sigma_out_x=None):
+                 bn_momentum=0.1, sigma_out_x=None, bn_eps=1e-5):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -265,7 +265,7 @@ class BNResidualConv2d(nn.Module):
         self.padding = padding
         self.dilation = dilation
         self.groups = groups
-        self.bn = nn.BatchNorm2d(in_channels, affine=False, momentum=bn_momentum)
+        self.bn = nn.BatchNorm2d(in_channels, affine=False, momentum=bn_momentum, eps=bn_eps)
         self.bn.running_mean.copy_(bn_running_mean)
         self.bn.running_var.copy_(bn_running_var)
         self.v_tilde = nn.Parameter(v_tilde)  # [C_out, C_in, kH, kW]
@@ -1844,7 +1844,7 @@ class NormalizedResidualManager(BaseReparamManager):
 
     def __init__(self, model, target_names, device, lambda_reg=0.01, max_batches=200,
                  scale_invariant=False, entropy_lambda=0.0, reparam_target="fc2",
-                 bn_momentum=0.1):
+                 bn_momentum=0.1, bn_eps=1e-5):
         super().__init__(model, target_names, device, lambda_reg=lambda_reg,
                          max_batches=max_batches, scale_invariant=scale_invariant,
                          reparam_target=reparam_target)
@@ -1854,6 +1854,13 @@ class NormalizedResidualManager(BaseReparamManager):
         if not 0.0 <= float(bn_momentum) <= 1.0:
             raise ValueError(f"bn_momentum must be in [0, 1], got {bn_momentum}")
         self.bn_momentum = float(bn_momentum)
+        # BN eps = σ floor in the forward w_eff = v_tilde / sqrt(running_var + eps). Default
+        # 1e-5 (torch BN default → byte-identical to old pruning runs). Raise to 1e-1 for
+        # mid-training insertion / NN-continue: dead-ReLU channels have var≈0 → σ≈sqrt(eps),
+        # and a tiny σ blows up the 1/σ² effective step on v_tilde → NaN. 1e-1 floors σ≥0.316.
+        if not float(bn_eps) > 0.0:
+            raise ValueError(f"bn_eps must be > 0, got {bn_eps}")
+        self.bn_eps = float(bn_eps)
 
     def _calibrate(self, targets, loader):
         """Calibrate (μ_x, σ_x, σ_out_x) via the shared per-layer stats hook (same routine
@@ -1864,16 +1871,19 @@ class NormalizedResidualManager(BaseReparamManager):
     def _make_reparam(self, module, calibration_data):
         """Create BNResidual* module from standard nn.Linear/Conv2d."""
         mu_x, sigma_x, sigma_out_x = calibration_data
-        BN_EPS = 1e-5  # default nn.BatchNorm eps
+        # σ_x from _calibrate_stats = sqrt(var + CALIB_EPS) with CALIB_EPS=1e-5 (its default).
+        # Recover the raw measured variance by subtracting THAT eps — independent of the
+        # forward σ-floor self.bn_eps. Then bake v_tilde with self.bn_eps so that
+        # w_eff = v_tilde/sqrt(running_var + self.bn_eps) = W exactly (function-preserving),
+        # while self.bn_eps>1e-5 floors σ for dead channels (mid-training-insertion stability).
+        CALIB_EPS = 1e-5
+        BN_EPS = self.bn_eps
 
         if isinstance(module, nn.Linear):
             W = module.weight.data.clone()  # [out, in]
             b = module.bias.data.clone() if module.bias is not None else torch.zeros(
                 module.out_features, device=self.device)
-            # _calibrate_stats returns σ_x = sqrt(var + eps); recover the raw variance so
-            # bn_running_var + sigma_eff exactly match the pre-Fix-2 vnr init (no eps
-            # double-count) → tp_variance / vnr stays numerically backward-compatible.
-            bn_running_var = (sigma_x ** 2 - BN_EPS).clamp(min=0.0)
+            bn_running_var = (sigma_x ** 2 - CALIB_EPS).clamp(min=0.0)
             # BN eval: x_bn = (x - μ) / sqrt(var + eps)
             # For v_tilde / sqrt(var + eps) = W: v_tilde = W * sqrt(var + eps)
             sigma_eff = torch.sqrt(bn_running_var + BN_EPS)
@@ -1883,17 +1893,14 @@ class NormalizedResidualManager(BaseReparamManager):
                 module.in_features, module.out_features,
                 v_tilde=v_tilde, m=m,
                 bn_running_mean=mu_x, bn_running_var=bn_running_var,
-                bn_momentum=self.bn_momentum, sigma_out_x=sigma_out_x)
+                bn_momentum=self.bn_momentum, sigma_out_x=sigma_out_x, bn_eps=BN_EPS)
             return reparam.to(self.device)
 
         elif isinstance(module, nn.Conv2d):
             W = module.weight.data.clone()  # [C_out, C_in, kH, kW]
             b = module.bias.data.clone() if module.bias is not None else torch.zeros(
                 module.out_channels, device=self.device)
-            # _calibrate_stats returns σ_x = sqrt(var + eps); recover the raw variance so
-            # bn_running_var + sigma_eff exactly match the pre-Fix-2 vnr init (no eps
-            # double-count) → tp_variance / vnr stays numerically backward-compatible.
-            bn_running_var = (sigma_x ** 2 - BN_EPS).clamp(min=0.0)
+            bn_running_var = (sigma_x ** 2 - CALIB_EPS).clamp(min=0.0)
             sigma_eff = torch.sqrt(bn_running_var + BN_EPS)
             v_tilde = W * sigma_eff[None, :, None, None]
             m = b + W.sum(dim=(2, 3)) @ mu_x
@@ -1903,7 +1910,7 @@ class NormalizedResidualManager(BaseReparamManager):
                 padding=module.padding, dilation=module.dilation,
                 groups=module.groups, v_tilde=v_tilde, m=m,
                 bn_running_mean=mu_x, bn_running_var=bn_running_var,
-                bn_momentum=self.bn_momentum, sigma_out_x=sigma_out_x)
+                bn_momentum=self.bn_momentum, sigma_out_x=sigma_out_x, bn_eps=BN_EPS)
             return reparam.to(self.device)
 
         raise TypeError(f"Unsupported module type: {type(module)}")

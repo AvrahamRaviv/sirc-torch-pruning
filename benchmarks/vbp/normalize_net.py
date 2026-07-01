@@ -92,12 +92,13 @@ def build_reparam_manager(model, layer_names, device, args):
             ema_momentum=mu_ema)
     bn_mom = getattr(args, "norm_bn_momentum", None)
     bn_mom = 0.1 if bn_mom is None else float(bn_mom)
+    bn_eps = float(getattr(args, "norm_bn_eps", 1e-5) or 1e-5)
     log_info(f"--reparam_variant=bn (CANONICAL, BN trick): input normalized by live-EMA "
-             f"σ (momentum={bn_mom}), trainable v_tilde=σ·W, μ folded to bias. "
+             f"σ (momentum={bn_mom}, eps={bn_eps}), trainable v_tilde=σ·W, μ folded to bias. "
              f"WD on v_tilde = contribution-score regularizer.")
     return NormalizedResidualManager(
         model, layer_names, device, lambda_reg=lam, max_batches=args.max_batches,
-        bn_momentum=bn_mom)
+        bn_momentum=bn_mom, bn_eps=bn_eps)
 
 
 def get_device():
@@ -329,13 +330,16 @@ def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
     if getattr(args, "lr_schedule", "cosine") == "step":
         # Epoch-wise step decay to match official from-scratch recipes
         # (R50 mmpretrain: milestones 30/60/90 ×0.1; MNv2 torchvision: step_size 1 ×0.98).
+        _warmup = int(getattr(args, "ft_warmup_epochs", 0) or 0)
         scheduler, step_per_batch = build_step_scheduler(
             optimizer, args.epochs,
             milestones=getattr(args, "lr_milestones", None),
             gamma=getattr(args, "lr_gamma", 0.1),
-            step_size=getattr(args, "lr_step_size", 0))
+            step_size=getattr(args, "lr_step_size", 0),
+            warmup_epochs=_warmup)
         log_info(f"LR schedule=step (milestones={getattr(args,'lr_milestones',None)}, "
-                 f"step_size={getattr(args,'lr_step_size',0)}, gamma={getattr(args,'lr_gamma',0.1)})")
+                 f"step_size={getattr(args,'lr_step_size',0)}, gamma={getattr(args,'lr_gamma',0.1)}, "
+                 f"warmup_epochs={_warmup})")
     else:
         scheduler, step_per_batch = build_ft_scheduler(
             optimizer, args.epochs, len(train_loader),

@@ -829,7 +829,8 @@ def build_ft_scheduler(optimizer, epochs, steps_per_epoch, eta_min=1e-8,
     return scheduler, True
 
 
-def build_step_scheduler(optimizer, epochs, milestones=None, gamma=0.1, step_size=0):
+def build_step_scheduler(optimizer, epochs, milestones=None, gamma=0.1, step_size=0,
+                         warmup_epochs=0):
     """Epoch-wise step LR (for matching official from-scratch recipes).
 
     step_size>0  -> StepLR(step_size, gamma): decay ×gamma every step_size epochs
@@ -837,14 +838,30 @@ def build_step_scheduler(optimizer, epochs, milestones=None, gamma=0.1, step_siz
     step_size==0 -> MultiStepLR(milestones, gamma): decay ×gamma at given epochs
                     (e.g. ResNet50 mmpretrain: milestones=[30,60,90], gamma=0.1).
 
+    warmup_epochs>0 -> linear warmup (1e-2·lr → lr) over the first warmup_epochs, THEN the
+                    step decay. Needed when continuing a net in normalized (reparam) coords:
+                    v_tilde is ~10× smaller than the raw weight, so the raw base LR is far too
+                    hot at insertion and diverges — ramp in. MultiStepLR milestones are shifted
+                    by warmup_epochs (the post-warmup clock restarts at 0 under SequentialLR);
+                    StepLR is periodic so it needs no shift.
+
     Returns (scheduler, step_per_batch=False) — train_one_epoch steps it once per epoch.
     """
+    warmup_epochs = int(warmup_epochs or 0)
     if step_size and step_size > 0:
-        scheduler = torch.optim.lr_scheduler.StepLR(
+        core = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=int(step_size), gamma=gamma)
     else:
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer, milestones=list(milestones or []), gamma=gamma)
+        ms = [max(0, int(m) - warmup_epochs) for m in (milestones or [])]
+        core = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer, milestones=ms, gamma=gamma)
+    if warmup_epochs > 0:
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-2, end_factor=1.0, total_iters=warmup_epochs)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, core], milestones=[warmup_epochs])
+    else:
+        scheduler = core
     return scheduler, False
 
 
