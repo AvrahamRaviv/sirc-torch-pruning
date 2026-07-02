@@ -35,6 +35,7 @@ EDIT the CLUSTER dict + ARCHS[...]['cluster_weights'] before submit.
 mobilenet_v1 is timm-only (not buildable by normnet_main) — run via research/harness_mbv1.py separately.
 """
 import argparse
+import csv
 import json
 import os
 import re
@@ -107,12 +108,26 @@ ARCHS = OrderedDict([
         weights=None,
         cluster_weights="/algo/NetOptimization/outputs/NORMNET/MNv1/mobilenet_v1.safetensors",
         val_resize=256)),
+    # ---- modern IMAGENET1K_V2 checkpoints (SAME nn.Module as V1, only different weights).
+    # torchvision recipe V2 → BN running_var ~70-110× larger, so pruned-stale-BN (protocol B)
+    # collapses and recalib (protocol C) rescues — that contrast is exactly what bnrecal measures.
+    # V2 eval transform = resize 232 / crop 224 (torchvision ResNet50/MobileNet_V2 _Weights.V2).
+    ("resnet50_v2", dict(
+        model_type="cnn", cnn_arch="resnet50", model_name="resnet50",
+        weights="resnet50-11ad3fa6.pth",                        # 80.86% top-1 (IMAGENET1K_V2)
+        cluster_weights="/algo/NetOptimization/outputs/NORMNET/ResNet50/resnet50_imagenet1k_v2.pth",
+        val_resize=232)),
+    ("mobilenet_v2_v2", dict(
+        model_type="cnn", cnn_arch="mobilenet_v2", model_name="mobilenet_v2",
+        weights="mobilenet_v2-b0353104.pth",                    # 72.2% top-1 (IMAGENET1K_V2)
+        cluster_weights="/algo/NetOptimization/outputs/NORMNET/MNv2/mobilenet_v2_weights_v2.pth",
+        val_resize=232)),
 ])
 
 DENSE_MAC = {"convnext_t": 4.45, "resnet50": 4.12, "mobilenet_v2": 0.32, "deit_tiny": 1.44,
-             "mobilenet_v1": 0.584}  # GMACs @224
+             "mobilenet_v1": 0.584, "resnet50_v2": 4.12, "mobilenet_v2_v2": 0.32}  # GMACs @224
 FOLDABLE = {"convnext_t": False, "resnet50": True, "mobilenet_v2": True, "deit_tiny": False,
-            "mobilenet_v1": True}
+            "mobilenet_v1": True, "resnet50_v2": True, "mobilenet_v2_v2": True}
 
 # --------------------------------------------------------------------- scorer families (composable)
 # base flags WITHOUT prop_p / measured / iter-knobs — those are separate axes added in spec_flags().
@@ -120,17 +135,26 @@ BASES = OrderedDict([
     ("magnitude", ["--scorer", "magnitude"]),
     ("vbp",       ["--scorer", "variance"]),
     ("nci",       ["--scorer", "tp_variance"]),
+    ("vbp_pl",    ["--scorer", "variance"]),                     # VBP + per-layer (mean) normalizer
+    ("nci_pl",    ["--scorer", "tp_variance"]),                  # NCI + per-layer (mean) normalizer
     ("prop",      ["--scorer", "propagation"]),                  # relative independence (+ prop_p)
     ("cov",       ["--scorer", "propagation", "--prop_cov"]),    # covariance (+ prop_p [+ measured])
     ("iter",      ["--scorer", "propagation", "--prop_cov"]),    # iterative cov (+ prop_p [+ measured] + knobs)
 ])
-BASELINE = ["magnitude", "vbp", "nci"]
+BASELINE = ["magnitude", "vbp", "nci"]                          # curve-block baselines (width norm)
+PERLAYER = {"vbp_pl", "nci_pl"}                                 # baselines re-run with per-layer mean norm
 FOCUS = ["prop", "cov", "iter"]
 ITER_DROP_DEFAULT, ITER_FRAC_DEFAULT = 128, 0.6
 
 
+def base_normalizer(base):
+    """Default importance normalizer for a scorer base. _pl variants use per-layer 'mean' norm;
+    every other base keeps 'width' (the make_bnfold_spec / bnrecal default)."""
+    return "mean" if base in PERLAYER else "width"
+
+
 def scorer_label(base, p, measured):
-    if base in BASELINE:
+    if base in BASELINE or base in PERLAYER:
         return base
     return f"{base}{'m' if measured else ''}p{p}"
 
@@ -151,7 +175,7 @@ def make_bnfold_spec(arch, base, frac, protocol, recalib_k, measured=False):
     sc = scorer_label(base, 2, measured)
     tag = f"bnf__{arch}__{sc}__{protocol}__k{recalib_k}__mac{frac:.3f}"
     return dict(arch=arch, base=base, p=2, measured=measured, fold=False, frac=frac, mac_g=mac_g,
-                normalizer="width", nonrel=False, iter_drop=ITER_DROP_DEFAULT, iter_frac=ITER_FRAC_DEFAULT,
+                normalizer=base_normalizer(base), nonrel=False, iter_drop=ITER_DROP_DEFAULT, iter_frac=ITER_FRAC_DEFAULT,
                 block="bnfold", protocol=protocol, recalib_k=recalib_k, tag=tag)
 
 
@@ -212,31 +236,39 @@ def bnfix_specs():
 
 
 def bnrecal_specs(recalib_k=50):
-    """Recalib on/off across ALL 6 scorers — the isolated measure-pass lift, native BN, no fold.
-    Single MAC target (-33% ⇒ keep 0.67), all 5 archs × 6 scorers × {B,C} = 60 runs. Per cell:
+    """Recalib on/off across ALL 8 scorers — the isolated measure-pass lift, native BN, no fold.
+    Single MAC target (-33% ⇒ keep 0.67). Per cell:
       B  native + no-recalib  (stale BN — recalib OFF)
       C  native + measure-pass(k50)  (recalib ON)
-    The 3 BN nets (resnet50, mnv2, mnv1) have a real recalib axis; convnext_t/deit_tiny are BN-free
-    (LayerNorm) so the recalib pass is a no-op ⇒ B==C (the grid is filled for symmetry).
+    Scorers (8): magnitude, vbp, nci, vbp_pl, nci_pl (per-layer mean norm), prop, cov, iter.
+    The BN nets (resnet50[_v2], mnv2[_v2], mnv1) have a real recalib axis; convnext_t/deit_tiny are
+    BN-free (LayerNorm) so the recalib pass is a no-op ⇒ B==C (grid filled for symmetry).
     mnv1 = timm-only, built by load_model via _unfuse_bn_act (see vbp_common). Cells carry
-    block='bnfold' so bn_flags + summarize_bnfold render them (B vs C:native+m50)."""
+    block='bnfold' so bn_flags + summarize_bnfold render them (B vs C:native+m50).
+
+    Grids:
+      COMPUTED  : 5 V1 archs × 8 scorers × {B,C} = 80  +  2 V2 archs × 8 scorers × {B,C} = 32  → 112
+      MEASURED  : 5 V1 archs × {cov,iter} × {B,C} = 20  (arch-fragile var_comp/LN lever; V1 only —
+                  the V2 ckpts get the plain 8×2 computed grid per the request)
+    Total = 132 runs."""
     specs, seen = [], set()
     def add(arch, base, fr, proto, k, measured=False):
         s = make_bnfold_spec(arch, base, fr, proto, k, measured)
         if s["tag"] not in seen:
             seen.add(s["tag"]); specs.append(s)
     fr = 0.67                                                # -33% MAC
-    ARCHS5 = ("resnet50", "mobilenet_v2", "mobilenet_v1", "convnext_t", "deit_tiny")
-    SCORERS = ["magnitude", "vbp", "nci", "prop", "cov", "iter"]
-    # COMPUTED-var grid: 5 archs x 6 scorers x {B,C} = 60
-    for arch in ARCHS5:
+    ARCHS_V1 = ("resnet50", "mobilenet_v2", "mobilenet_v1", "convnext_t", "deit_tiny")
+    ARCHS_V2 = ("resnet50_v2", "mobilenet_v2_v2")            # modern IMAGENET1K_V2 ckpts (same arch)
+    SCORERS = ["magnitude", "vbp", "nci", "vbp_pl", "nci_pl", "prop", "cov", "iter"]  # 8
+    # COMPUTED-var grid: (V1 + V2) archs x 8 scorers x {B,C}
+    for arch in ARCHS_V1 + ARCHS_V2:
         for base in SCORERS:
             add(arch, base, fr, "B_native", 0)               # recalib OFF (stale)
             add(arch, base, fr, "C_native_recal", recalib_k) # recalib ON  (measure-pass, full epoch)
-    # MEASURED-var grid: 5 archs x {cov,iter} x {B,C} = 20. Measured-var is the arch-fragile lever
+    # MEASURED-var grid: V1 archs x {cov,iter} x {B,C} = 20. Measured-var is the arch-fragile lever
     # (helps convnext: iter-meas ~0.71 vs computed 0.68; neutral deit; craters mnv1/mnv2 — that
     # contrast is exactly what this block measures). Distinct scorer label (covmp2/itermp2) → own rows.
-    for arch in ARCHS5:
+    for arch in ARCHS_V1:
         for base in ("cov", "iter"):
             add(arch, base, fr, "B_native", 0, measured=True)
             add(arch, base, fr, "C_native_recal", recalib_k, measured=True)
@@ -357,7 +389,7 @@ def spec_flags(spec):
     a = ARCHS[arch]
     f = ["--mac_target_g", str(spec["mac_g"]), "--val_resize", str(a["val_resize"]),
          "--imp_normalizer", spec["normalizer"]]
-    if arch in ("mobilenet_v2", "mobilenet_v1"):
+    if arch in ("mobilenet_v2", "mobilenet_v1", "mobilenet_v2_v2"):
         f += ["--max_prune_ratio", "0.8"]                  # per-layer cap (narrow mobilenet layers)
     f += list(BASES[base])
     if base in ("prop", "cov", "iter"):
@@ -439,6 +471,35 @@ def mode_submit(args):
               f"python reproduce_table.py --mode collect --run_name {args.run_name}")
 
 
+# ===================================================================== CSV output
+def _csv_path(base_path, suffix=""):
+    """Sibling .csv path for a given base file (LEDGER). suffix distinguishes the pretty tables."""
+    root = base_path[:-6] if base_path.endswith(".jsonl") else os.path.splitext(base_path)[0]
+    return f"{root}{suffix}.csv"
+
+
+def _write_csv(path, header, matrix):
+    """Write header + rows (list of lists) to CSV. No-op on empty matrix."""
+    if not matrix:
+        return None
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(matrix)
+    return path
+
+
+LEDGER_FIELDS = ["arch", "scorer", "base", "p", "measured", "fold", "frac", "block", "normalizer",
+                 "nonrel", "iter_drop", "iter_frac", "protocol", "recalib_k", "acc", "mac_g",
+                 "mac_pct", "tag"]
+
+
+def _write_ledger_csv(rows, path):
+    """Flat one-row-per-cell CSV mirroring the jsonl ledger (machine-friendly)."""
+    matrix = [[r.get(k, "") for k in LEDGER_FIELDS] for r in rows]
+    return _write_csv(path, LEDGER_FIELDS, matrix)
+
+
 # ===================================================================== CLUSTER: collect
 def collect(args):
     specs = gen_specs(args)
@@ -462,7 +523,9 @@ def collect(args):
     with open(LEDGER, "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
-    print(f"[COLLECT] {n_found}/{len(specs)} cells found → {LEDGER}")
+    csv_path = _write_ledger_csv(rows, _csv_path(LEDGER))
+    print(f"[COLLECT] {n_found}/{len(specs)} cells found → {LEDGER}"
+          + (f"  +  {csv_path}" if csv_path else ""))
     summarize(rows)
 
 
@@ -476,6 +539,7 @@ def summarize(rows):
         return
     canon = [r for r in rows if r["block"] == "curve" and r["normalizer"] == "width"
              and not r["nonrel"] and r["p"] == 2]
+    curve_csv = []                                            # [arch, mac_frac, mac%, <scorers...>]
     for arch in ARCHS:
         ar = [r for r in canon if r["arch"] == arch and r["fold"] == FOLDABLE[arch]]
         if not ar:
@@ -493,6 +557,10 @@ def summarize(rows):
                 m = [r for r in fa if r["scorer"] == sc]
                 cells.append(f"{m[0]['acc']:.3f}" if m and m[0]["acc"] is not None else "·")
             print(f"| {fr:.3f} | {mac} | " + " | ".join(cells) + " |")
+            curve_csv.append([arch, f"{fr:.3f}", mac] + cells)
+    cpath = _write_csv(_csv_path(LEDGER, "_curve"), ["arch", "mac_frac", "mac%"] + SUMMARY_SCORERS, curve_csv)
+    if cpath:
+        print(f"\n[csv] curve table → {cpath}")
     print("\nBest scorer per arch (any axis):")
     for arch in ARCHS:
         ar = [r for r in rows if r["arch"] == arch and r["acc"] is not None]
@@ -517,9 +585,11 @@ def summarize_bnfold(rows):
              ("E_native_recal_fold", 50, "E:native+m50+fold"), ("F_varcomp", 0, "F:varcomp-analytic")]
     print(f"\n{'='*100}\nBN-FOLD VALIDATION  (pre-FT top-1; measure-pass = no-grad BN re-estimation, "
           f"k batches)\n{'='*100}")
-    print("| arch | scorer | mac% | " + " | ".join(c[2] for c in cols) + " |")
+    header = ["arch", "scorer", "mac%"] + [c[2] for c in cols]
+    print("| " + " | ".join(header) + " |")
     print("|" + "---|" * (len(cols) + 3))
     keys = sorted({(r["arch"], r["scorer"], r["frac"]) for r in br})
+    csv_rows = []
     for arch, sc, fr in keys:
         grp = [r for r in br if r["arch"] == arch and r["scorer"] == sc and r["frac"] == fr]
         mac = next((r["mac_pct"] for r in grp if r.get("mac_pct") is not None), "?")
@@ -528,6 +598,10 @@ def summarize_bnfold(rows):
             m = [r for r in grp if r["protocol"] == proto and (r.get("recalib_k") or 0) == k]
             cells.append(f"{m[0]['acc']:.3f}" if m else "·")
         print(f"| {arch} | {sc} | {mac} | " + " | ".join(cells) + " |")
+        csv_rows.append([arch, sc, mac] + cells)
+    bpath = _write_csv(_csv_path(LEDGER, "_bnfold"), header, csv_rows)
+    if bpath:
+        print(f"\n[csv] bn-fold/recal table → {bpath}")
 
 
 # ===================================================================== LOCAL: subprocess
@@ -586,6 +660,12 @@ def mode_local(args):
             print(f"  {s['tag']}: acc={acc}  ({rec['secs']}s)", flush=True)
             with open(LEDGER, "a") as f:
                 f.write(json.dumps(rec) + "\n")
+    if not args.dry_run and os.path.exists(LEDGER):        # mirror the jsonl ledger to .csv
+        led = [json.loads(l) for l in open(LEDGER) if l.strip()]
+        fields = ["arch", "scorer", "fold", "frac", "block", "acc", "mac_pct", "secs", "tag"]
+        cpath = _write_csv(_csv_path(LEDGER), fields, [[r.get(k, "") for k in fields] for r in led])
+        if cpath:
+            print(f"[csv] local ledger → {cpath}")
 
 
 # ===================================================================== main
