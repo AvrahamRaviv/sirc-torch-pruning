@@ -169,14 +169,19 @@ def make_spec(arch, base, p, measured, fold, frac, norm="width", nonrel=False,
                 normalizer=norm, nonrel=nonrel, iter_drop=drop, iter_frac=ifrac, block=block, tag=tag)
 
 
-def make_bnfold_spec(arch, base, frac, protocol, recalib_k, measured=False):
-    """BN-fold validation cell: scorer p=2 (measured-var optional for cov/iter), BN handling = protocol(+k)."""
+def make_bnfold_spec(arch, base, frac, protocol, recalib_k, measured=False, norm=None):
+    """BN-fold validation cell: scorer p=2 (measured-var optional for cov/iter), BN handling = protocol(+k).
+    norm overrides the normalizer (default = base_normalizer); a non-default normalizer is stamped into
+    the tag + scorer label (e.g. covp2_nnone) so it renders as its own row and never collides."""
     mac_g = round(DENSE_MAC[arch] * frac, 3)
+    normalizer = norm if norm is not None else base_normalizer(base)
     sc = scorer_label(base, 2, measured)
+    if normalizer != base_normalizer(base):
+        sc = f"{sc}_n{normalizer}"                            # distinct row + tag for the normalizer ablation
     tag = f"bnf__{arch}__{sc}__{protocol}__k{recalib_k}__mac{frac:.3f}"
     return dict(arch=arch, base=base, p=2, measured=measured, fold=False, frac=frac, mac_g=mac_g,
-                normalizer=base_normalizer(base), nonrel=False, iter_drop=ITER_DROP_DEFAULT, iter_frac=ITER_FRAC_DEFAULT,
-                block="bnfold", protocol=protocol, recalib_k=recalib_k, tag=tag)
+                normalizer=normalizer, nonrel=False, iter_drop=ITER_DROP_DEFAULT, iter_frac=ITER_FRAC_DEFAULT,
+                block="bnfold", protocol=protocol, recalib_k=recalib_k, scorer_lbl=sc, tag=tag)
 
 
 def bnfold_specs():
@@ -250,10 +255,12 @@ def bnrecal_specs(recalib_k=50):
       COMPUTED  : 5 V1 archs × 8 scorers × {B,C} = 80  +  2 V2 archs × 8 scorers × {B,C} = 32  → 112
       MEASURED  : 5 V1 archs × {cov,iter} × {B,C} = 20  (arch-fragile var_comp/LN lever; V1 only —
                   the V2 ckpts get the plain 8×2 computed grid per the request)
-    Total = 132 runs."""
+      NO-NORM   : 7 (V1+V2) archs × {cov,iter} computed × {B,C} = 28  (ablate the width normalizer:
+                  --imp_normalizer none. Distinct rows covp2_nnone / iterp2_nnone.)
+    Total = 160 runs."""
     specs, seen = [], set()
-    def add(arch, base, fr, proto, k, measured=False):
-        s = make_bnfold_spec(arch, base, fr, proto, k, measured)
+    def add(arch, base, fr, proto, k, measured=False, norm=None):
+        s = make_bnfold_spec(arch, base, fr, proto, k, measured, norm)
         if s["tag"] not in seen:
             seen.add(s["tag"]); specs.append(s)
     fr = 0.67                                                # -33% MAC
@@ -272,6 +279,12 @@ def bnrecal_specs(recalib_k=50):
         for base in ("cov", "iter"):
             add(arch, base, fr, "B_native", 0, measured=True)
             add(arch, base, fr, "C_native_recal", recalib_k, measured=True)
+    # NO-NORM grid: (V1+V2) archs x {cov,iter} computed x {B,C}, --imp_normalizer none. Ablate the
+    # width (per-fan-in) normalizer — does dropping it change the propagation ranking / collapse?
+    for arch in ARCHS_V1 + ARCHS_V2:
+        for base in ("cov", "iter"):
+            add(arch, base, fr, "B_native", 0, norm="none")
+            add(arch, base, fr, "C_native_recal", recalib_k, norm="none")
     return specs
 
 
@@ -513,7 +526,7 @@ def collect(args):
         except Exception:
             continue
         n_found += 1
-        rows.append(dict(arch=s["arch"], scorer=scorer_label(s["base"], s["p"], s["measured"]),
+        rows.append(dict(arch=s["arch"], scorer=s.get("scorer_lbl") or scorer_label(s["base"], s["p"], s["measured"]),
                          base=s["base"], p=s["p"], measured=s["measured"], fold=s["fold"],
                          frac=s["frac"], block=s["block"], normalizer=s["normalizer"],
                          nonrel=s["nonrel"], iter_drop=s["iter_drop"], iter_frac=s["iter_frac"],
