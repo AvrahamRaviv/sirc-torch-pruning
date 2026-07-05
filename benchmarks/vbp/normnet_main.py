@@ -1324,6 +1324,16 @@ def parse_args(argv):
                         "Default 1e-5 (torch BN default; byte-identical to old pruning runs). "
                         "Set 0.1 for mid-training insertion / NN-continue: dead-ReLU channels "
                         "have var~0 → tiny σ → 1/sigma^2 blow-up on v_tilde → NaN; 1e-1 floors σ>=0.316.")
+    p.add_argument("--lr_scale_by_sigma2", action="store_true", default=False,
+                   help="per-LAYER mean-σ² lr scaling on v_tilde (see normalize_net.py; "
+                        "corrects cross-layer scale only, not intra-layer channel spread)")
+    p.add_argument("--lr_scale_by_sigma2_perchannel", action="store_true", default=False,
+                   help="PER-CHANNEL σ² gradient scaling on v_tilde (autograd hook: grad *= "
+                        "running_var+eps per input channel). Cancels the 1/σ² per-channel "
+                        "preconditioner (stability ceiling + late-insertion kick) and makes "
+                        "coupled WD uniform in W-space. Recommended for NN-continue: combine "
+                        "with --norm_bn_eps 0.1 --norm_bn_momentum 0. Supersedes "
+                        "--lr_scale_by_sigma2.")
     p.add_argument("--reparam_lambda", type=float, default=0.0, help="extra λ‖σv‖ during norm-ft")
     p.add_argument("--epochs_norm_ft", type=int, default=0, help="FT in normalized coords (0=skip)")
     p.add_argument("--lr_norm_ft", type=float, default=0.01)

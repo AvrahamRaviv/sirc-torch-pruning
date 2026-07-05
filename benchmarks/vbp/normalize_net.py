@@ -255,6 +255,43 @@ def verify_roundtrip(model, mgr, loader, args, device, use_ddp):
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+def register_sigma2_grad_hooks(mgr):
+    """Per-channel σ² gradient scaling for the bn reparam: v_tilde.grad *= (running_var
+    + eps) per INPUT channel, applied inside autograd (so it runs before DDP's gradient
+    allreduce and before the optimizer adds weight decay).
+
+    W-space effect (W = v_tilde/σ, frozen stats): the gradient step becomes uniform
+    across channels — cancels the 1/σ² per-channel preconditioner that (a) caps the
+    stable LR at lr/eps and (b) kicks converged checkpoints out of their basin at
+    insertion — while keeping the reparam's stabilizing μ-coupling. As a free side
+    effect the coupled WD on v_tilde turns into uniform W-space decay
+    (Δ_wd W = −lr·wd·W), fixing the σ²-scaled-WD distortion too.
+    CIFAR/R20 proxy evidence: 2× stability ceiling, ~80% of the late-insertion
+    accuracy kick removed (netnorm NN_CONTINUE_PROXY_REPORT.md).
+
+    Idempotent per manager: previously registered handles are removed first.
+    """
+    for h in getattr(mgr, "_sigma2_hook_handles", []):
+        h.remove()
+    handles = []
+    for rp in mgr._reparam_modules.values():
+        if not hasattr(rp, "v_tilde"):
+            continue
+
+        def make_hook(rp=rp):
+            def hook(grad):
+                s2 = (rp.bn.running_var + rp.bn.eps).detach()
+                shape = (1, -1, 1, 1) if grad.dim() == 4 else (1, -1)
+                return grad * s2.reshape(shape)
+            return hook
+
+        handles.append(rp.v_tilde.register_hook(make_hook()))
+    mgr._sigma2_hook_handles = handles
+    log_info(f"lr_scale_by_sigma2_perchannel: hooked {len(handles)} v_tilde tensors "
+             f"(grad *= running_var+eps per input channel)")
+    return handles
+
+
 def build_optimizer(model, args, mgr=None):
     """Optimizer with weight decay ON the residual weight (free-by-design reg).
 
@@ -273,9 +310,20 @@ def build_optimizer(model, args, mgr=None):
     is_bn_variant = active and all(
         hasattr(rp, "v_tilde") for rp in mgr._reparam_modules.values())
     scale_by_sigma2 = getattr(args, "lr_scale_by_sigma2", False)
+    scale_perchannel = getattr(args, "lr_scale_by_sigma2_perchannel", False)
+    if scale_perchannel and not is_bn_variant:
+        log_info("lr_scale_by_sigma2_perchannel ignored: bn reparam variant only")
+        scale_perchannel = False
     if scale_by_sigma2 and not is_bn_variant:
         log_info("lr_scale_by_sigma2 ignored: only applies to the bn reparam variant")
         scale_by_sigma2 = False
+    if scale_perchannel and scale_by_sigma2:
+        log_info("both σ² scalings requested → per-channel wins (per-layer disabled)")
+        scale_by_sigma2 = False
+    if scale_perchannel:
+        # Gradient-side fix: uniform lr + default WD grouping below; the autograd hook
+        # does the per-channel work (and makes the coupled WD uniform in W-space).
+        register_sigma2_grad_hooks(mgr)
 
     if not active:
         groups = [{"params": params, "weight_decay": args.wd}]
@@ -712,6 +760,13 @@ def parse_args():
                         help="Scale each reparam layer's SGD lr by its mean σ² (from "
                              "calibration BN running_var) → neutralizes the 1/σ² W-space "
                              "rescaling. Per-layer (not per-channel). Use with cosine, not flat.")
+    parser.add_argument("--lr_scale_by_sigma2_perchannel", action="store_true", default=False,
+                        help="PER-CHANNEL σ² gradient scaling on v_tilde (autograd hook: "
+                             "grad *= running_var+eps per input channel). Cancels the 1/σ² "
+                             "per-channel preconditioner (stability ceiling + late-insertion "
+                             "kick) AND makes coupled WD uniform in W-space. Supersedes the "
+                             "per-layer flag. Recommended for NN-continue with "
+                             "--norm_bn_eps 0.1 --norm_bn_momentum 0.")
     parser.add_argument("--norm_bn_momentum", type=float, default=None,
                         help="Override inserted-BN EMA momentum after calibration. "
                              "0=freeze σ at calibration (conv: true freeze), "
