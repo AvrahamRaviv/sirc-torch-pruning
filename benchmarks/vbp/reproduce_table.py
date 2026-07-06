@@ -169,18 +169,26 @@ def make_spec(arch, base, p, measured, fold, frac, norm="width", nonrel=False,
                 normalizer=norm, nonrel=nonrel, iter_drop=drop, iter_frac=ifrac, block=block, tag=tag)
 
 
-def make_bnfold_spec(arch, base, frac, protocol, recalib_k, measured=False, norm=None):
+def make_bnfold_spec(arch, base, frac, protocol, recalib_k, measured=False, norm=None,
+                     alpha=1.0, precision=False, prec_eps=0.01):
     """BN-fold validation cell: scorer p=2 (measured-var optional for cov/iter), BN handling = protocol(+k).
     norm overrides the normalizer (default = base_normalizer); a non-default normalizer is stamped into
-    the tag + scorer label (e.g. covp2_nnone) so it renders as its own row and never collides."""
+    the tag + scorer label (e.g. covp2_nnone) so it renders as its own row and never collides.
+    alpha/precision = RECOVER scorers (Σ̂ transform, cov/iter only): alpha≠1 → covp2_a-0.5, precision →
+    covp2_prec (stamped into label+tag → distinct rows; alpha=1 & no precision = plain cov = no-op)."""
     mac_g = round(DENSE_MAC[arch] * frac, 3)
     normalizer = norm if norm is not None else base_normalizer(base)
     sc = scorer_label(base, 2, measured)
     if normalizer != base_normalizer(base):
         sc = f"{sc}_n{normalizer}"                            # distinct row + tag for the normalizer ablation
+    if precision:
+        sc = f"{sc}_prec"                                     # recover: conditional-variance reweight
+    elif alpha != 1.0:
+        sc = f"{sc}_a{alpha:g}"                               # recover: correlation-sign knob (covp2_a-0.5)
     tag = f"bnf__{arch}__{sc}__{protocol}__k{recalib_k}__mac{frac:.3f}"
     return dict(arch=arch, base=base, p=2, measured=measured, fold=False, frac=frac, mac_g=mac_g,
                 normalizer=normalizer, nonrel=False, iter_drop=ITER_DROP_DEFAULT, iter_frac=ITER_FRAC_DEFAULT,
+                alpha=alpha, precision=precision, prec_eps=prec_eps,
                 block="bnfold", protocol=protocol, recalib_k=recalib_k, scorer_lbl=sc, tag=tag)
 
 
@@ -288,6 +296,34 @@ def bnrecal_specs(recalib_k=50):
     return specs
 
 
+RECOVER_ALPHAS = (1.0, 0.5, 0.0, -0.5, -1.0)                 # cov → p2 → anti-cov crossover sweep
+
+
+def recover_specs(recalib_k=50):
+    """RECOVER scorers — punish redundancy / reward uniqueness (retention half; user FTs favorites).
+    Champion cov is retention-optimal but protects redundant channels (wrong for FT recover). Test
+    scorers that penalize correlation, on RETENTION, isolating the SCORER from BN staleness by
+    running WITH recalib (protocol C) on the BN nets. Expect these to COST retention vs cov (α=1);
+    the win is post-FT. Grid @ -33% MAC (keep 0.67):
+      archs (5): resnet50, mobilenet_v2, mobilenet_v1, convnext_t, deit_tiny
+      bases (2): cov (one-shot), iter (greedy — best for anti-cov, drop-one keeps a survivor)
+      scorers  : α ∈ {1.0,0.5,0.0,−0.5,−1.0} (α=1 = plain cov baseline, dedups vs bnrecal) ∪ {precision}
+    = 5 archs × 2 bases × 6 scorers = 60 cells (α=1 overlaps bnrecal cov-C where both run)."""
+    specs, seen = [], set()
+    def add(arch, base, alpha=1.0, precision=False):
+        s = make_bnfold_spec(arch, base, 0.67, "C_native_recal", recalib_k,
+                             alpha=alpha, precision=precision)
+        if s["tag"] not in seen:
+            seen.add(s["tag"]); specs.append(s)
+    ARCHS_REC = ("resnet50", "mobilenet_v2", "mobilenet_v1", "convnext_t", "deit_tiny")
+    for arch in ARCHS_REC:
+        for base in ("cov", "iter"):
+            for a in RECOVER_ALPHAS:
+                add(arch, base, alpha=a)
+            add(arch, base, precision=True)
+    return specs
+
+
 def gen_specs(args):
     archs = [a for a in (args.archs.split(",") if args.archs else ARCHS) if a in ARCHS]
     blocks = args.blocks.split(",")
@@ -349,6 +385,11 @@ def gen_specs(args):
 
     if "bnrecal" in blocks:                                  # recalib on/off × 6 scorers @ -33%
         for s in bnrecal_specs(recalib_k=args.calib_batches):  # measure-pass k = full-epoch knob
+            if s["arch"] in archs and s["tag"] not in seen:
+                seen.add(s["tag"]); specs.append(s)
+
+    if "recover" in blocks:                                  # recover scorers (α-sweep + precision) @ -33%
+        for s in recover_specs(recalib_k=args.calib_batches):
             if s["arch"] in archs and s["tag"] not in seen:
                 seen.add(s["tag"]); specs.append(s)
 
@@ -422,6 +463,11 @@ def spec_flags(spec):
             f += ["--prop_measured_var"]
     if spec["nonrel"]:
         f += ["--prop_non_relative"]
+    if base in ("cov", "iter"):                              # RECOVER scorers (Σ̂ transform)
+        if spec.get("precision"):
+            f += ["--prop_precision", "--prop_precision_eps", str(spec.get("prec_eps", 0.01))]
+        elif spec.get("alpha", 1.0) != 1.0:
+            f += ["--prop_cov_alpha", str(spec["alpha"])]
     return f
 
 

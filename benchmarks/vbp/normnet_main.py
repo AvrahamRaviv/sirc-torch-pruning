@@ -105,6 +105,32 @@ def _ratio_for_mac(model, ex, imp_factory, ignored_factory, target_g, global_pru
     return best
 
 
+def _transform_icov(icov, alpha=1.0, precision=False, eps=1e-2):
+    """RECOVER scorers: transform each layer's input correlation Σ̂ BEFORE it enters the
+    propagation scorer (so the cov numerator + colsum mass-conservation inherit it for free).
+
+    precision=True  → Σ̂ → diag(d), d_c = 1/(inv(Σ̂+εI))_cc = conditional variance of channel c
+                      (precision-matrix diagonal). Redundant channel (predictable from the rest)
+                      → small d_c → deprioritized; unique channel → d_c≈1. Since _layer_N gives
+                      N = w̃²·d when Σ̂ is diagonal, this multiplicatively down-weights redundant
+                      input channels.
+    else            → Σ̂_eff = I + α·(Σ̂ − I) (scale off-diagonal). α=1 = identity (no-op = exact
+                      prop_cov); α=0 = independence/p2; α<0 = anti-cov (shared variance penalized).
+
+    Returns a NEW dict (originals untouched)."""
+    out = {}
+    for name, S in icov.items():
+        n = S.shape[0]
+        I = torch.eye(n, device=S.device, dtype=S.dtype)
+        if precision:
+            prec = torch.linalg.inv(S + eps * I)
+            d = 1.0 / prec.diagonal().clamp_min(eps)   # conditional variance per channel
+            out[name] = torch.diag(d)
+        else:
+            out[name] = I + alpha * (S - I)
+    return out
+
+
 def _classifier(model):
     """The logits head: resnet/mobilenet → .fc, convnext/timm → .head, HF ViT → .classifier.
     None if neither."""
@@ -830,11 +856,34 @@ def main(argv):
             if args.scorer == "propagation" and args.prop_cov:
                 if args.prop_p != 2:
                     raise SystemExit("--prop_cov requires --prop_p 2 (variance decomposition)")
+                if args.prop_precision and args.prop_cov_alpha != 1.0:
+                    raise SystemExit("--prop_precision and --prop_cov_alpha≠1 are mutually exclusive "
+                                     "(distinct RECOVER scorers) — pick one.")
+                if (args.prop_precision or args.prop_cov_alpha != 1.0) and args.prop_measured_var:
+                    raise SystemExit("RECOVER scorers (--prop_precision / --prop_cov_alpha≠1) are "
+                                     "incompatible with --prop_measured_var (measured denom breaks "
+                                     "the transformed-numerator mass accounting).")
                 icov = mgr.collect_input_covariance(calib_loader, max_batches=args.calib_batches)
-                off = [float((s - torch.eye(s.shape[0], device=s.device, dtype=s.dtype)).abs().sum() / s.abs().sum()) for s in icov.values()]
-                _med = f"{sorted(off)[len(off) // 2]:.2f}" if off else "n/a (no cov layers)"
+                def _offmass(d):
+                    o = [float((s - torch.eye(s.shape[0], device=s.device, dtype=s.dtype)).abs().sum()
+                               / s.abs().sum()) for s in d.values()]
+                    return f"{sorted(o)[len(o) // 2]:.2f}" if o else "n/a (no cov layers)"
+                _med = _offmass(icov)
                 log_info(f"prop_cov: input correlation on {len(icov)} layers "
                          f"({args.calib_batches} calib batches), median offdiag mass={_med}")
+                # RECOVER scorers = transform Σ̂ before it enters the scorer (numerator machinery
+                # + colsum mass-conservation inherit it automatically). Default (α=1, no precision)
+                # is a bit-exact no-op → prop_cov unchanged.
+                if args.prop_precision or args.prop_cov_alpha != 1.0:
+                    icov = _transform_icov(icov, args.prop_cov_alpha,
+                                           args.prop_precision, args.prop_precision_eps)
+                    if args.prop_precision:
+                        log_info(f"prop_precision: Σ̂→diag(conditional-var), ε={args.prop_precision_eps} "
+                                 f"(redundant channels deprioritized; recover scorer)")
+                    else:
+                        log_info(f"prop_cov_alpha={args.prop_cov_alpha}: Σ̂→I+α(Σ̂−I) "
+                                 f"(α<0 punishes correlated channels; recover scorer), "
+                                 f"median offdiag mass now={_offmass(icov)}")
             elif args.scorer == "propagation" and args.prop_measured_var:
                 log_info("WARNING: --prop_measured_var without --prop_cov = denominator-only "
                          "(numerator stays independence) → mass leaks → depth bias returns. "
@@ -1405,6 +1454,23 @@ def parse_args(argv):
                         "= diag-only special case; convnext offdiag = 53-89%% of Var). With "
                         "--prop_measured_var the denom uses measured σ_out_x² instead of the "
                         "recon colsum (recon≈meas).")
+    p.add_argument("--prop_cov_alpha", type=float, default=1.0,
+                   help="RECOVER scorer (needs --prop_cov, p=2): scale the off-diagonal of every "
+                        "layer's input correlation, Σ̂_eff = I + α·(Σ̂−I). α=1 = exact prop_cov "
+                        "(default, no-op); α=0 = independence/p2 (cov-blind); α<0 = ANTI-COV "
+                        "(shared variance PENALIZED → punish redundant/correlated channels, keep "
+                        "unique). α=−1 → N=w̃⊙(w̃(2I−Σ̂)). Retention-champion cov protects redundant "
+                        "channels (wrong for FT recover); α<0 tests the opposite. Sweep the crossover.")
+    p.add_argument("--prop_precision", action="store_true",
+                   help="RECOVER scorer (needs --prop_cov, p=2): reweight each input channel by its "
+                        "CONDITIONAL variance d_c = 1/(inv(Σ̂+εI))_cc (precision-matrix diagonal). "
+                        "Redundant channel (predictable from others) → small d_c → deprioritized; "
+                        "unique channel → d_c≈1. Implemented as Σ̂→diag(d) (N=w̃²·d). Principled "
+                        "'keep unique info' scorer. Mutually exclusive with --prop_cov_alpha≠1 and "
+                        "--prop_measured_var.")
+    p.add_argument("--prop_precision_eps", type=float, default=1e-2,
+                   help="ridge ε for --prop_precision (Σ̂+εI before inverse) — guards singular Σ̂ "
+                        "(exact-redundancy case). Default 1e-2.")
     p.add_argument("--skip_sigma_c", action="store_true",
                    help="propagation: at residual joins use the MEASURED post-add std σ_c as the "
                         "branch-weight denominator (PDF σ_c^p/(σ_a^p+σ_b^p) skip factor) instead of "

@@ -169,7 +169,35 @@ def nci_cov_vec(Wcons, cov):
     return 2.0 * (M * cov).sum(1) - torch.diag(M) * torch.diag(cov)
 
 
-def scores_all(model, X, sigma, p, normalizer):
+def _corr(cov, eps=1e-12):
+    """Covariance → unit-diagonal correlation Σ̂ (what the real scorer transforms)."""
+    sd = torch.diag(cov).clamp_min(eps).sqrt()
+    c = cov / (sd[:, None] * sd[None, :] + eps)
+    c.fill_diagonal_(1.0)
+    return c.clamp_(-1.0, 1.0)
+
+
+def cov_contrib_vec(Wcons, sc, S):
+    """Propagation cov numerator, per input channel c of consumer Wcons: score_c = Σ_o w̃_oc·(w̃ S)_oc,
+    w̃ = σ_c·W_cons (signed). Mirrors the real _layer_N (N=w̃⊙(w̃Σ̂), colsum over outputs). Passing:
+      S = corr        → cov-aware variance contribution (retention champion, α=1)
+      S = I+α(corr−I) → anti-cov (α<0 penalizes correlated channels)
+      S = I           → independence (== nci)
+      S = diag(d)     → precision reweight (score_c = d_c·Σ_o w̃_oc²)"""
+    wt = sc[None, :] * Wcons                                    # (out,in) signed w̃
+    N = wt * (wt @ S)                                           # (out,in)
+    return N.sum(0).clamp_min(0)                                # (in,)  per-channel keep-score
+
+
+def precision_diag(corr, eps=1e-2):
+    """Conditional variance per channel d_c = 1/(inv(Σ̂+εI))_cc (precision-matrix diagonal). Redundant
+    channel (predictable from the rest) → small d_c; unique channel → d_c≈1. ε ridge guards singular Σ̂."""
+    n = corr.shape[0]
+    prec = torch.linalg.inv(corr + eps * torch.eye(n, dtype=corr.dtype))
+    return (1.0 / prec.diagonal().clamp_min(eps))
+
+
+def scores_all(model, X, sigma, p, normalizer, alpha_anti=-1.0, prec_eps=1e-2):
     """Per HIDDEN layer h (=output of lins[h], input of lins[h+1], h in 0..L-2) return a dict of
     per-neuron score vectors for every criterion. Producer = lins[h] (row), consumer = lins[h+1]
     (column). Propagation seeded at the logits with I=1 and pushed back through the consumers."""
@@ -184,6 +212,9 @@ def scores_all(model, X, sigma, p, normalizer):
         s = sigma[h]                  # (neurons,)
         a = X[h + 1]                  # the consumed activations (input to lins[h+1]) = relu(Z_h)
         cov = torch.cov(a.t())        # (neurons,neurons) channel covariance on real data
+        corr = _corr(cov)             # unit-diagonal Σ̂ (what the recover scorers transform)
+        n = corr.shape[0]
+        I = torch.eye(n, dtype=corr.dtype)
         mag_cons = Wcons.pow(2).sum(0).sqrt()                   # ‖W_cons[:,c]‖_2
         mag_prod = Wprod.pow(2).sum(1).sqrt()                   # ‖W_prod[c,:]‖_2
         out[h] = {
@@ -191,6 +222,11 @@ def scores_all(model, X, sigma, p, normalizer):
             "magnitude_tp": _norm(0.5 * (mag_cons + mag_prod), normalizer),
             "nci": _norm(s.pow(2) * Wcons.pow(2).sum(0), normalizer),
             "nci_cov": _norm(nci_cov_vec(Wcons, cov).clamp_min(0), normalizer),
+            # RECOVER scorers (Σ̂ transform) — cov=retention champ, anti_cov/precision punish redundancy
+            "cov": _norm(cov_contrib_vec(Wcons, s, corr), normalizer),
+            "anti_cov": _norm(cov_contrib_vec(Wcons, s, I + alpha_anti * (corr - I)), normalizer),
+            "precision": _norm(cov_contrib_vec(Wcons, s, torch.diag(precision_diag(corr, prec_eps))),
+                               normalizer),
         }
 
     # propagation: I^L = 1 (over 10 logits). Walk back l = L-1 .. 1, scoring the INPUTS of lins[l]
@@ -342,6 +378,89 @@ def skip_factor_check():
           f"→ branch-sum misses the 2·Cov(A,B) cross term the σ_c denominator restores")
 
 
+# --------------------------------------------------------------------------- recover proxy
+def _spearman(a, b):
+    ra = torch.argsort(torch.argsort(a)).float()
+    rb = torch.argsort(torch.argsort(b)).float()
+    return torch.corrcoef(torch.stack([ra, rb]))[0, 1].item()
+
+
+def _build_pruned(model, keep):
+    """keep = list (len L-1) of LongTensor kept-neuron indices per hidden layer. Structurally slice
+    lins[h] rows (its outputs) + lins[h+1] cols (its inputs) + bns[h] (if BatchNorm1d) → smaller MLP."""
+    import copy
+    new = copy.deepcopy(model).cpu()
+    L = len(new.lins)
+    for h in range(L - 1):
+        idx = keep[h]
+        lin = new.lins[h]
+        lin.weight = nn.Parameter(lin.weight.data[idx].clone())
+        if lin.bias is not None:
+            lin.bias = nn.Parameter(lin.bias.data[idx].clone())
+        lin.out_features = idx.numel()
+        bn = new.bns[h]
+        if isinstance(bn, nn.BatchNorm1d):
+            for attr in ("weight", "bias"):
+                p = getattr(bn, attr)
+                if p is not None:
+                    setattr(bn, attr, nn.Parameter(p.data[idx].clone()))
+            bn.running_mean = bn.running_mean[idx].clone()
+            bn.running_var = bn.running_var[idx].clone()
+            bn.num_features = idx.numel()
+        nxt = new.lins[h + 1]
+        nxt.weight = nn.Parameter(nxt.weight.data[:, idx].clone())
+        nxt.in_features = idx.numel()
+    return new
+
+
+def _refit(model, tr, device, steps, lr=1e-3):
+    if steps <= 0:
+        return
+    opt = torch.optim.Adam(model.parameters(), lr)
+    model.train()
+    it, done = iter(tr), 0
+    while done < steps:
+        try:
+            x, y = next(it)
+        except StopIteration:
+            it = iter(tr); x, y = next(it)
+        x, y = x.to(device), y.to(device)
+        opt.zero_grad(); F.cross_entropy(model(x), y).backward(); opt.step(); done += 1
+
+
+@torch.no_grad()
+def _mask_divergence(sc, criteria, ref="cov"):
+    """Spearman rank-corr of each criterion's concatenated per-neuron scores vs the ref (cov) — how
+    DIFFERENT is the mask? corr≈1 ⇒ same ranking as cov (pointless); low ⇒ genuinely different mask."""
+    cat = {c: torch.cat([sc[h][c] for h in sorted(sc)]) for c in criteria}
+    return {c: _spearman(cat[c], cat[ref]) for c in criteria}
+
+
+def recover_proxy(model, sc, tr, te, device, ratio=0.5, refit_steps=100,
+                  criteria=("nci", "cov", "anti_cov", "precision")):
+    """Local FT-recover crossover proxy: prune every hidden layer to `ratio` by each scorer, measure
+    test acc at K=0 (retention) and after K=refit_steps refit (recover). Hypothesis: cov best at K=0
+    (retention champ), anti_cov/precision catch up / pass as K grows (they keep unique, prune
+    recoverable). Also prints Spearman-vs-cov mask divergence (must be <1 to matter)."""
+    L = len(model.lins)
+    div = _mask_divergence(sc, criteria)
+    print(f"\n{'='*78}\nRECOVER PROXY  (keep {ratio:.0%} of each hidden layer; refit K={refit_steps} steps)\n{'='*78}")
+    print(f"{'scorer':>12} {'ρ_vs_cov':>9} {'acc@K0':>8} {f'acc@K{refit_steps}':>9} {'Δrecover':>9}")
+    for crit in criteria:
+        keep = []
+        for h in range(L - 1):
+            v = sc[h][crit]
+            k = max(1, int(round(ratio * len(v))))
+            keep.append(torch.argsort(v, descending=True)[:k].sort().values)
+        m = _build_pruned(model, keep).to(device)
+        a0 = evaluate(m, te, device)
+        _refit(m, tr, device, refit_steps)
+        aK = evaluate(m, te, device)
+        print(f"{crit:>12} {div[crit]:>9.3f} {a0:>8.4f} {aK:>9.4f} {aK - a0:>+9.4f}")
+    print("Read: cov wins acc@K0 (retention). A recover scorer 'bites' if ρ_vs_cov<1 AND it closes/"
+          "passes cov by K — that's the green-light to FT on cluster.")
+
+
 # --------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
@@ -355,6 +474,9 @@ def main():
     ap.add_argument("--normalizer", choices=["none", "mean"], default="none")
     ap.add_argument("--p", type=float, default=2.0)
     ap.add_argument("--max_batches", type=int, default=40)
+    ap.add_argument("--recover_ratio", type=float, default=0.5)   # keep-fraction per hidden layer
+    ap.add_argument("--refit_steps", type=int, default=100)       # K refit steps in recover proxy
+    ap.add_argument("--prec_eps", type=float, default=1e-2)       # ridge for precision scorer
     args = ap.parse_args()
 
     device = "mps" if torch.backends.mps.is_available() else "cpu"
@@ -378,25 +500,27 @@ def main():
 
     X, Z, sigma = collect_stats(model, tr, device, args.max_batches)
 
-    sc = scores_all(model, X, sigma, args.p, args.normalizer)
+    sc = scores_all(model, X, sigma, args.p, args.normalizer, prec_eps=args.prec_eps)
     print("\n=== PER-HIDDEN-LAYER SCORES (top-8 neurons by nci) ===")
     for h in sorted(sc):
         d = sc[h]
         order = torch.argsort(d["nci"], descending=True)[:8]
         print(f"\nhidden layer {h}  ({len(d['nci'])} neurons)  top-8 by nci, idx={order.tolist()}")
-        for k in ("magnitude_classic", "magnitude_tp", "nci", "nci_cov", "prop_rel", "prop_nonrel"):
+        for k in ("magnitude_classic", "magnitude_tp", "nci", "nci_cov",
+                  "cov", "anti_cov", "precision", "prop_rel", "prop_nonrel"):
             vals = " ".join(f"{d[k][j]:7.3f}" for j in order)
             print(f"  {k:18s} {vals}")
         # cross-criterion rank agreement (top-25% set overlap)
         topk = {k: set(torch.argsort(d[k], descending=True)[:max(1, len(d[k]) // 4)].tolist())
                 for k in d}
-        base = topk["nci"]
-        ovs = " ".join(f"nci∩{k}={len(base & topk[k]) / max(1, len(base)):.2f}"
-                       for k in ("nci_cov", "prop_rel", "prop_nonrel"))
+        base = topk["cov"]                                       # vs the retention champion
+        ovs = " ".join(f"cov∩{k}={len(base & topk[k]) / max(1, len(base)):.2f}"
+                       for k in ("nci_cov", "anti_cov", "precision", "prop_rel"))
         print(f"  top-25% overlap  {ovs}")
 
     validate_nci_cov(model, X)
     independence_check(model, X, Z)
+    recover_proxy(model, sc, tr, te, device, ratio=args.recover_ratio, refit_steps=args.refit_steps)
     skip_factor_check()
 
 
