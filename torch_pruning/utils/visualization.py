@@ -8,8 +8,19 @@ from __future__ import annotations
 import os.path
 import re
 from typing import List, Optional, Set, Dict, Any, TYPE_CHECKING
-import graphviz
+try:
+    import graphviz
+except ImportError:  # graphviz optional (e.g. minimal docker image without it)
+    graphviz = None
 from torch_pruning.ops import OPTYPE, _ElementWiseOp
+
+
+def _require_graphviz():
+    if graphviz is None:
+        raise ImportError(
+            "graphviz is required for dependency-graph visualization. "
+            "Install with `pip install graphviz` (and the system Graphviz binaries)."
+        )
 
 if TYPE_CHECKING:
     from torch_pruning.dependency import DependencyGraph, Dependency
@@ -414,6 +425,7 @@ def visualize_graph(
         >>> DG = tp.DependencyGraph().build_dependency(model, torch.randn(1,3,224,224))
         >>> tp.utils.visualize_graph(DG, "./graph", view="dependency", show_groups=True)
     """
+    _require_graphviz()
     if view not in ("computational", "dependency", "both"):
         raise ValueError(f"Invalid view mode: {view}. Must be 'computational', 'dependency', or 'both'")
 
@@ -593,6 +605,7 @@ def visualize_all_views(
     Returns:
         Dict mapping view name to its graphviz.Digraph object.
     """
+    _require_graphviz()
     os.makedirs(output_dir, exist_ok=True)
 
     results = {}
