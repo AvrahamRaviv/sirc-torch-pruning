@@ -2,14 +2,18 @@
   "arm": "reference_thirdparty",
   "status": "reference_nonofficial_recipe",
   "source": "https://github.com/osmr/imgclsmob/releases/download/v0.0.155/mobilenet_w1-0865-eafd91e9.params.log",
-  "note": "ONLY published per-epoch MNv1 curve anywhere (imgclsmob, Gluon/MXNet, 2018). STRONGER recipe than official paper -> 73.57% vs official 70.6-70.9. Our MNv2-style repro run targets the official anchor (mnv1_official_anchor_run.json); use this curve for shape/sanity only (e.g. what epoch crosses 60/70%).",
+  "note": "ONLY published per-epoch MNv1 curve anywhere (imgclsmob, Gluon/MXNet, 2018). STRONGER recipe than official paper -> 73.6 vs official 70.6-70.9. Release log = 7 concatenated attempts; main metrics.jsonl = attempt-2 timeline (200ep cosine WARM-STARTED from a 59-epoch ckpt -> its epoch 1 val is already 0.647, NOT scratch!). For early-epoch scratch comparison use _scratch61_metrics.jsonl (attempt-1 true scratch, E1-61, val 0.019 -> 0.562). Our MNv2-style repro targets the official anchor (mnv1_official_anchor_run.json); these curves are shape/sanity only.",
   "pre_train_val_acc": null,
   "best_val_acc": 0.7363,
+  "scratch_prefix": {
+    "epochs": 61,
+    "best_val_acc": 0.5685
+  },
   "config": {
     "model": "mobilenet_w1",
     "dataset": "imagenet1k",
     "lr": 0.5,
-    "schedule": "cosine, 5ep warmup",
+    "schedule": "cosine, 5ep warmup; attempt-2 = fresh 200ep cosine from warm start",
     "optimizer": "nag (nesterov sgd)",
     "momentum": 0.9,
     "weight_decay": 0.0001,

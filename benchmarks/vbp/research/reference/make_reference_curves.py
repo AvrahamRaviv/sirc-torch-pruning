@@ -261,59 +261,95 @@ def convert_convnext(raw_path, out_dir):
 
 def convert_mnv1_imgclsmob(raw_path, out_dir):
     """imgclsmob (osmr) MobileNet-w1 Gluon training log — the ONLY published per-epoch MNv1
-    curve found anywhere. NOT the official recipe: NAG SGD lr 0.5 cosine 210ep, effective
-    bs 1120 (224 x batch-size-scale 5), label smoothing, 5ep warmup, no WD on bn/bias ->
-    73.57% top-1 (official paper recipe lands 70.6-70.9). Use as a SHAPE/sanity reference
-    for a stronger recipe, not as the target of our MNv2-style repro run.
+    curve found anywhere. NOT the official recipe (NAG SGD lr 0.5 cosine, effective bs 1120,
+    label smoothing, 5ep warmup, no WD on bn/bias); official paper recipe lands 70.6-70.9.
 
-    Log format (text): per-epoch triplet
-        [Epoch N] speed: ...
-        [Epoch N] training: err-top1=X loss=Y
-        [Epoch N] validation: err-top1=X err-top5=Y
-    plus batch lines "Epoch[N] Batch [k] ... lr=Z" (we keep the LAST lr seen per epoch)."""
+    The release log is SEVEN concatenated attempts (crashes + resumes + one recipe change).
+    True history:
+      attempt 1: from SCRATCH, cosine-210 plan, epochs 1-61 (err 0.981 -> 0.438), then
+                 several aborted resume detours (ignored);
+      attempt 2: fresh 200-epoch cosine schedule WARM-STARTED from attempt-1 epoch-59 ckpt,
+                 runs E1-200 (its own timeline; E1 val is already 0.647!), final err 0.2641
+                 = 73.59% -> the released weights.
+    Naive per-epoch dict over the whole file mixes the timelines (bug found 07-30) — so we
+    parse segment-aware (split on 'Script command line', read attempt/start_epoch from the
+    Namespace line) and emit TWO curves:
+      <TAG>_metrics.jsonl          attempt-2 timeline (the release curve; warm-start caveat)
+      <TAG>_scratch61_metrics.jsonl  attempt-1 true-scratch prefix E1-61 (the useful curve
+                                     for early-epoch sanity of a from-scratch repro)
+    Log line format per epoch: '[Epoch N] training: err-top1=X loss=Y' +
+    '[Epoch N] validation: err-top1=X err-top5=Y'; batch lines 'Epoch[N] ... lr=Z' (keep
+    LAST lr per epoch). Within a segment, printed epoch numbers are already global to that
+    attempt's timeline; on overlap after a resume, the LATER segment wins."""
     import re
     re_train = re.compile(r"\[Epoch (\d+)\] training: err-top1=([\d.]+)\s+loss=([\d.]+)")
     re_val = re.compile(r"\[Epoch (\d+)\] validation: err-top1=([\d.]+)\s+err-top5=([\d.]+)")
     re_lr = re.compile(r"Epoch\[(\d+)\].*\blr=([\d.eE+-]+)")
-    train, val, lr_last = {}, {}, {}
+    re_attempt = re.compile(r"attempt=(\d+)")
+    re_start = re.compile(r"start_epoch=(\d+)")
+
+    # timeline key -> {epoch -> data}; timelines: ("scratch",) = attempt1 start=1 segment,
+    # ("final",) = all attempt-2 segments merged in file order (later overwrites earlier).
+    tls = {"scratch": {"train": {}, "val": {}, "lr": {}},
+           "final": {"train": {}, "val": {}, "lr": {}}}
+    cur = None
+    seg_attempt = seg_start = None
     with open(raw_path, errors="replace") as f:
         for line in f:
+            if line.startswith("Script command line"):
+                seg_attempt = seg_start = None
+                cur = None
+                continue
+            if seg_attempt is None:
+                ma, ms = re_attempt.search(line), re_start.search(line)
+                if ma and ms:
+                    seg_attempt, seg_start = int(ma.group(1)), int(ms.group(1))
+                    if seg_attempt == 1 and seg_start == 1:
+                        cur = tls["scratch"]
+                    elif seg_attempt == 2:
+                        cur = tls["final"]
+                    else:
+                        cur = None          # attempt-1 resume detours: ignore
+                continue
+            if cur is None:
+                continue
             m = re_train.search(line)
             if m:
-                train[int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
+                cur["train"][int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
                 continue
             m = re_val.search(line)
             if m:
-                val[int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
+                cur["val"][int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
                 continue
             m = re_lr.search(line)
             if m:
-                lr_last[int(m.group(1))] = float(m.group(2))
-    epochs = sorted(val)
-    n = len(epochs)
-    assert n > 0, "no validation lines found"
+                cur["lr"][int(m.group(1))] = float(m.group(2))
 
     os.makedirs(out_dir, exist_ok=True)
-    metrics_path = os.path.join(out_dir, f"{MNV1_IMGCLSMOB_TAG}_metrics.jsonl")
-    best = 0.0
-    with open(metrics_path, "w") as mf:
-        for e in epochs:
-            err1, err5 = val[e]
-            val_acc = 1.0 - err1
-            best = max(best, val_acc)
-            rec = {
-                "arm": "reference_thirdparty",
-                "epoch": e,
-                "epochs": n,
-                "val_acc": round(val_acc, 6),
-                "val_top5": round(1.0 - err5, 6),
-                "best_val_acc": round(best, 6),
-                "lr": lr_last.get(e),
-            }
-            if e in train:
-                rec["train_acc"] = round(1.0 - train[e][0], 6)
-                rec["train_loss"] = round(train[e][1], 6)
-            mf.write(json.dumps(rec) + "\n")
+
+    def emit(tl, path, arm):
+        epochs = sorted(tl["val"])
+        assert epochs, f"no validation lines for {path}"
+        n = len(epochs)
+        best = 0.0
+        with open(path, "w") as mf:
+            for e in epochs:
+                err1, err5 = tl["val"][e]
+                val_acc = 1.0 - err1
+                best = max(best, val_acc)
+                rec = {"arm": arm, "epoch": e, "epochs": n,
+                       "val_acc": round(val_acc, 6), "val_top5": round(1.0 - err5, 6),
+                       "best_val_acc": round(best, 6), "lr": tl["lr"].get(e)}
+                if e in tl["train"]:
+                    rec["train_acc"] = round(1.0 - tl["train"][e][0], 6)
+                    rec["train_loss"] = round(tl["train"][e][1], 6)
+                mf.write(json.dumps(rec) + "\n")
+        return n, best
+
+    final_path = os.path.join(out_dir, f"{MNV1_IMGCLSMOB_TAG}_metrics.jsonl")
+    n_f, best_f = emit(tls["final"], final_path, "reference_thirdparty")
+    scratch_path = os.path.join(out_dir, f"{MNV1_IMGCLSMOB_TAG}_scratch61_metrics.jsonl")
+    n_s, best_s = emit(tls["scratch"], scratch_path, "reference_thirdparty_scratch")
 
     run_path = os.path.join(out_dir, f"{MNV1_IMGCLSMOB_TAG}_run.json")
     run = {
@@ -321,29 +357,35 @@ def convert_mnv1_imgclsmob(raw_path, out_dir):
         "status": "reference_nonofficial_recipe",
         "source": MNV1_IMGCLSMOB_SOURCE,
         "note": "ONLY published per-epoch MNv1 curve anywhere (imgclsmob, Gluon/MXNet, 2018). "
-                "STRONGER recipe than official paper -> 73.57% vs official 70.6-70.9. Our "
-                "MNv2-style repro run targets the official anchor (mnv1_official_anchor_run"
-                ".json); use this curve for shape/sanity only (e.g. what epoch crosses 60/70%).",
+                "STRONGER recipe than official paper -> 73.6 vs official 70.6-70.9. Release "
+                "log = 7 concatenated attempts; main metrics.jsonl = attempt-2 timeline "
+                "(200ep cosine WARM-STARTED from a 59-epoch ckpt -> its epoch 1 val is "
+                "already 0.647, NOT scratch!). For early-epoch scratch comparison use "
+                "_scratch61_metrics.jsonl (attempt-1 true scratch, E1-61, val 0.019 -> "
+                "0.562). Our MNv2-style repro targets the official anchor "
+                "(mnv1_official_anchor_run.json); these curves are shape/sanity only.",
         "pre_train_val_acc": None,
-        "best_val_acc": round(best, 6),
+        "best_val_acc": round(best_f, 6),
+        "scratch_prefix": {"epochs": n_s, "best_val_acc": round(best_s, 6)},
         "config": {
             "model": "mobilenet_w1",
             "dataset": "imagenet1k",
             "lr": 0.5,
-            "schedule": "cosine, 5ep warmup",
+            "schedule": "cosine, 5ep warmup; attempt-2 = fresh 200ep cosine from warm start",
             "optimizer": "nag (nesterov sgd)",
             "momentum": 0.9,
             "weight_decay": 1e-4,
             "wd_excludes": "bn gamma/beta + bias",
             "label_smoothing": True,
             "batch_size": 1120,
-            "epochs": n,
+            "epochs": n_f,
         },
     }
     with open(run_path, "w") as rf:
         json.dump(run, rf, indent=2)
-    print(f"wrote {metrics_path} ({n} epochs)")
-    print(f"wrote {run_path}  best_val_acc={best:.4f} (third-party recipe)")
+    print(f"wrote {final_path} ({n_f} epochs, attempt-2 warm-start timeline)")
+    print(f"wrote {scratch_path} ({n_s} epochs, attempt-1 true scratch)")
+    print(f"wrote {run_path}  final best={best_f:.4f}, scratch-prefix best={best_s:.4f}")
 
 
 def write_mnv1_anchor(out_dir):
