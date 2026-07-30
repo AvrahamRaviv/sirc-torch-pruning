@@ -34,6 +34,10 @@ CONVNEXT_SOURCE = ("https://download.openmmlab.com/mmclassification/v0/convnext/
                    "convnext-tiny_32xb128_in1k_20221207-998cf3e9.json")
 CONVNEXT_TAG = "convnext_t_official_mmpretrain"
 
+MNV1_IMGCLSMOB_SOURCE = ("https://github.com/osmr/imgclsmob/releases/download/v0.0.155/"
+                         "mobilenet_w1-0865-eafd91e9.params.log")
+MNV1_IMGCLSMOB_TAG = "mnv1_imgclsmob_train"
+
 
 def convert_r50(raw_path, out_dir):
     val_recs = []
@@ -255,6 +259,93 @@ def convert_convnext(raw_path, out_dir):
     print(f"wrote {run_path}  best_val_acc={best:.4f} (EMA-evaluated)")
 
 
+def convert_mnv1_imgclsmob(raw_path, out_dir):
+    """imgclsmob (osmr) MobileNet-w1 Gluon training log — the ONLY published per-epoch MNv1
+    curve found anywhere. NOT the official recipe: NAG SGD lr 0.5 cosine 210ep, effective
+    bs 1120 (224 x batch-size-scale 5), label smoothing, 5ep warmup, no WD on bn/bias ->
+    73.57% top-1 (official paper recipe lands 70.6-70.9). Use as a SHAPE/sanity reference
+    for a stronger recipe, not as the target of our MNv2-style repro run.
+
+    Log format (text): per-epoch triplet
+        [Epoch N] speed: ...
+        [Epoch N] training: err-top1=X loss=Y
+        [Epoch N] validation: err-top1=X err-top5=Y
+    plus batch lines "Epoch[N] Batch [k] ... lr=Z" (we keep the LAST lr seen per epoch)."""
+    import re
+    re_train = re.compile(r"\[Epoch (\d+)\] training: err-top1=([\d.]+)\s+loss=([\d.]+)")
+    re_val = re.compile(r"\[Epoch (\d+)\] validation: err-top1=([\d.]+)\s+err-top5=([\d.]+)")
+    re_lr = re.compile(r"Epoch\[(\d+)\].*\blr=([\d.eE+-]+)")
+    train, val, lr_last = {}, {}, {}
+    with open(raw_path, errors="replace") as f:
+        for line in f:
+            m = re_train.search(line)
+            if m:
+                train[int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
+                continue
+            m = re_val.search(line)
+            if m:
+                val[int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
+                continue
+            m = re_lr.search(line)
+            if m:
+                lr_last[int(m.group(1))] = float(m.group(2))
+    epochs = sorted(val)
+    n = len(epochs)
+    assert n > 0, "no validation lines found"
+
+    os.makedirs(out_dir, exist_ok=True)
+    metrics_path = os.path.join(out_dir, f"{MNV1_IMGCLSMOB_TAG}_metrics.jsonl")
+    best = 0.0
+    with open(metrics_path, "w") as mf:
+        for e in epochs:
+            err1, err5 = val[e]
+            val_acc = 1.0 - err1
+            best = max(best, val_acc)
+            rec = {
+                "arm": "reference_thirdparty",
+                "epoch": e,
+                "epochs": n,
+                "val_acc": round(val_acc, 6),
+                "val_top5": round(1.0 - err5, 6),
+                "best_val_acc": round(best, 6),
+                "lr": lr_last.get(e),
+            }
+            if e in train:
+                rec["train_acc"] = round(1.0 - train[e][0], 6)
+                rec["train_loss"] = round(train[e][1], 6)
+            mf.write(json.dumps(rec) + "\n")
+
+    run_path = os.path.join(out_dir, f"{MNV1_IMGCLSMOB_TAG}_run.json")
+    run = {
+        "arm": "reference_thirdparty",
+        "status": "reference_nonofficial_recipe",
+        "source": MNV1_IMGCLSMOB_SOURCE,
+        "note": "ONLY published per-epoch MNv1 curve anywhere (imgclsmob, Gluon/MXNet, 2018). "
+                "STRONGER recipe than official paper -> 73.57% vs official 70.6-70.9. Our "
+                "MNv2-style repro run targets the official anchor (mnv1_official_anchor_run"
+                ".json); use this curve for shape/sanity only (e.g. what epoch crosses 60/70%).",
+        "pre_train_val_acc": None,
+        "best_val_acc": round(best, 6),
+        "config": {
+            "model": "mobilenet_w1",
+            "dataset": "imagenet1k",
+            "lr": 0.5,
+            "schedule": "cosine, 5ep warmup",
+            "optimizer": "nag (nesterov sgd)",
+            "momentum": 0.9,
+            "weight_decay": 1e-4,
+            "wd_excludes": "bn gamma/beta + bias",
+            "label_smoothing": True,
+            "batch_size": 1120,
+            "epochs": n,
+        },
+    }
+    with open(run_path, "w") as rf:
+        json.dump(run, rf, indent=2)
+    print(f"wrote {metrics_path} ({n} epochs)")
+    print(f"wrote {run_path}  best_val_acc={best:.4f} (third-party recipe)")
+
+
 def write_mnv1_anchor(out_dir):
     """MobileNetV1: NO official per-epoch log exists anywhere (paper=TF internal, TF-slim
     publishes final ckpt only 70.9%, mmpretrain has no V1, timm publishes no logs). Emit a
@@ -294,9 +385,11 @@ def main(argv):
     ap = argparse.ArgumentParser(description="official log -> ExpHandler reference pair")
     ap.add_argument("raw_json", nargs="?", default=None,
                     help="downloaded mmcls/mmpretrain log json (not needed for mnv1_anchor)")
-    ap.add_argument("--model", default="r50", choices=["r50", "mnv2", "convnext", "mnv1_anchor"],
+    ap.add_argument("--model", default="r50",
+                    choices=["r50", "mnv2", "convnext", "mnv1_anchor", "mnv1_imgclsmob"],
                     help="r50/convnext = per-epoch VAL (mmpretrain); mnv2 = per-epoch TRAIN-only "
-                         "(mmcls); mnv1_anchor = run.json only (no log exists)")
+                         "(mmcls); mnv1_anchor = run.json only (no official log exists); "
+                         "mnv1_imgclsmob = third-party per-epoch curve (stronger recipe, 73.57%)")
     ap.add_argument("--out_dir", default=os.path.dirname(os.path.abspath(__file__)))
     a = ap.parse_args(argv[1:])
     if a.model == "mnv1_anchor":
@@ -307,6 +400,8 @@ def main(argv):
         convert_r50(a.raw_json, a.out_dir)
     elif a.model == "convnext":
         convert_convnext(a.raw_json, a.out_dir)
+    elif a.model == "mnv1_imgclsmob":
+        convert_mnv1_imgclsmob(a.raw_json, a.out_dir)
     else:
         convert_mnv2(a.raw_json, a.out_dir)
 
