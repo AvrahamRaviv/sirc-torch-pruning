@@ -396,7 +396,10 @@ def load_model(args, device):
             model_fn = convnext_tiny
             log_info(f"Unknown ConvNeXt variant '{args.model_name}', defaulting to tiny")
 
-        model = model_fn(pretrained=False)
+        dp = float(getattr(args, "drop_path", 0.0) or 0.0)
+        model = model_fn(pretrained=False, drop_path_rate=dp)
+        if dp > 0:
+            log_info(f"ConvNeXt drop_path_rate={dp} (stochastic depth)")
         ckpt = checkpoint or args.model_name
         if os.path.exists(ckpt):
             state = torch.load(ckpt, map_location="cpu", weights_only=True)
@@ -425,8 +428,14 @@ def load_model(args, device):
         ckpt = checkpoint or args.model_name
         has_file = bool(ckpt) and os.path.isfile(ckpt)
         # Offline clusters: build the arch WITHOUT downloading, then load explicit weights from a
-        # .safetensors / .pth file. With no file (local, HF cache present) fall back to timm pretrained.
-        model = timm.create_model("mobilenetv1_100", pretrained=not has_file)
+        # .safetensors / .pth file. With no file (local, HF cache present) fall back to timm
+        # pretrained — unless --random_init (from-scratch training; also the only option on an
+        # offline cluster with no HF cache).
+        random_init = bool(getattr(args, "random_init", False))
+        model = timm.create_model("mobilenetv1_100",
+                                  pretrained=(not has_file) and not random_init)
+        if random_init and not has_file:
+            log_info("mobilenet_v1: RANDOM INIT (--random_init, from scratch)")
         if has_file:
             if ckpt.endswith(".safetensors"):
                 from safetensors.torch import load_file

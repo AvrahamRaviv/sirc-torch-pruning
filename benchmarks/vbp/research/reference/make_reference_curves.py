@@ -30,6 +30,10 @@ MNV2_SOURCE = ("https://download.openmmlab.com/mmclassification/v0/mobilenet_v2/
                "mobilenet_v2_batch256_imagenet_20200708-3b2dc3af.json")
 MNV2_TAG = "mnv2_official_mmcls_train"
 
+CONVNEXT_SOURCE = ("https://download.openmmlab.com/mmclassification/v0/convnext/"
+                   "convnext-tiny_32xb128_in1k_20221207-998cf3e9.json")
+CONVNEXT_TAG = "convnext_t_official_mmpretrain"
+
 
 def convert_r50(raw_path, out_dir):
     val_recs = []
@@ -173,15 +177,136 @@ def convert_mnv2(raw_path, out_dir):
           f"ep{epochs[-1]} train_loss={sum(loss[epochs[-1]])/len(loss[epochs[-1]]):.4f}")
 
 
+def convert_convnext(raw_path, out_dir):
+    """ConvNeXt-T mmpretrain log (mmengine format, 2022-12): train lines
+    {"lr","loss","epoch","step"} every 100 steps + ONE val line {"accuracy/top1","accuracy/top5",
+    "step"} per epoch where "step" = epoch number. CAVEAT baked into the note: the published
+    per-epoch val is EMA-evaluated — near-zero until ~e40, crosses 50% ~e70; a raw-model curve
+    climbs much faster early. Don't panic-compare early epochs; shape + final (82.16) are the
+    anchors."""
+    val = {}                                  # epoch -> (top1, top5)
+    loss, lr_last = defaultdict(list), {}
+    with open(raw_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            if "accuracy/top1" in r:
+                val[int(r["step"])] = (r["accuracy/top1"], r.get("accuracy/top5"))
+            elif "loss" in r and "epoch" in r:
+                e = int(r["epoch"])
+                loss[e].append(r["loss"])
+                lr_last[e] = r.get("lr")
+    epochs = sorted(val)
+    n = len(epochs)
+    assert n > 0, "no accuracy/top1 lines found"
+
+    os.makedirs(out_dir, exist_ok=True)
+    metrics_path = os.path.join(out_dir, f"{CONVNEXT_TAG}_metrics.jsonl")
+    best = 0.0
+    with open(metrics_path, "w") as mf:
+        for e in epochs:
+            top1, top5 = val[e]
+            val_acc = top1 / 100.0
+            best = max(best, val_acc)
+            rec = {
+                "arm": "reference",
+                "epoch": e,
+                "epochs": n,
+                "val_acc": round(val_acc, 6),        # NOTE: EMA-evaluated (see run.json note)
+                "val_top5": round(top5 / 100.0, 6) if top5 is not None else None,
+                "best_val_acc": round(best, 6),
+                "lr": lr_last.get(e),
+            }
+            if loss.get(e):
+                rec["train_loss"] = round(sum(loss[e]) / len(loss[e]), 6)
+            mf.write(json.dumps(rec) + "\n")
+
+    run_path = os.path.join(out_dir, f"{CONVNEXT_TAG}_run.json")
+    run = {
+        "arm": "reference",
+        "status": "reference",
+        "source": CONVNEXT_SOURCE,
+        "note": "per-epoch val is EMA-evaluated: near-zero until ~e40 (e30 0.6%, e50 9.5%), "
+                "e100 73.3%, e200 80.9%, final 82.16%. A raw-model (non-EMA) curve climbs much "
+                "faster early — compare SHAPE mid/late + final, not early epochs. train_loss is "
+                "the raw-model signal and IS comparable per-epoch.",
+        "pre_train_val_acc": None,
+        "best_val_acc": round(best, 6),
+        "config": {
+            "model": "convnext_tiny",
+            "dataset": "imagenet1k",
+            "lr": 4e-3,
+            "schedule": "cosine, 20ep linear warmup",
+            "optimizer": "adamw",
+            "weight_decay": 0.05,
+            "batch_size": 4096,
+            "epochs": n,
+            "extras_not_in_our_trainer": ["mixup 0.8", "cutmix 1.0", "randaug(9,0.5)",
+                                          "label_smoothing 0.1", "EMA 0.9999",
+                                          "layer-wise LR decay: none", "drop_path 0.1 (we HAVE "
+                                          "--drop_path)"],
+        },
+    }
+    with open(run_path, "w") as rf:
+        json.dump(run, rf, indent=2)
+    print(f"wrote {metrics_path} ({n} epochs)")
+    print(f"wrote {run_path}  best_val_acc={best:.4f} (EMA-evaluated)")
+
+
+def write_mnv1_anchor(out_dir):
+    """MobileNetV1: NO official per-epoch log exists anywhere (paper=TF internal, TF-slim
+    publishes final ckpt only 70.9%, mmpretrain has no V1, timm publishes no logs). Emit a
+    run.json anchor (no metrics.jsonl) so the comparison target is recorded: final-only,
+    like MNv2 val."""
+    run_path = os.path.join(out_dir, "mnv1_official_anchor_run.json")
+    run = {
+        "arm": "reference",
+        "status": "reference_final_only",
+        "source": "paper arXiv:1704.04861 (70.6%); TF-slim ckpt mobilenet_v1_1.0_224 (70.9%)",
+        "note": "NO per-epoch curve published anywhere for MNv1 — verify from-scratch control "
+                "on the FINAL number only (70.6-70.9). Recipe per paper = 'RMSprop, like "
+                "Inception V3, less regularization'; the concrete MobileNet-family recipe "
+                "(lr 0.045, x0.98/epoch, wd 4e-5, momentum 0.9) is the V2-paper restatement "
+                "of the same setup — our SGD port of it matches the MNv2 baseline_repro run.",
+        "final_val_anchor": 0.709,
+        "config": {
+            "model": "mobilenet_v1_1.0_224",
+            "dataset": "imagenet1k",
+            "lr": 0.045,
+            "schedule": "step x0.98 every epoch",
+            "lr_step_size": 1,
+            "lr_gamma": 0.98,
+            "optimizer": "rmsprop (ours: sgd)",
+            "momentum": 0.9,
+            "weight_decay": 4e-5,
+            "batch_size": 256,
+            "epochs": 300,
+        },
+    }
+    with open(run_path, "w") as rf:
+        json.dump(run, rf, indent=2)
+    print(f"wrote {run_path} (final-only anchor 0.709, no metrics.jsonl — none published)")
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description="official log -> ExpHandler reference pair")
-    ap.add_argument("raw_json", help="downloaded mmcls/mmpretrain log json")
-    ap.add_argument("--model", default="r50", choices=["r50", "mnv2"],
-                    help="r50 = per-epoch VAL (mmpretrain); mnv2 = per-epoch TRAIN-only (mmcls)")
+    ap.add_argument("raw_json", nargs="?", default=None,
+                    help="downloaded mmcls/mmpretrain log json (not needed for mnv1_anchor)")
+    ap.add_argument("--model", default="r50", choices=["r50", "mnv2", "convnext", "mnv1_anchor"],
+                    help="r50/convnext = per-epoch VAL (mmpretrain); mnv2 = per-epoch TRAIN-only "
+                         "(mmcls); mnv1_anchor = run.json only (no log exists)")
     ap.add_argument("--out_dir", default=os.path.dirname(os.path.abspath(__file__)))
     a = ap.parse_args(argv[1:])
+    if a.model == "mnv1_anchor":
+        write_mnv1_anchor(a.out_dir)
+        return
+    assert a.raw_json, "raw_json required for this model"
     if a.model == "r50":
         convert_r50(a.raw_json, a.out_dir)
+    elif a.model == "convnext":
+        convert_convnext(a.raw_json, a.out_dir)
     else:
         convert_mnv2(a.raw_json, a.out_dir)
 

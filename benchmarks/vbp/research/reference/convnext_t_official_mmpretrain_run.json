@@ -1,0 +1,27 @@
+{
+  "arm": "reference",
+  "status": "reference",
+  "source": "https://download.openmmlab.com/mmclassification/v0/convnext/convnext-tiny_32xb128_in1k_20221207-998cf3e9.json",
+  "note": "per-epoch val is EMA-evaluated: near-zero until ~e40 (e30 0.6%, e50 9.5%), e100 73.3%, e200 80.9%, final 82.16%. A raw-model (non-EMA) curve climbs much faster early \u2014 compare SHAPE mid/late + final, not early epochs. train_loss is the raw-model signal and IS comparable per-epoch.",
+  "pre_train_val_acc": null,
+  "best_val_acc": 0.82158,
+  "config": {
+    "model": "convnext_tiny",
+    "dataset": "imagenet1k",
+    "lr": 0.004,
+    "schedule": "cosine, 20ep linear warmup",
+    "optimizer": "adamw",
+    "weight_decay": 0.05,
+    "batch_size": 4096,
+    "epochs": 300,
+    "extras_not_in_our_trainer": [
+      "mixup 0.8",
+      "cutmix 1.0",
+      "randaug(9,0.5)",
+      "label_smoothing 0.1",
+      "EMA 0.9999",
+      "layer-wise LR decay: none",
+      "drop_path 0.1 (we HAVE --drop_path)"
+    ]
+  }
+}

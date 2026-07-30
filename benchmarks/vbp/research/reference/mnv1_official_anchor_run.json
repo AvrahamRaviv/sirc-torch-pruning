@@ -1,0 +1,20 @@
+{
+  "arm": "reference",
+  "status": "reference_final_only",
+  "source": "paper arXiv:1704.04861 (70.6%); TF-slim ckpt mobilenet_v1_1.0_224 (70.9%)",
+  "note": "NO per-epoch curve published anywhere for MNv1 \u2014 verify from-scratch control on the FINAL number only (70.6-70.9). Recipe per paper = 'RMSprop, like Inception V3, less regularization'; the concrete MobileNet-family recipe (lr 0.045, x0.98/epoch, wd 4e-5, momentum 0.9) is the V2-paper restatement of the same setup \u2014 our SGD port of it matches the MNv2 baseline_repro run.",
+  "final_val_anchor": 0.709,
+  "config": {
+    "model": "mobilenet_v1_1.0_224",
+    "dataset": "imagenet1k",
+    "lr": 0.045,
+    "schedule": "step x0.98 every epoch",
+    "lr_step_size": 1,
+    "lr_gamma": 0.98,
+    "optimizer": "rmsprop (ours: sgd)",
+    "momentum": 0.9,
+    "weight_decay": 4e-05,
+    "batch_size": 256,
+    "epochs": 300
+  }
+}

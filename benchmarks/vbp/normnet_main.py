@@ -1344,6 +1344,13 @@ def parse_args(argv):
     p.add_argument("--load_raw", action="store_true",
                    help="when --checkpoint is a bundle, load the raw (trajectory-endpoint) "
                         "model instead of the EMA (default: EMA, the deployable one)")
+    p.add_argument("--random_init", action="store_true", default=False,
+                   help="force random init when no --checkpoint (skips the timm-pretrained "
+                        "fallback of timm-built archs, e.g. mobilenet_v1) — required for "
+                        "from-scratch training of those archs")
+    p.add_argument("--drop_path", type=float, default=0.0,
+                   help="ConvNeXt stochastic depth rate (official ConvNeXt-T recipe: 0.1). "
+                        "0 = off (backcompat); ignored by non-convnext models")
     p.add_argument("--data_path", required=True)
     p.add_argument("--exclude_stem", action="store_true")
     p.add_argument("--interior_only", action="store_true",
