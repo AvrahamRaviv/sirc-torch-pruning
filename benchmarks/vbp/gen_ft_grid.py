@@ -23,6 +23,7 @@ DATA_PATH = "/algo/NetOptimization/outputs/VBP/"
 NGPU = 4                       # FT is train-heavy -> 4 GPUs
 TRAIN_BS = 64                  # per-GPU; 64 x 4 = 256 effective = the recipe batch (no LR rescale)
 CALIB_BATCHES = 200            # scorer cov/var calibration (200 ~= 5000 in rank; 5000 wastes ~1h)
+RECALIB_BATCHES = 50           # post-prune BN recalibration (no-grad re-estimation; no-op on LN/convnext)
 USE_KD = True                  # KD on (user choice; teacher = the dense --model_name)
 
 # ------------------------------------------------------------------ per-arch config
@@ -80,7 +81,7 @@ SCORERS = {
 def core_flags(a):
     """Flags common to every cell: prune protocol B_native (mean-fold, no recalib) + FT scaffolding."""
     f = ["--global_pruning", "--reparam_variant", "mean", "--bias_comp",
-         "--no_bn_recalib", "--skip_norm_eval",
+         "--recalib_batches", str(RECALIB_BATCHES), "--skip_norm_eval",
          "--calib_batches", str(CALIB_BATCHES),
          "--epochs_train", "0", "--epochs_norm_ft", "0",
          "--imp_normalizer", "width",
@@ -97,7 +98,7 @@ def core_flags(a):
 def build_sh(arch, scorer):
     a = ARCHS[arch]
     save_dir = os.path.join(a["root"], scorer)
-    tag = f"{arch}__ft__{scorer}"
+    tag = f"{arch}_ft_{scorer}"
     flags = ["--model_type", a["model_type"], "--cnn_arch", a["cnn_arch"],
              "--model_name", os.path.join(a["root"], a["ckpt"]),
              "--data_path", DATA_PATH,
