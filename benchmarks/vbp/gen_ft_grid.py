@@ -59,8 +59,10 @@ ARCHS = {
     "mobilenet_v1": dict(
         root="/algo/NetOptimization/outputs/NORMNET/MNv1",
         ckpt="mobilenet_v1.safetensors", model_type="cnn", cnn_arch="mobilenet_v1",
-        val_resize=256, mac=0.47, cap="0.8",
-        recipe=["--opt", "sgd", "--epochs_ft", "150", "--lr_ft", "0.05",
+        val_resize=256, mac=0.391, cap="0.8",   # 0.391/0.584 dense = 67% kept (matches retention table)
+        # pre-FT already ~0.65 -> finetune (recover), NOT scratch-retrain. lr0.05 blew up step 1
+        # (loss 1.9->6.4, val->chance). lr0.01 = 5x gentler, no warmup needed; 90ep enough to recover.
+        recipe=["--opt", "sgd", "--epochs_ft", "90", "--lr_ft", "0.01",
                 "--lr_schedule", "cosine", "--ft_eta_min", "1e-6",
                 "--wd", "4e-5", "--momentum", "0.9"]),
 }
