@@ -91,6 +91,12 @@ def core_flags(a):
          "--train_batch_size", str(TRAIN_BS)]
     if a["cap"]:
         f += ["--max_prune_ratio", a["cap"]]
+    # BN-free FT: after recalib seeds correct running stats, fold Conv->BN into the conv weight
+    # (function-preserving) so FT has NO live BN to drift. Fixes the MNv1 train-good/eval-chance
+    # collapse (live BN momentum 0.1 drags depthwise running_var -> eval explodes). Does NOT touch
+    # the prune/scorer (unlike --fold_native_bn). CNN-only; convnext=LayerNorm (no Conv-BN, no-op).
+    if a["model_type"] == "cnn":
+        f += ["--fold_after_recalib"]
     if USE_KD:
         alpha, T = a.get("kd", ("0.5", "2.0"))          # per-arch KD; convnext = (0.0, 4.0)
         f += ["--use_kd", "--kd_alpha", alpha, "--kd_T", T]
