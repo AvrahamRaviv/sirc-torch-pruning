@@ -1285,21 +1285,27 @@ def main(argv):
                 log_info("BN recalibration done")
             log_info(f"fold_native_bn: reinserted {n_re} fresh BN (no-prune path, pre-FT)")
 
-    # Pin surviving native BN running stats (momentum→0) so FT can't drift them. See flag help:
-    # mean-reparam leaves some BatchNormAct2d live (predecessor is MeanResidualConv2d, so neither
-    # folded nor reparam'd); default momentum 0.1 drifts their depthwise running_var → eval→chance
-    # though train looks healthy. Freeze at the recalibrated-good values. Log types+count (also
-    # confirms the diagnosis: 0 frozen ⇒ collapse is NOT native-BN drift, look elsewhere).
+    # Freeze surviving native BN during FT via STICKY EVAL MODE (not just momentum→0). mean-reparam
+    # leaves some BatchNormAct2d live (predecessor is MeanResidualConv2d → neither folded nor
+    # reparam'd). The killer is train-vs-eval NORMALIZATION mismatch: in train mode BN normalizes by
+    # BATCH stats, in eval by running stats. momentum→0 alone does NOT fix it — FT still adapts the
+    # weights to batch-normalization while eval uses the (clean) running stats → eval collapses to
+    # chance though train looks healthy. Fix: force each BN to eval() AND override its .train() to a
+    # no-op so the per-epoch model.train() can't flip it back → BN uses the recalibrated-good running
+    # stats in BOTH train and eval → train forward ≡ eval forward (verified: Δlogit 0.137→0.000).
+    # The rest of the net still trains normally. Log count+types (0 ⇒ collapse is NOT BN, look else).
     if getattr(args, "freeze_bn_ft", False):
-        import torch.nn as _nn
+        import types as _types, torch.nn as _nn
         from collections import Counter as _Counter
         _frozen = []
         for _m in model.modules():
             if isinstance(_m, _nn.modules.batchnorm._BatchNorm):
                 _m.momentum = 0.0
+                _m.eval()
+                _m.train = _types.MethodType(lambda self, mode=True: self, _m)  # sticky eval
                 _frozen.append(type(_m).__name__)
-        log_info(f"freeze_bn_ft: pinned {len(_frozen)} BN running-stat trackers (momentum→0) "
-                 f"for FT: {dict(_Counter(_frozen))}")
+        log_info(f"freeze_bn_ft: {len(_frozen)} BN forced to sticky-eval (running stats in "
+                 f"train+eval, momentum→0) for FT: {dict(_Counter(_frozen))}")
 
     # -- 4. FINE-TUNE (plain post-prune / post-normalize recovery) ----------------------
     best = _run_phase(model, None, loaders, args, device, use_ddp,
