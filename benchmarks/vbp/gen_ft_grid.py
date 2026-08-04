@@ -93,11 +93,6 @@ def core_flags(a):
          "--train_batch_size", str(TRAIN_BS)]
     if a["cap"]:
         f += ["--max_prune_ratio", a["cap"]]
-    # NOTE: --freeze_bn_ft intentionally NOT emitted. Local repro showed sticky-eval freezing BLOCKS
-    # learning (net stuck at majority class), and the local toy could not reproduce the cluster
-    # collapse at all (it never prunes → no degenerate channels). The MNv1 collapse is still
-    # undiagnosed; use --diag_bn_modes (BN eval vs batch-stat pre-FT acc) to settle BN-vs-FT-dynamics
-    # before committing a fix. The flag remains in normnet_main (default-off) for that investigation.
     if USE_KD:
         alpha, T = a.get("kd", ("0.5", "2.0"))          # per-arch KD; convnext = (0.0, 4.0)
         f += ["--use_kd", "--kd_alpha", alpha, "--kd_T", T]
