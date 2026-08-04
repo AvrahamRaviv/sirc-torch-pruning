@@ -1285,6 +1285,22 @@ def main(argv):
                 log_info("BN recalibration done")
             log_info(f"fold_native_bn: reinserted {n_re} fresh BN (no-prune path, pre-FT)")
 
+    # Pin surviving native BN running stats (momentum→0) so FT can't drift them. See flag help:
+    # mean-reparam leaves some BatchNormAct2d live (predecessor is MeanResidualConv2d, so neither
+    # folded nor reparam'd); default momentum 0.1 drifts their depthwise running_var → eval→chance
+    # though train looks healthy. Freeze at the recalibrated-good values. Log types+count (also
+    # confirms the diagnosis: 0 frozen ⇒ collapse is NOT native-BN drift, look elsewhere).
+    if getattr(args, "freeze_bn_ft", False):
+        import torch.nn as _nn
+        from collections import Counter as _Counter
+        _frozen = []
+        for _m in model.modules():
+            if isinstance(_m, _nn.modules.batchnorm._BatchNorm):
+                _m.momentum = 0.0
+                _frozen.append(type(_m).__name__)
+        log_info(f"freeze_bn_ft: pinned {len(_frozen)} BN running-stat trackers (momentum→0) "
+                 f"for FT: {dict(_Counter(_frozen))}")
+
     # -- 4. FINE-TUNE (plain post-prune / post-normalize recovery) ----------------------
     best = _run_phase(model, None, loaders, args, device, use_ddp,
                       epochs=args.epochs_ft, lr=args.lr_ft, tag="FINE-TUNE", teacher=teacher)
@@ -1405,6 +1421,14 @@ def parse_args(argv):
                         "BN-FREE net (folded scale baked into conv). Keeps the BN gain in the "
                         "propagation score WITHOUT the fresh-BN reset that hurts recovery. "
                         "No-op without --fold_native_bn.")
+    p.add_argument("--freeze_bn_ft", action="store_true",
+                   help="Pin every surviving native BN's running stats (momentum→0) right before "
+                        "FT. reparam(mean) turns scored convs into MeanResidualConv2d (BN-free), but "
+                        "native BN whose predecessor became MeanResidualConv2d are neither folded "
+                        "(fold_all_conv_bn needs an nn.Conv2d predecessor) nor reparam'd → they stay "
+                        "live and at default momentum 0.1 their (depthwise) running_var drifts tiny "
+                        "during FT → eval explodes to chance while train (batch stats) looks healthy. "
+                        "Freezing keeps eval on the recalibrated-good stats. Logs count+types frozen.")
     p.add_argument("--fold_after_recalib", action="store_true",
                    help="BN-free deployable export (var_comp form (b), measure-pass source): AFTER "
                         "BN recalibration (correct running stats), fold Conv->BN into the conv "

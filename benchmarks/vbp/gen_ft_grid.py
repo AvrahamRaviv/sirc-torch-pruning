@@ -91,12 +91,14 @@ def core_flags(a):
          "--train_batch_size", str(TRAIN_BS)]
     if a["cap"]:
         f += ["--max_prune_ratio", a["cap"]]
-    # BN-free FT: after recalib seeds correct running stats, fold Conv->BN into the conv weight
-    # (function-preserving) so FT has NO live BN to drift. Fixes the MNv1 train-good/eval-chance
-    # collapse (live BN momentum 0.1 drags depthwise running_var -> eval explodes). Does NOT touch
-    # the prune/scorer (unlike --fold_native_bn). CNN-only; convnext=LayerNorm (no Conv-BN, no-op).
+    # Freeze surviving native BN during FT. reparam(mean) turns scored convs into MeanResidualConv2d
+    # (BN-free), but native BatchNormAct2d whose predecessor became MeanResidualConv2d stay live
+    # (fold_all_conv_bn needs an nn.Conv2d predecessor -> folds 0; recalib still seeds them good).
+    # At default momentum 0.1 their depthwise running_var drifts tiny in FT -> eval collapses to
+    # chance while train (batch stats) looks healthy. momentum->0 pins eval on the recalib-good
+    # stats. CNN-only; convnext=LayerNorm (no BN, no-op). Log line reports how many were frozen.
     if a["model_type"] == "cnn":
-        f += ["--fold_after_recalib"]
+        f += ["--freeze_bn_ft"]
     if USE_KD:
         alpha, T = a.get("kd", ("0.5", "2.0"))          # per-arch KD; convnext = (0.0, 4.0)
         f += ["--use_kd", "--kd_alpha", alpha, "--kd_T", T]
