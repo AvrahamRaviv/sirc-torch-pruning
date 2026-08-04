@@ -60,11 +60,12 @@ ARCHS = {
         root="/algo/NetOptimization/outputs/NORMNET/MNv1",
         ckpt="mobilenet_v1.safetensors", model_type="cnn", cnn_arch="mobilenet_v1",
         val_resize=256, mac=0.391, cap="0.8",   # 0.391/0.584 dense = 67% kept (matches retention table)
-        # pre-FT already ~0.50 -> finetune (recover), NOT scratch-retrain. lr0.05 blew up step 1;
-        # lr0.01 trained healthy but eval collapsed to chance (still undiagnosed). Local toy showed
-        # even a PLAIN net collapses at lr0.01 but trains at lr0.001 -> drop to lr0.001 for the
-        # epoch-1 diagnostic probe (raise later once the collapse cause is confirmed).
-        recipe=["--opt", "sgd", "--epochs_ft", "90", "--lr_ft", "0.001",
+        # pre-FT already ~0.50 -> finetune (recover), NOT scratch-retrain. Eval-collapse was the BN
+        # recalib-momentum bug (fixed 18cfc5f9), NOT lr. First healthy run (lr0.001, cosine90):
+        # cov/iter plateau ~0.70 by e12-15 -> 90ep wasteful, lr0.001 crawls early. Now: lr0.008
+        # (higher peak = steeper early climb, cosine lands soft), 30ep (3x cheaper; tail still lets
+        # slower scorers nci/vbp finish their climb). No warmup needed (recover start is stable).
+        recipe=["--opt", "sgd", "--epochs_ft", "30", "--lr_ft", "0.008",
                 "--lr_schedule", "cosine", "--ft_eta_min", "1e-6",
                 "--wd", "4e-5", "--momentum", "0.9"]),
 }
