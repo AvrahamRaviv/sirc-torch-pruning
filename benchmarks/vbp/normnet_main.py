@@ -1259,6 +1259,29 @@ def main(argv):
         tgt = f"mac={args.mac_target_g}G" if args.mac_target_g > 0 else f"ratio={args.pruning_ratio}"
         log_info(f"PRUNE ({args.scorer}, {tgt}): pre-FT acc={acc:.4f}  "
                  f"{pr_macs:.2f}G ({100*pr_macs/dense_macs:.0f}%) {pr_params:.2f}M params")
+        # DIAG: the FT eval-collapse question — does the pruned net lose accuracy when BN uses
+        # BATCH stats (train-mode forward) vs running stats (eval-mode)? Big gap ⇒ FT (which trains
+        # in BN-train-mode) adapts weights to batch-normalization that eval can't match ⇒ the
+        # collapse is BN batch-vs-running. Small gap ⇒ BN mode is fine, collapse is FT dynamics/lr.
+        # Sets ONLY BN modules to train() (isolates BN; dropout stays eval). No training. Pair with
+        # --epochs_ft 0 for a ~2-min answer.
+        if getattr(args, "diag_bn_modes", False):
+            import torch.nn as _nn
+            from vbp_common import forward_logits as _fwd
+            _bns = [m for m in model.modules() if isinstance(m, _nn.modules.batchnorm._BatchNorm)]
+            model.eval()
+            for m in _bns: m.train()                       # ONLY BN -> batch stats; rest stays eval
+            _c = _t = 0
+            with torch.no_grad():
+                for _img, _lab in val_loader:
+                    _img = _img.to(device, non_blocking=True); _lab = _lab.to(device, non_blocking=True)
+                    _c += (_fwd(model, _img, args.model_type).max(1)[1] == _lab).sum().item()
+                    _t += _lab.numel()
+            model.eval()                                   # restore
+            acc_bn_train = _c / max(_t, 1)
+            log_info(f"DIAG_BN_MODES: pre-FT acc  eval-mode(running)={acc:.4f}  "
+                     f"BN-train-mode(batch)={acc_bn_train:.4f}  Δ={acc-acc_bn_train:+.4f}  "
+                     f"({len(_bns)} BN) — big Δ ⇒ collapse is BN batch-vs-running")
         # Structured prune summary → dedicated <tag>_prune.json (NOT metrics.jsonl, which is
         # per-epoch only — an epochless record there breaks the curve parsers). Holds the
         # per-layer pruning ratios the user wants.
@@ -1427,6 +1450,13 @@ def parse_args(argv):
                         "BN-FREE net (folded scale baked into conv). Keeps the BN gain in the "
                         "propagation score WITHOUT the fresh-BN reset that hurts recovery. "
                         "No-op without --fold_native_bn.")
+    p.add_argument("--diag_bn_modes", action="store_true",
+                   help="Diagnostic: after pruning, log pre-FT accuracy with BN in eval-mode "
+                        "(running stats) vs BN-train-mode (batch stats). A big drop in BN-train-mode "
+                        "means FT (which trains in BN-train-mode) is adapting weights to a "
+                        "batch-normalization that eval can't reproduce → the eval-collapse is BN "
+                        "batch-vs-running. Small drop → BN mode is fine, look at FT dynamics/lr. "
+                        "No training; pair with --epochs_ft 0 for a ~2-min answer.")
     p.add_argument("--freeze_bn_ft", action="store_true",
                    help="Pin every surviving native BN's running stats (momentum→0) right before "
                         "FT. reparam(mean) turns scored convs into MeanResidualConv2d (BN-free), but "

@@ -60,9 +60,11 @@ ARCHS = {
         root="/algo/NetOptimization/outputs/NORMNET/MNv1",
         ckpt="mobilenet_v1.safetensors", model_type="cnn", cnn_arch="mobilenet_v1",
         val_resize=256, mac=0.391, cap="0.8",   # 0.391/0.584 dense = 67% kept (matches retention table)
-        # pre-FT already ~0.65 -> finetune (recover), NOT scratch-retrain. lr0.05 blew up step 1
-        # (loss 1.9->6.4, val->chance). lr0.01 = 5x gentler, no warmup needed; 90ep enough to recover.
-        recipe=["--opt", "sgd", "--epochs_ft", "90", "--lr_ft", "0.01",
+        # pre-FT already ~0.50 -> finetune (recover), NOT scratch-retrain. lr0.05 blew up step 1;
+        # lr0.01 trained healthy but eval collapsed to chance (still undiagnosed). Local toy showed
+        # even a PLAIN net collapses at lr0.01 but trains at lr0.001 -> drop to lr0.001 for the
+        # epoch-1 diagnostic probe (raise later once the collapse cause is confirmed).
+        recipe=["--opt", "sgd", "--epochs_ft", "90", "--lr_ft", "0.001",
                 "--lr_schedule", "cosine", "--ft_eta_min", "1e-6",
                 "--wd", "4e-5", "--momentum", "0.9"]),
 }
@@ -91,14 +93,11 @@ def core_flags(a):
          "--train_batch_size", str(TRAIN_BS)]
     if a["cap"]:
         f += ["--max_prune_ratio", a["cap"]]
-    # Freeze surviving native BN during FT. reparam(mean) turns scored convs into MeanResidualConv2d
-    # (BN-free), but native BatchNormAct2d whose predecessor became MeanResidualConv2d stay live
-    # (fold_all_conv_bn needs an nn.Conv2d predecessor -> folds 0; recalib still seeds them good).
-    # At default momentum 0.1 their depthwise running_var drifts tiny in FT -> eval collapses to
-    # chance while train (batch stats) looks healthy. momentum->0 pins eval on the recalib-good
-    # stats. CNN-only; convnext=LayerNorm (no BN, no-op). Log line reports how many were frozen.
-    if a["model_type"] == "cnn":
-        f += ["--freeze_bn_ft"]
+    # NOTE: --freeze_bn_ft intentionally NOT emitted. Local repro showed sticky-eval freezing BLOCKS
+    # learning (net stuck at majority class), and the local toy could not reproduce the cluster
+    # collapse at all (it never prunes → no degenerate channels). The MNv1 collapse is still
+    # undiagnosed; use --diag_bn_modes (BN eval vs batch-stat pre-FT acc) to settle BN-vs-FT-dynamics
+    # before committing a fix. The flag remains in normnet_main (default-off) for that investigation.
     if USE_KD:
         alpha, T = a.get("kd", ("0.5", "2.0"))          # per-arch KD; convnext = (0.0, 4.0)
         f += ["--use_kd", "--kd_alpha", alpha, "--kd_T", T]
