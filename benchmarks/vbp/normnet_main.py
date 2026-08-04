@@ -742,7 +742,10 @@ def main(argv):
 
     loaders = build_dataloaders(args, use_ddp=use_ddp)
     train_loader, val_loader, _ = loaders
-    had_ckpt = args.checkpoint is not None       # _load_any nulls it for vnr → capture first
+    # "did we load real (dense) weights?" — the KD teacher needs them. The grid loads via
+    # --model_name (timm/safetensors), NOT --checkpoint, so the old `args.checkpoint is not None`
+    # gate silently disabled KD for EVERY grid arch ("no checkpoint → KD off"). Count model_name too.
+    had_ckpt = (args.checkpoint is not None) or bool(getattr(args, "model_name", ""))
     model = _load_any(args, device)             # plain ckpt, VNR ckpt, or random init
     ex = torch.randn(1, 3, 224, 224).to(device)
     dense_macs, dense_params = _count(model, ex)
