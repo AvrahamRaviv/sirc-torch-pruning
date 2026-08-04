@@ -390,8 +390,10 @@ def _fast_bn_recalib(model, loader, device, max_batches, log=None):
     rebuild in _recalibrate_bn (serial JPEG decode = the C/E recalib tax). Reset BN running
     stats, train-mode forward of ≤max_batches calib batches on `device`, no grad/weight update."""
     import torch.nn as _nn
+    _saved_mom = {}
     for m in model.modules():
         if isinstance(m, _nn.modules.batchnorm._BatchNorm):
+            _saved_mom[id(m)] = m.momentum
             m.reset_running_stats()
             m.momentum = None          # cumulative EXACT average, not the default 0.1 EMA: an EMA
                                        # left ~20% short of the true post-prune stats at small k,
@@ -405,6 +407,13 @@ def _fast_bn_recalib(model, loader, device, max_batches, log=None):
         model(x.to(device, non_blocking=True))
         n += 1
     model.eval()
+    # RESTORE momentum. Leaving it None made FT run BN in cumulative-average mode: num_batches_tracked
+    # keeps growing so the running stats barely move while FT shifts the weights → eval uses stale
+    # stats that no longer match the net → train-good / eval-chance collapse (lr-independent). Restore
+    # the original EMA momentum (0.1) so FT tracks stats normally, like standard pruning fine-tuning.
+    for m in model.modules():
+        if isinstance(m, _nn.modules.batchnorm._BatchNorm):
+            m.momentum = _saved_mom.get(id(m), 0.1)
     if log:
         log(f"fast BN recalibration done ({n} calib batches, reused loader workers)")
 
