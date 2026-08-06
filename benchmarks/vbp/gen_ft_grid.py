@@ -45,8 +45,12 @@ ARCHS = {
         root="/algo/NetOptimization/outputs/NORMNET/MNv2",
         ckpt="mobilenet_v2_weights.pth", model_type="cnn", cnn_arch="mobilenet_v2",
         val_resize=232, mac=0.16, cap="0.8",
-        recipe=["--opt", "sgd", "--epochs_ft", "300", "--lr_ft", "0.045",
-                "--lr_schedule", "step", "--lr_step_size", "1", "--lr_gamma", "0.98",
+        # was torchvision SCRATCH recipe (300ep, step x0.98/ep) — wrong class for recover-FT.
+        # MNv2 competitors recover-FT long (DepGraph 300ep, AMC 150ep cosine -> 70.85% @70%FLOPs);
+        # MNv2 is compact/low-redundancy so does NOT collapse to MNv1's 30ep. 100ep cosine lr0.05
+        # (AMC-style, ~2/3 of AMC's 150; watch per-epoch, trim next round if plateau by ~e70).
+        recipe=["--opt", "sgd", "--epochs_ft", "100", "--lr_ft", "0.05",
+                "--lr_schedule", "cosine", "--ft_eta_min", "1e-6",
                 "--wd", "4e-5", "--momentum", "0.9"]),
     "convnext_t": dict(
         root="/algo/NetOptimization/outputs/NORMNET/ConvNeXt_tiny",
