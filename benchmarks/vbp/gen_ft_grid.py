@@ -44,10 +44,11 @@ ARCHS = {
     "mobilenet_v2": dict(
         root="/algo/NetOptimization/outputs/NORMNET/MNv2",
         ckpt="mobilenet_v2_weights.pth", model_type="cnn", cnn_arch="mobilenet_v2",
-        val_resize=232, mac=0.21, cap="0.8", interior=True,
-        # mac 0.21 = 0.67*dense(0.32) = 67% kept (retention-table point; 0.16 over-pruned into the
-        # stream-collapse regime). interior_only protects the residual stream (project .conv.2 +
-        # stem + final) so global pruning can't gut it to ~1 channel — matches the proven hand-runs.
+        val_resize=232, mac=0.16, cap="0.8", interior=True,
+        # aggressive mac 0.16 (kept per user) is SAFE only WITH interior_only: it protects the
+        # residual stream (project .conv.2 + stem + final) so global pruning prunes the inverted-
+        # residual EXPANSION, not the stream -> no gut-to-1-channel collapse. Dropping interior_only
+        # at 0.16 was the retention crater (e1 10-15); with it, expect the proven ~50-65.
         # was torchvision SCRATCH recipe (300ep, step x0.98/ep) — wrong class for recover-FT.
         # MNv2 competitors recover-FT long (DepGraph 300ep, AMC 150ep cosine -> 70.85% @70%FLOPs);
         # MNv2 is compact/low-redundancy so does NOT collapse to MNv1's 30ep. 100ep cosine lr0.05
