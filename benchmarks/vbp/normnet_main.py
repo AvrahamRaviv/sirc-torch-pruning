@@ -1038,19 +1038,17 @@ def main(argv):
                                        target_layers=_post_act_target_layers(model, args.model_type, ex),
                                        max_batches=args.calib_batches)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
-                # BROADCAST rank-0's stats onto every rank (was all_reduce-mean). Under an
-                # aggressive/degenerate cut (e.g. MNv2 @0.16G + --interior_only) tp_variance's
-                # score landscape is near-flat/tied, so the global-threshold boundary sits inside a
-                # tie region where any sub-ULP per-rank residue flips a channel -> ranks prune to
-                # DIFFERENT widths ([131,24] vs [129,24]) -> DDP param-shape verify crashes at init.
-                # mean-all-reduce did not guarantee the identical masks the boundary needs;
-                # broadcast(src=0) makes every rank use rank-0's exact values -> byte-identical
-                # masks. (Same guarantee the propagation/iterative paths already get via src=0.)
+                # Sync per-rank activation stats. all_reduce-SUM/ws is byte-identical on every rank
+                # (a collective delivers the same result everywhere) AND pools all ranks' calib data
+                # (world_size x more batches = a better estimate than any single rank). The DDP
+                # mask-divergence crash was NOT from these stats (they were already identical) — it
+                # was per-rank model drift, fixed by broadcast_model_state in the classical branch.
+                ws = torch.distributed.get_world_size()
                 for d in (var_imp.variance, var_imp.means):
                     for k in list(d.keys()):
                         t = d[k].detach().to(device).contiguous()   # NCCL needs CUDA tensors
-                        torch.distributed.broadcast(t, src=0)
-                        d[k] = t.to(d[k].device)
+                        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+                        d[k] = (t / ws).to(d[k].device)
             # Re-key stats by module NAME (stable across deepcopy; module objects are not).
             var_stats_by_name = {}
             for nm, m in model.named_modules():
