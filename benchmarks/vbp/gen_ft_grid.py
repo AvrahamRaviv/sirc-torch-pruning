@@ -44,7 +44,10 @@ ARCHS = {
     "mobilenet_v2": dict(
         root="/algo/NetOptimization/outputs/NORMNET/MNv2",
         ckpt="mobilenet_v2_weights.pth", model_type="cnn", cnn_arch="mobilenet_v2",
-        val_resize=232, mac=0.16, cap="0.8",
+        val_resize=232, mac=0.21, cap="0.8", interior=True,
+        # mac 0.21 = 0.67*dense(0.32) = 67% kept (retention-table point; 0.16 over-pruned into the
+        # stream-collapse regime). interior_only protects the residual stream (project .conv.2 +
+        # stem + final) so global pruning can't gut it to ~1 channel — matches the proven hand-runs.
         # was torchvision SCRATCH recipe (300ep, step x0.98/ep) — wrong class for recover-FT.
         # MNv2 competitors recover-FT long (DepGraph 300ep, AMC 150ep cosine -> 70.85% @70%FLOPs);
         # MNv2 is compact/low-redundancy so does NOT collapse to MNv1's 30ep. 100ep cosine lr0.05
@@ -98,6 +101,8 @@ def core_flags(a):
          "--train_batch_size", str(TRAIN_BS)]
     if a["cap"]:
         f += ["--max_prune_ratio", a["cap"]]
+    if a.get("interior"):
+        f += ["--interior_only"]         # protect residual-stream out-channels (arch opt-in)
     if USE_KD:
         alpha, T = a.get("kd", ("0.5", "2.0"))          # per-arch KD; convnext = (0.0, 4.0)
         f += ["--use_kd", "--kd_alpha", alpha, "--kd_T", T]
