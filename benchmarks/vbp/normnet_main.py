@@ -832,6 +832,16 @@ def main(argv):
     else:
         log_info(f"classical scorer ({args.scorer}): SKIP normalize transform — "
                  f"prune original net (no reparam to norm form)")
+        # Sync weights+buffers to rank 0 BEFORE scoring/pruning (the do_normalize path above
+        # already does this after reparameterize). Classical scorers skipped it, so any per-rank
+        # drift in the model (e.g. BN running stats nudged by rank-local calib forwards, or load
+        # nondeterminism) fed the pruner divergent inputs -> ranks pruned to DIFFERENT widths
+        # ([120,24] vs rank0) -> DDP param-shape verify crash at FT init. Broadcasting the model
+        # makes the prune byte-identical on every rank (broadcasting only the tp_variance stats
+        # was insufficient — the weight/BN terms of the group importance also must match).
+        if use_ddp:
+            from vbp_common import broadcast_model_state
+            broadcast_model_state(model)
 
     # -- 2b. optional FT in normalized coordinates (train v_tilde; WD on σW = contrib reg)
     # Bracket the reg phase with ‖ṽ‖ snapshots → the delta = how much λ-reg made channels
