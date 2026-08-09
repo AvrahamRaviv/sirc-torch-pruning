@@ -49,12 +49,16 @@ ARCHS = {
         # residual stream (project .conv.2 + stem + final) so global pruning prunes the inverted-
         # residual EXPANSION, not the stream -> no gut-to-1-channel collapse. Dropping interior_only
         # at 0.16 was the retention crater (e1 10-15); with it, expect the proven ~50-65.
-        # was torchvision SCRATCH recipe (300ep, step x0.98/ep) — wrong class for recover-FT.
-        # MNv2 competitors recover-FT long (DepGraph 300ep, AMC 150ep cosine -> 70.85% @70%FLOPs);
-        # MNv2 is compact/low-redundancy so does NOT collapse to MNv1's 30ep. 100ep cosine lr0.05
-        # (AMC-style, ~2/3 of AMC's 150; watch per-epoch, trim next round if plateau by ~e70).
-        recipe=["--opt", "sgd", "--epochs_ft", "100", "--lr_ft", "0.05",
-                "--lr_schedule", "cosine", "--ft_eta_min", "1e-6",
+        # recipe = the in-tree DepGraph/Isomorphic MNv2 @ target-flops 0.15 finetune (the exact SOTA
+        # cell, reproduce/scripts/prune/imagenet/mobilenetv2_group_sl.sh): 150ep, lr 0.0045 @ bs256
+        # (= their 0.036 @ bs2048 / 8, linear scaling; our grid is 64x4=256 → 0.0045), step x0.98
+        # EVERY epoch (lr-step-size 1, lr-gamma 0.98), wd 4e-5, sgd mom 0.9. NOTE our prior lr 0.05
+        # was 11x too hot (AMC-extrapolated) → capped ~61.5; 0.0045 is their proven value. Method
+        # still differs: theirs = group_sl LEARNED sparsity (150 sl-epochs reg 1e-4) then prune,
+        # ours = one-shot scorer → we won't fully match 68.91 (different class), but lr+epochs fix
+        # closes most of the training-side gap. KD kept ON (favorable; theirs has none).
+        recipe=["--opt", "sgd", "--epochs_ft", "150", "--lr_ft", "0.0045",
+                "--lr_schedule", "step", "--lr_step_size", "1", "--lr_gamma", "0.98",
                 "--wd", "4e-5", "--momentum", "0.9"]),
     "convnext_t": dict(
         root="/algo/NetOptimization/outputs/NORMNET/ConvNeXt_tiny",
