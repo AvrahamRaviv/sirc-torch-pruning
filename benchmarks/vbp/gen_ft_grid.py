@@ -49,16 +49,16 @@ ARCHS = {
         # residual stream (project .conv.2 + stem + final) so global pruning prunes the inverted-
         # residual EXPANSION, not the stream -> no gut-to-1-channel collapse. Dropping interior_only
         # at 0.16 was the retention crater (e1 10-15); with it, expect the proven ~50-65.
-        # recipe = the in-tree DepGraph/Isomorphic MNv2 @ target-flops 0.15 finetune (the exact SOTA
-        # cell, reproduce/scripts/prune/imagenet/mobilenetv2_group_sl.sh): 150ep, lr 0.0045 @ bs256
-        # (= their 0.036 @ bs2048 / 8, linear scaling; our grid is 64x4=256 → 0.0045), step x0.98
-        # EVERY epoch (lr-step-size 1, lr-gamma 0.98), wd 4e-5, sgd mom 0.9. NOTE our prior lr 0.05
-        # was 11x too hot (AMC-extrapolated) → capped ~61.5; 0.0045 is their proven value. Method
-        # still differs: theirs = group_sl LEARNED sparsity (150 sl-epochs reg 1e-4) then prune,
-        # ours = one-shot scorer → we won't fully match 68.91 (different class), but lr+epochs fix
-        # closes most of the training-side gap. KD kept ON (favorable; theirs has none).
-        recipe=["--opt", "sgd", "--epochs_ft", "150", "--lr_ft", "0.0045",
-                "--lr_schedule", "step", "--lr_step_size", "1", "--lr_gamma", "0.98",
+        # cosine-150 COMPROMISE of the TP no-SL recipe (reproduce/.../mobilenetv2_group_norm.sh =
+        # 300ep, lr 0.045 @ bs2048, step x0.98/ep, soft_keeping 0.5). Their step x0.98 is calibrated
+        # for 300ep; over our 150 it dumps lr to ~6e-4 by e100 → the <50% asymptote we saw. Fix:
+        # keep 150ep but cosine (holds lr high across the shorter budget) at lr 0.006 (= their
+        # 0.045 linear-scaled to our bs64x4=256: 0.045*256/2048=0.0056, round 0.006), eta_min 1e-6.
+        # Expected ~62-64 (mid-60s): budget/schedule gap closes, but 68.91 = group_sl LEARNED
+        # sparsity (different method class; even TP no-SL @300ep ~66-67). One-shot ceiling is
+        # mid-60s here — 68 needs an SL pre-prune stage, not FT knobs. KD kept ON (favorable).
+        recipe=["--opt", "sgd", "--epochs_ft", "150", "--lr_ft", "0.006",
+                "--lr_schedule", "cosine", "--ft_eta_min", "1e-6",
                 "--wd", "4e-5", "--momentum", "0.9"]),
     "convnext_t": dict(
         root="/algo/NetOptimization/outputs/NORMNET/ConvNeXt_tiny",
