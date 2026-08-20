@@ -5,6 +5,7 @@ Shared training, data loading, logging, and model loading functions
 extracted from vbp_imagenet.py to avoid duplication across scripts.
 """
 
+import contextlib
 import datetime
 import logging
 import os
@@ -921,10 +922,14 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        # autocast wraps ONLY the forward + loss build; backward/step run in fp32. enabled=False
-        # (default, no --amp) makes this an inert passthrough → bit-identical to the old path.
-        with torch.autocast(device_type=("cuda" if use_amp else "cpu"),
-                            dtype=torch.float16, enabled=use_amp):
+        # autocast wraps ONLY the forward + loss build; backward/step run in fp32. When --amp is
+        # off we skip the context entirely (nullcontext) → bit-identical to the old path. NOTE:
+        # do NOT rely on torch.autocast(enabled=False): on old torch (1.x, CPU) __enter__ calls
+        # set_autocast_cpu_dtype(float16) regardless of enabled → "AutocastCPU only support
+        # Bfloat16" crash even when amp is off.
+        amp_ctx = (torch.autocast(device_type="cuda", dtype=torch.float16)
+                   if use_amp else contextlib.nullcontext())
+        with amp_ctx:
             logits = forward_logits(model, images, args.model_type)
             ce_loss = F.cross_entropy(logits, labels)
 
