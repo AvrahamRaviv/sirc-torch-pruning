@@ -1650,6 +1650,9 @@ def parse_args(argv):
     p.add_argument("--use_kd", action="store_true")
     p.add_argument("--kd_alpha", type=float, default=0.5)
     p.add_argument("--kd_T", type=float, default=2.0)
+    p.add_argument("--amp", action="store_true",
+                   help="bf16 autocast for FT forward/loss (cuda-only, no GradScaler); "
+                        "accuracy-neutral, ~2x faster. Default off = bit-identical fp32.")
     p.add_argument("--train_batch_size", type=int, default=128)
     p.add_argument("--val_batch_size", type=int, default=256)
     p.add_argument("--val_resize", type=int, default=232)

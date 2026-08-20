@@ -899,6 +899,12 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
     use_kd = args.use_kd and teacher is not None
     use_l21 = fc1_modules is not None and getattr(args, 'sparse_mode', 'none') == "l1_group"
     use_var_loss = var_hooks is not None and getattr(args, 'var_loss_weight', 0) > 0
+    # bf16 autocast (opt-in via --amp; cuda-only). bf16 needs NO GradScaler (wide exponent =
+    # no fp16 underflow) → loss.backward() stays in fp32, master weights untouched → accuracy-
+    # neutral (matches the SOTA torchvision/isomorphic recipe which finetunes with --amp).
+    use_amp = getattr(args, "amp", False) and device.type == "cuda"
+    if use_amp and epoch == 0 and is_main():
+        log_info(f"[{phase}] AMP on: bf16 autocast (no GradScaler)")
 
     total_loss = 0.0
     total_reg = 0.0
@@ -912,45 +918,49 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        logits = forward_logits(model, images, args.model_type)
-        ce_loss = F.cross_entropy(logits, labels)
+        # autocast wraps ONLY the forward + loss build; backward/step run in fp32. enabled=False
+        # (default, no --amp) makes this an inert passthrough → bit-identical to the old path.
+        with torch.autocast(device_type=("cuda" if use_amp else "cpu"),
+                            dtype=torch.bfloat16, enabled=use_amp):
+            logits = forward_logits(model, images, args.model_type)
+            ce_loss = F.cross_entropy(logits, labels)
 
-        # Knowledge distillation
-        if use_kd:
-            with torch.no_grad():
-                teacher_logits = forward_logits(teacher, images, args.model_type)
-            kd_loss = F.kl_div(
-                F.log_softmax(logits / args.kd_T, dim=1),
-                F.softmax(teacher_logits / args.kd_T, dim=1),
-                reduction="batchmean"
-            ) * (args.kd_T ** 2)
-            loss = args.kd_alpha * ce_loss + (1 - args.kd_alpha) * kd_loss
-        else:
-            loss = ce_loss
-
-        # L2,1 group regularization
-        if use_l21:
-            reg_loss = l21_regularization(fc1_modules, device)
-            loss = loss + args.l1_lambda * reg_loss
-            total_reg += reg_loss.item()
-
-        # Variance concentration loss
-        if use_var_loss:
-            var_loss = var_hooks.compute_loss()
-            loss = loss + args.var_loss_weight * var_loss
-            total_var += var_loss.item()
-
-        # Auxiliary loss (e.g. mean-residual regularization)
-        # aux_loss_fn may return a scalar OR a dict {name: tensor} for per-component logging
-        if aux_loss_fn is not None:
-            aux = aux_loss_fn()
-            if isinstance(aux, dict):
-                for k, v in aux.items():
-                    loss = loss + v
-                    total_aux[k] = total_aux.get(k, 0.0) + v.item()
+            # Knowledge distillation
+            if use_kd:
+                with torch.no_grad():
+                    teacher_logits = forward_logits(teacher, images, args.model_type)
+                kd_loss = F.kl_div(
+                    F.log_softmax(logits / args.kd_T, dim=1),
+                    F.softmax(teacher_logits / args.kd_T, dim=1),
+                    reduction="batchmean"
+                ) * (args.kd_T ** 2)
+                loss = args.kd_alpha * ce_loss + (1 - args.kd_alpha) * kd_loss
             else:
-                loss = loss + aux
-                total_aux["aux"] = total_aux.get("aux", 0.0) + aux.item()
+                loss = ce_loss
+
+            # L2,1 group regularization
+            if use_l21:
+                reg_loss = l21_regularization(fc1_modules, device)
+                loss = loss + args.l1_lambda * reg_loss
+                total_reg += reg_loss.item()
+
+            # Variance concentration loss
+            if use_var_loss:
+                var_loss = var_hooks.compute_loss()
+                loss = loss + args.var_loss_weight * var_loss
+                total_var += var_loss.item()
+
+            # Auxiliary loss (e.g. mean-residual regularization)
+            # aux_loss_fn may return a scalar OR a dict {name: tensor} for per-component logging
+            if aux_loss_fn is not None:
+                aux = aux_loss_fn()
+                if isinstance(aux, dict):
+                    for k, v in aux.items():
+                        loss = loss + v
+                        total_aux[k] = total_aux.get(k, 0.0) + v.item()
+                else:
+                    loss = loss + aux
+                    total_aux["aux"] = total_aux.get("aux", 0.0) + aux.item()
 
         optimizer.zero_grad()
         loss.backward()

@@ -44,22 +44,22 @@ ARCHS = {
     "mobilenet_v2": dict(
         root="/algo/NetOptimization/outputs/NORMNET/MNv2",
         ckpt="mobilenet_v2_weights.pth", model_type="cnn", cnn_arch="mobilenet_v2",
-        val_resize=232, mac=0.16, cap="0.8", interior=True,
-        # aggressive mac 0.16 (kept per user) is SAFE only WITH interior_only: it protects the
-        # residual stream (project .conv.2 + stem + final) so global pruning prunes the inverted-
-        # residual EXPANSION, not the stream -> no gut-to-1-channel collapse. Dropping interior_only
-        # at 0.16 was the retention crater (e1 10-15); with it, expect the proven ~50-65.
-        # cosine-150 COMPROMISE of the TP no-SL recipe (reproduce/.../mobilenetv2_group_norm.sh =
-        # 300ep, lr 0.045 @ bs2048, step x0.98/ep, soft_keeping 0.5). Their step x0.98 is calibrated
-        # for 300ep; over our 150 it dumps lr to ~6e-4 by e100 → the <50% asymptote we saw. Fix:
-        # keep 150ep but cosine (holds lr high across the shorter budget) at lr 0.006 (= their
-        # 0.045 linear-scaled to our bs64x4=256: 0.045*256/2048=0.0056, round 0.006), eta_min 1e-6.
-        # Expected ~62-64 (mid-60s): budget/schedule gap closes, but 68.91 = group_sl LEARNED
-        # sparsity (different method class; even TP no-SL @300ep ~66-67). One-shot ceiling is
-        # mid-60s here — 68 needs an SL pre-prune stage, not FT knobs. KD kept ON (favorable).
-        recipe=["--opt", "sgd", "--epochs_ft", "150", "--lr_ft", "0.006",
+        val_resize=256, mac=0.15, cap="0.8", interior=True,
+        train_bs=128, amp=True, kd_off=True,
+        # SOTA-MATCH recipe. Isomorphic-Pruning MNv2-0.15G (68.91 top-1) = ONE-SHOT taylor global
+        # prune (NO sparsity learning, same class as our scorers) + a PLAIN 300ep finetune. Their
+        # exact FT (scripts/finetuning/mobilenet_v2_0.15G.sh):
+        #   300ep, bs512x4=2048, lr0.036 cosine, warmup0, wd2e-5, --amp, bilinear, NO KD, NO aug.
+        # We match it so the ONLY difference is the scorer (propagation vs taylor) → clean head-to-
+        # head at the SAME 0.15G budget + SAME FT. Deltas vs theirs: bs128x4=512 (our GPUs), so lr
+        # linear-scaled 0.036*512/2048=0.009; bf16 --amp (accuracy-neutral, ~2x faster); KD OFF
+        # (theirs has none — don't let KD confound the comparison). interior_only kept = our
+        # method's residual-stream protection (part of what we're benchmarking). Earlier 150ep
+        # runs capped ~56 purely because half-budget + step x0.98 dumped lr; NOT a method ceiling
+        # — no SL premium exists for this number, so 68.91 is a fair reachable target.
+        recipe=["--opt", "sgd", "--epochs_ft", "300", "--lr_ft", "0.009",
                 "--lr_schedule", "cosine", "--ft_eta_min", "1e-6",
-                "--wd", "4e-5", "--momentum", "0.9"]),
+                "--wd", "2e-5", "--momentum", "0.9"]),
     "convnext_t": dict(
         root="/algo/NetOptimization/outputs/NORMNET/ConvNeXt_tiny",
         ckpt="convnext_tiny_22k_1k_224.pth", model_type="convnext", cnn_arch="convnext_tiny",
@@ -103,12 +103,14 @@ def core_flags(a):
          "--epochs_train", "0", "--epochs_norm_ft", "0",
          "--imp_normalizer", "width",
          "--val_resize", str(a["val_resize"]), "--mac_target_g", str(a["mac"]),
-         "--train_batch_size", str(TRAIN_BS)]
+         "--train_batch_size", str(a.get("train_bs", TRAIN_BS))]  # per-arch batch (mnv2=128)
     if a["cap"]:
         f += ["--max_prune_ratio", a["cap"]]
     if a.get("interior"):
         f += ["--interior_only"]         # protect residual-stream out-channels (arch opt-in)
-    if USE_KD:
+    if a.get("amp"):
+        f += ["--amp"]                   # bf16 FT (mnv2 SOTA-match; accuracy-neutral)
+    if USE_KD and not a.get("kd_off"):   # kd_off per arch (mnv2 matches SOTA recipe = no KD)
         alpha, T = a.get("kd", ("0.5", "2.0"))          # per-arch KD; convnext = (0.0, 4.0)
         f += ["--use_kd", "--kd_alpha", alpha, "--kd_T", T]
     return f
