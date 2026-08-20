@@ -899,12 +899,15 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
     use_kd = args.use_kd and teacher is not None
     use_l21 = fc1_modules is not None and getattr(args, 'sparse_mode', 'none') == "l1_group"
     use_var_loss = var_hooks is not None and getattr(args, 'var_loss_weight', 0) > 0
-    # bf16 autocast (opt-in via --amp; cuda-only). bf16 needs NO GradScaler (wide exponent =
-    # no fp16 underflow) → loss.backward() stays in fp32, master weights untouched → accuracy-
-    # neutral (matches the SOTA torchvision/isomorphic recipe which finetunes with --amp).
+    # fp16 autocast (opt-in via --amp; cuda-only) + GradScaler. WHY fp16 not bf16: MNv2 uses
+    # ReLU6 (=hardtanh); the cluster torch (1.x) has NO hardtanh_backward_cuda kernel for BFloat16
+    # ("RuntimeError: hardtanh_backward_cuda not implemented for 'BFloat16'") → bf16 backward dies.
+    # fp16 has the kernel and is broadly supported on old torch. GradScaler handles fp16 underflow;
+    # master weights stay fp32 → accuracy-neutral (matches SOTA torchvision/isomorphic --amp recipe).
     use_amp = getattr(args, "amp", False) and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)  # enabled=False → passthrough (bit-identical)
     if use_amp and epoch == 0 and is_main():
-        log_info(f"[{phase}] AMP on: bf16 autocast (no GradScaler)")
+        log_info(f"[{phase}] AMP on: fp16 autocast + GradScaler")
 
     total_loss = 0.0
     total_reg = 0.0
@@ -921,7 +924,7 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
         # autocast wraps ONLY the forward + loss build; backward/step run in fp32. enabled=False
         # (default, no --amp) makes this an inert passthrough → bit-identical to the old path.
         with torch.autocast(device_type=("cuda" if use_amp else "cpu"),
-                            dtype=torch.bfloat16, enabled=use_amp):
+                            dtype=torch.float16, enabled=use_amp):
             logits = forward_logits(model, images, args.model_type)
             ce_loss = F.cross_entropy(logits, labels)
 
@@ -963,12 +966,15 @@ def train_one_epoch(model, train_loader, train_sampler, optimizer,
                     total_aux["aux"] = total_aux.get("aux", 0.0) + aux.item()
 
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        # unscale BEFORE regularize/clip so they see true-magnitude fp32 grads (no-op when amp off)
+        scaler.unscale_(optimizer)
         if regularize_fn is not None:
             eval_m = model.module if isinstance(model, DDP) else model
             regularize_fn(eval_m)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         if step_per_batch:
             scheduler.step()
 
