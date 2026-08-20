@@ -364,6 +364,73 @@ def build_optimizer(model, args, mgr=None):
     return torch.optim.AdamW(groups, lr=args.lr)
 
 
+def warmstart_adam_v(model, mgr, optimizer, train_loader, args, device):
+    """#2-warmstart: seed AdamW's second moment (exp_avg_sq) with a multi-batch E[g²]
+    estimate for the reparam v_tilde params, instead of the default 0.
+
+    Motivation (boss "scale optimizer moments" idea, adapted to a fresh optimizer):
+    continue-training loads a WEIGHTS-ONLY checkpoint, so the optimizer starts cold —
+    exp_avg_sq=0. AdamW's per-coordinate step is lr·m̂/√v̂; for the first ~1/(1-β2)≈1000
+    steps v̂ is a high-variance single-sample estimate of E[g²], so early per-channel step
+    sizes are noisy → the observed insertion dip (F e1 < A e1). Seeding v̂ with an
+    E[g²] average computed over a few calibration batches makes the step per-channel
+    correct from step 1. exp_avg (m) stays 0 so the FIRST-order state still warms up
+    live (gentle warmup steps); we set the step counter high so bias-correction treats
+    the seed as a converged EMA (v̂≈seed immediately, m̂≈m — no 1/(1-β^step) inflation).
+
+    AdamW + bn-variant only; no-op otherwise. If the σ² grad hook (#3) is registered the
+    E[g²] estimate is measured through it, so #2 and #3 compose consistently.
+    """
+    import torch.nn.functional as F
+    if getattr(args, "opt", "sgd") != "adamw":
+        return 0
+    params = [rp.v_tilde for rp in mgr._reparam_modules.values() if hasattr(rp, "v_tilde")]
+    if not params:
+        return 0
+    n_batches = int(getattr(args, "adam_warmstart_batches", 8))
+    warm_step = float(getattr(args, "adam_warmstart_step", 1000))
+    accum = {id(p): torch.zeros_like(p) for p in params}
+    was_training = model.training
+    model.train()
+    it = iter(train_loader)
+    seen = 0
+    for _ in range(n_batches):
+        try:
+            imgs, tgts = next(it)
+        except StopIteration:
+            break
+        imgs, tgts = imgs.to(device), tgts.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        loss = F.cross_entropy(model(imgs), tgts)
+        loss.backward()
+        for p in params:
+            if p.grad is not None:
+                accum[id(p)] += p.grad.detach() ** 2
+        seen += 1
+    optimizer.zero_grad(set_to_none=True)
+    if not was_training:
+        model.eval()
+    if seen == 0:
+        return 0
+    # DDP: average the estimate across ranks so every rank seeds identical optimizer state.
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        for p in params:
+            dist.all_reduce(accum[id(p)], op=dist.ReduceOp.SUM)
+        seen_t = torch.tensor(float(seen), device=device)
+        dist.all_reduce(seen_t, op=dist.ReduceOp.SUM)
+        seen = seen_t.item()
+    for p in params:
+        v0 = accum[id(p)] / seen
+        st = optimizer.state[p]
+        st["step"] = torch.tensor(warm_step)
+        st["exp_avg"] = torch.zeros_like(p)
+        st["exp_avg_sq"] = v0
+    mean_v0 = sum((accum[id(p)] / seen).mean().item() for p in params) / len(params)
+    log_info(f"adam_warmstart_v: seeded exp_avg_sq for {len(params)} v_tilde tensors from "
+             f"{int(seen)}-sample E[g²] (step={warm_step:g}, mean v0={mean_v0:.3g})")
+    return len(params)
+
+
 def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
                      args, device, use_ddp, teacher=None):
     """Short training of the (optionally normalized) model. Returns best val acc.
@@ -375,6 +442,8 @@ def train_normalized(model, mgr, train_loader, val_loader, train_sampler,
     """
     normalized = mgr is not None and mgr.is_active
     optimizer = build_optimizer(model, args, mgr)
+    if normalized and getattr(args, "adam_warmstart_v", False):
+        warmstart_adam_v(model, mgr, optimizer, train_loader, args, device)
     if getattr(args, "lr_schedule", "cosine") == "step":
         # Epoch-wise step decay to match official from-scratch recipes
         # (R50 mmpretrain: milestones 30/60/90 ×0.1; MNv2 torchvision: step_size 1 ×0.98).

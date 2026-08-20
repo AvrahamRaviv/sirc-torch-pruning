@@ -1440,6 +1440,16 @@ def parse_args(argv):
                         "coupled WD uniform in W-space. Recommended for NN-continue: combine "
                         "with --norm_bn_eps 0.1 --norm_bn_momentum 0. Supersedes "
                         "--lr_scale_by_sigma2.")
+    p.add_argument("--adam_warmstart_v", action="store_true", default=False,
+                   help="#2 (moment warm-start): seed AdamW exp_avg_sq (2nd moment) with a "
+                        "few-batch E[g²] estimate on v_tilde instead of 0, killing the Adam "
+                        "cold-start dip at normalization insertion. AdamW + bn-variant only; "
+                        "no-op under SGD or mean-variant.")
+    p.add_argument("--adam_warmstart_batches", type=int, default=8,
+                   help="#2: number of calibration batches to average E[g²] over.")
+    p.add_argument("--adam_warmstart_step", type=float, default=1000,
+                   help="#2: Adam step counter to stamp on the seeded state (high → "
+                        "bias-correction treats the seed as a converged EMA).")
     p.add_argument("--reparam_lambda", type=float, default=0.0, help="extra λ‖σv‖ during norm-ft")
     p.add_argument("--epochs_norm_ft", type=int, default=0, help="FT in normalized coords (0=skip)")
     p.add_argument("--lr_norm_ft", type=float, default=0.01)
