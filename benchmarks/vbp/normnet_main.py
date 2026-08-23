@@ -1438,6 +1438,17 @@ def parse_args(argv):
                         "stays function-preserving (w_eff=v/σ=W for any σ). Default off = "
                         "byte-identical. bn-variant only; pair with --norm_bn_momentum 0 to "
                         "keep the non-zero σ frozen through training.")
+    p.add_argument("--norm_by_max", action="store_true", default=False,
+                   help="#8 (boss menu, extreme-variance axis): normalize the bn-variant input "
+                        "by per-channel max|x| instead of std (outlier-driven scale estimator). "
+                        "μ unchanged. Function-preserving. Default off. NOTE: pure per-channel "
+                        "rescale → likely absorbed by AdamW (predicted parity, like σ²).")
+    p.add_argument("--norm_var_min", type=float, default=0.0,
+                   help="#6 (boss menu, extreme-variance axis): only normalize channels whose "
+                        "input variance exceeds this threshold; low-var channels left UNSCALED "
+                        "(σ=1, no 1/σ amp). Set 1.0 for boss's 'normalize only var>1'. Changes "
+                        "WHICH channels are normalized (not a rescale) → survives AdamW. Default "
+                        "0.0 = normalize all = byte-identical. bn-variant only.")
     p.add_argument("--lr_scale_by_sigma2", action="store_true", default=False,
                    help="per-LAYER mean-σ² lr scaling on v_tilde (see normalize_net.py; "
                         "corrects cross-layer scale only, not intra-layer channel spread)")

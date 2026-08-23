@@ -905,6 +905,10 @@ class BaseReparamManager(ABC):
         # nothing); only the denominator becomes the per-channel non-zero count. Insertion
         # stays function-preserving (w_eff = v_tilde/σ = W for any σ). Default off.
         var_nonzero = getattr(self, "_var_nonzero", False)
+        # #8 (boss menu): use per-channel max|x| as the normalizer instead of std.
+        # A max-based scale is a different (outlier-driven) estimator of channel spread.
+        # Overrides σ_in only; μ unchanged. Insertion stays function-preserving. Default off.
+        norm_by_max = getattr(self, "_norm_by_max", False)
 
         def _per_channel_reduce(t, channel_dim):
             """Return (sum, sum_sq, count) reduced over all-but-channel axes.
@@ -925,6 +929,7 @@ class BaseReparamManager(ABC):
         for name, module in targets.items():
             acc = {
                 'in_sum': None, 'in_sum_sq': None, 'in_count': 0, 'in_nz': None,
+                'in_max': None,
                 'out_sum': None, 'out_sum_sq': None, 'out_count': 0,
             }
             accumulators[name] = acc
@@ -937,7 +942,8 @@ class BaseReparamManager(ABC):
             ch_in = -1 if is_linear else 1
             ch_out = -1 if is_linear else 1
 
-            def make_hook(acc_ref, ch_in=ch_in, ch_out=ch_out, var_nonzero=var_nonzero):
+            def make_hook(acc_ref, ch_in=ch_in, ch_out=ch_out,
+                          var_nonzero=var_nonzero, norm_by_max=norm_by_max):
                 def hook(mod, inp, out):
                     x = inp[0].detach()
                     ch_in_eff = (x.dim() - 1) if ch_in == -1 else ch_in
@@ -949,11 +955,16 @@ class BaseReparamManager(ABC):
                         else:
                             acc_ref['in_sum'] += s; acc_ref['in_sum_sq'] += ss
                         acc_ref['in_count'] += n
-                        if var_nonzero:
+                        if var_nonzero or norm_by_max:
                             rd = tuple(i for i in range(x.dim()) if i != ch_in_eff)
-                            nz = (x != 0).sum(dim=rd)
-                            acc_ref['in_nz'] = nz if acc_ref['in_nz'] is None \
-                                else acc_ref['in_nz'] + nz
+                            if var_nonzero:
+                                nz = (x != 0).sum(dim=rd)
+                                acc_ref['in_nz'] = nz if acc_ref['in_nz'] is None \
+                                    else acc_ref['in_nz'] + nz
+                            if norm_by_max:
+                                mx = x.abs().amax(dim=rd)
+                                acc_ref['in_max'] = mx if acc_ref['in_max'] is None \
+                                    else torch.maximum(acc_ref['in_max'], mx)
 
                     o = out.detach()
                     ch_out_eff = (o.dim() - 1) if ch_out == -1 else ch_out
@@ -1014,6 +1025,9 @@ class BaseReparamManager(ABC):
             denom_in = acc['in_nz'] if (var_nonzero and acc['in_nz'] is not None) \
                 else acc['in_count']
             mu_in, sigma_in = _finalize(acc['in_sum'], acc['in_sum_sq'], denom_in, in_dim)
+            if norm_by_max and acc['in_max'] is not None:
+                # #8: replace the std normalizer with per-channel max|x| (floored by eps).
+                sigma_in = acc['in_max'].clamp(min=eps ** 0.5).to(sigma_in.dtype)
             _mu_out, sigma_out = _finalize(acc['out_sum'], acc['out_sum_sq'], acc['out_count'], out_dim)
 
             if acc['in_count'] == 0:
@@ -1862,7 +1876,8 @@ class NormalizedResidualManager(BaseReparamManager):
 
     def __init__(self, model, target_names, device, lambda_reg=0.01, max_batches=200,
                  scale_invariant=False, entropy_lambda=0.0, reparam_target="fc2",
-                 bn_momentum=0.1, bn_eps=1e-5, var_nonzero=False):
+                 bn_momentum=0.1, bn_eps=1e-5, var_nonzero=False,
+                 norm_by_max=False, var_min=0.0):
         super().__init__(model, target_names, device, lambda_reg=lambda_reg,
                          max_batches=max_batches, scale_invariant=scale_invariant,
                          reparam_target=reparam_target)
@@ -1870,6 +1885,10 @@ class NormalizedResidualManager(BaseReparamManager):
         # #5: calibrate σ (and μ) from non-zero activations only. Read by _calibrate_stats
         # (inherited from BaseReparamManager) via getattr(self, "_var_nonzero").
         self._var_nonzero = bool(var_nonzero)
+        # #8: use per-channel max|x| as the normalizer (read in _calibrate_stats).
+        self._norm_by_max = bool(norm_by_max)
+        # #6: only normalize channels with input variance > var_min; rest left σ=1.
+        self._var_min = float(var_min)
         # σ EMA momentum for the input-normalizing BN.
         # 0.1 = torch BN default; slower (e.g. 0.01) for long from-scratch training.
         if not 0.0 <= float(bn_momentum) <= 1.0:
@@ -1892,6 +1911,16 @@ class NormalizedResidualManager(BaseReparamManager):
     def _make_reparam(self, module, calibration_data):
         """Create BNResidual* module from standard nn.Linear/Conv2d."""
         mu_x, sigma_x, sigma_out_x = calibration_data
+        # #6 (boss menu): normalize only channels whose input variance exceeds a threshold.
+        # Low-var channels are left UNSCALED (σ:=1 → v_tilde=W, no 1/σ amp). This changes
+        # WHICH channels are normalized (not a global rescale), so it survives AdamW's
+        # per-coordinate scale-invariance. Function-preserving (w_eff=v/σ=W for any σ).
+        var_min = getattr(self, "_var_min", 0.0)
+        if var_min > 0.0:
+            keep = (sigma_x ** 2) > var_min
+            sigma_x = torch.where(keep, sigma_x, torch.ones_like(sigma_x))
+            _log_info(f"--norm_var_min={var_min}: normalizing {int(keep.sum())}/"
+                      f"{keep.numel()} channels (var>thresh); rest left unscaled (σ=1).")
         # σ_x from _calibrate_stats = sqrt(var + CALIB_EPS) with CALIB_EPS=1e-5 (its default).
         # Recover the raw measured variance by subtracting THAT eps — independent of the
         # forward σ-floor self.bn_eps. Then bake v_tilde with self.bn_eps so that

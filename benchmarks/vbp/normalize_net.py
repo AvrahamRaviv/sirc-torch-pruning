@@ -100,9 +100,18 @@ def build_reparam_manager(model, layer_names, device, args):
     if var_nz:
         log_info("--norm_var_nonzero: σ/μ calibrated over NON-ZERO activations only "
                  "(ReLU-sparse channels get a larger, active-unit σ).")
+    by_max = bool(getattr(args, "norm_by_max", False))
+    if by_max:
+        log_info("--norm_by_max: normalizer = per-channel max|x| (outlier-driven scale), "
+                 "not std.")
+    var_min = float(getattr(args, "norm_var_min", 0.0))
+    if var_min > 0.0:
+        log_info(f"--norm_var_min={var_min}: only channels with input var>thresh are "
+                 f"normalized; low-var channels left unscaled (σ=1).")
     return NormalizedResidualManager(
         model, layer_names, device, lambda_reg=lam, max_batches=args.max_batches,
-        bn_momentum=bn_mom, bn_eps=bn_eps, var_nonzero=var_nz)
+        bn_momentum=bn_mom, bn_eps=bn_eps, var_nonzero=var_nz,
+        norm_by_max=by_max, var_min=var_min)
 
 
 def get_device():
