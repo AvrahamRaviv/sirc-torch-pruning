@@ -1430,6 +1430,14 @@ def parse_args(argv):
                         "Default 1e-5 (torch BN default; byte-identical to old pruning runs). "
                         "Set 0.1 for mid-training insertion / NN-continue: dead-ReLU channels "
                         "have var~0 → tiny σ → 1/sigma^2 blow-up on v_tilde → NaN; 1e-1 floors σ>=0.316.")
+    p.add_argument("--norm_var_nonzero", action="store_true", default=False,
+                   help="#5 (boss menu, extreme-variance axis): calibrate the bn-variant σ "
+                        "(and μ) from NON-ZERO activations only. ReLU sparsity injects a zero "
+                        "spike that deflates the all-value variance → small σ → large 1/σ amp; "
+                        "non-zero variance measures the spread of the active units. Insertion "
+                        "stays function-preserving (w_eff=v/σ=W for any σ). Default off = "
+                        "byte-identical. bn-variant only; pair with --norm_bn_momentum 0 to "
+                        "keep the non-zero σ frozen through training.")
     p.add_argument("--lr_scale_by_sigma2", action="store_true", default=False,
                    help="per-LAYER mean-σ² lr scaling on v_tilde (see normalize_net.py; "
                         "corrects cross-layer scale only, not intra-layer channel spread)")

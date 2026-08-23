@@ -898,6 +898,13 @@ class BaseReparamManager(ABC):
         """
         accumulators = {}
         hooks = []
+        # #5 (boss menu): estimate input μ/σ over NON-ZERO entries only. Post-ReLU
+        # activations are sparse — the zero spike deflates the all-value variance, making
+        # σ small and the reparam's 1/σ amplifier large. Non-zero variance measures the
+        # spread of the actually-active units. in_sum / in_sum_sq are unchanged (zeros add
+        # nothing); only the denominator becomes the per-channel non-zero count. Insertion
+        # stays function-preserving (w_eff = v_tilde/σ = W for any σ). Default off.
+        var_nonzero = getattr(self, "_var_nonzero", False)
 
         def _per_channel_reduce(t, channel_dim):
             """Return (sum, sum_sq, count) reduced over all-but-channel axes.
@@ -917,7 +924,7 @@ class BaseReparamManager(ABC):
 
         for name, module in targets.items():
             acc = {
-                'in_sum': None, 'in_sum_sq': None, 'in_count': 0,
+                'in_sum': None, 'in_sum_sq': None, 'in_count': 0, 'in_nz': None,
                 'out_sum': None, 'out_sum_sq': None, 'out_count': 0,
             }
             accumulators[name] = acc
@@ -930,7 +937,7 @@ class BaseReparamManager(ABC):
             ch_in = -1 if is_linear else 1
             ch_out = -1 if is_linear else 1
 
-            def make_hook(acc_ref, ch_in=ch_in, ch_out=ch_out):
+            def make_hook(acc_ref, ch_in=ch_in, ch_out=ch_out, var_nonzero=var_nonzero):
                 def hook(mod, inp, out):
                     x = inp[0].detach()
                     ch_in_eff = (x.dim() - 1) if ch_in == -1 else ch_in
@@ -942,6 +949,11 @@ class BaseReparamManager(ABC):
                         else:
                             acc_ref['in_sum'] += s; acc_ref['in_sum_sq'] += ss
                         acc_ref['in_count'] += n
+                        if var_nonzero:
+                            rd = tuple(i for i in range(x.dim()) if i != ch_in_eff)
+                            nz = (x != 0).sum(dim=rd)
+                            acc_ref['in_nz'] = nz if acc_ref['in_nz'] is None \
+                                else acc_ref['in_nz'] + nz
 
                     o = out.detach()
                     ch_out_eff = (o.dim() - 1) if ch_out == -1 else ch_out
@@ -974,7 +986,11 @@ class BaseReparamManager(ABC):
                 h.remove()
 
         def _finalize(s, ss, n, fallback_dim):
-            if s is not None and n > 0:
+            # n is a scalar total count, or (var_nonzero) a per-channel non-zero count tensor.
+            has_data = s is not None and (torch.is_tensor(n) or n > 0)
+            if has_data:
+                if torch.is_tensor(n):
+                    n = n.clamp(min=1).to(s.dtype)   # all-zero channel → σ→√eps (floored)
                 mu = s / n
                 var = (ss / n) - mu * mu
                 sigma = torch.sqrt(var.clamp_(min=0.0) + eps)
@@ -995,7 +1011,9 @@ class BaseReparamManager(ABC):
             else:
                 in_dim = out_dim = 0
 
-            mu_in, sigma_in = _finalize(acc['in_sum'], acc['in_sum_sq'], acc['in_count'], in_dim)
+            denom_in = acc['in_nz'] if (var_nonzero and acc['in_nz'] is not None) \
+                else acc['in_count']
+            mu_in, sigma_in = _finalize(acc['in_sum'], acc['in_sum_sq'], denom_in, in_dim)
             _mu_out, sigma_out = _finalize(acc['out_sum'], acc['out_sum_sq'], acc['out_count'], out_dim)
 
             if acc['in_count'] == 0:
@@ -1844,11 +1862,14 @@ class NormalizedResidualManager(BaseReparamManager):
 
     def __init__(self, model, target_names, device, lambda_reg=0.01, max_batches=200,
                  scale_invariant=False, entropy_lambda=0.0, reparam_target="fc2",
-                 bn_momentum=0.1, bn_eps=1e-5):
+                 bn_momentum=0.1, bn_eps=1e-5, var_nonzero=False):
         super().__init__(model, target_names, device, lambda_reg=lambda_reg,
                          max_batches=max_batches, scale_invariant=scale_invariant,
                          reparam_target=reparam_target)
         self._entropy_lambda = entropy_lambda
+        # #5: calibrate σ (and μ) from non-zero activations only. Read by _calibrate_stats
+        # (inherited from BaseReparamManager) via getattr(self, "_var_nonzero").
+        self._var_nonzero = bool(var_nonzero)
         # σ EMA momentum for the input-normalizing BN.
         # 0.1 = torch BN default; slower (e.g. 0.01) for long from-scratch training.
         if not 0.0 <= float(bn_momentum) <= 1.0:

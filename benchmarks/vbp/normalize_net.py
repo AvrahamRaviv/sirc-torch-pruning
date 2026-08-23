@@ -96,9 +96,13 @@ def build_reparam_manager(model, layer_names, device, args):
     log_info(f"--reparam_variant=bn (CANONICAL, BN trick): input normalized by live-EMA "
              f"σ (momentum={bn_mom}, eps={bn_eps}), trainable v_tilde=σ·W, μ folded to bias. "
              f"WD on v_tilde = contribution-score regularizer.")
+    var_nz = bool(getattr(args, "norm_var_nonzero", False))
+    if var_nz:
+        log_info("--norm_var_nonzero: σ/μ calibrated over NON-ZERO activations only "
+                 "(ReLU-sparse channels get a larger, active-unit σ).")
     return NormalizedResidualManager(
         model, layer_names, device, lambda_reg=lam, max_batches=args.max_batches,
-        bn_momentum=bn_mom, bn_eps=bn_eps)
+        bn_momentum=bn_mom, bn_eps=bn_eps, var_nonzero=var_nz)
 
 
 def get_device():
