@@ -44,22 +44,21 @@ ARCHS = {
     "mobilenet_v2": dict(
         root="/algo/NetOptimization/outputs/NORMNET/MNv2",
         ckpt="mobilenet_v2_weights.pth", model_type="cnn", cnn_arch="mobilenet_v2",
-        val_resize=256, mac=0.15, cap="0.8", interior=True,
-        train_bs=128, amp=True, kd_off=True,
-        # SOTA-MATCH recipe. Isomorphic-Pruning MNv2-0.15G (68.91 top-1) = ONE-SHOT taylor global
-        # prune (NO sparsity learning, same class as our scorers) + a PLAIN 300ep finetune. Their
-        # exact FT (scripts/finetuning/mobilenet_v2_0.15G.sh):
-        #   300ep, bs512x4=2048, lr0.036 cosine, warmup0, wd2e-5, --amp, bilinear, NO KD, NO aug.
-        # We match it so the ONLY difference is the scorer (propagation vs taylor) → clean head-to-
-        # head at the SAME 0.15G budget + SAME FT. Deltas vs theirs: bs128x4=512 (our GPUs), so lr
-        # linear-scaled 0.036*512/2048=0.009; bf16 --amp (accuracy-neutral, ~2x faster); KD OFF
-        # (theirs has none — don't let KD confound the comparison). interior_only kept = our
-        # method's residual-stream protection (part of what we're benchmarking). Earlier 150ep
-        # runs capped ~56 purely because half-budget + step x0.98 dumped lr; NOT a method ceiling
-        # — no SL premium exists for this number, so 68.91 is a fair reachable target.
-        recipe=["--opt", "sgd", "--epochs_ft", "300", "--lr_ft", "0.009",
+        val_resize=256, cap="0.8", interior=True,
+        train_bs=256, amp=True, prune_ratio=0.5,
+        # MIMIC-OWN-69 recipe. Reproduce the user's own MNv2 run that hit ~0.69 (vbp_imagenet_pat.py
+        # global weight_variance_both + VNR). Schedule is copied 1:1; ONLY TWO INTENTIONAL DIFFS:
+        #   (1) criterion  = our scorer (propagation/iter/magnitude/vbp/nci) instead of
+        #                    weight_variance_both  (each scorer carries its own normalizer)
+        #   (2) no VNR     = drop the 10ep --sparse_mode vnr sparsity-learning phase
+        #                    (normnet_main is prune+FT only; this is the controlled "no-SL" arm)
+        # Everything else matches the 69-run: AdamW, lr_ft 5e-4, wd 0.01, 200ep, warmup 5,
+        # eta_min 1e-6, KD on, bs 256/GPU, --keep_ratio 0.5 == --pruning_ratio 0.5 (drop mac
+        # target), bn recalib on. Residual (accuracy-neutral) delta: --amp fp16 for vacation speed
+        # (their cmd had none). interior_only kept = our method's residual-stream protection.
+        recipe=["--opt", "adamw", "--epochs_ft", "200", "--lr_ft", "0.0005",
                 "--lr_schedule", "cosine", "--ft_eta_min", "1e-6",
-                "--wd", "2e-5", "--momentum", "0.9"]),
+                "--ft_warmup_epochs", "5", "--wd", "0.01"]),
     "convnext_t": dict(
         root="/algo/NetOptimization/outputs/NORMNET/ConvNeXt_tiny",
         ckpt="convnext_tiny_22k_1k_224.pth", model_type="convnext", cnn_arch="convnext_tiny",
@@ -102,8 +101,13 @@ def core_flags(a):
          "--calib_batches", str(CALIB_BATCHES),
          "--epochs_train", "0", "--epochs_norm_ft", "0",
          "--imp_normalizer", "width",
-         "--val_resize", str(a["val_resize"]), "--mac_target_g", str(a["mac"]),
-         "--train_batch_size", str(a.get("train_bs", TRAIN_BS))]  # per-arch batch (mnv2=128)
+         "--val_resize", str(a["val_resize"]),
+         "--train_batch_size", str(a.get("train_bs", TRAIN_BS))]  # per-arch batch (mnv2=256)
+    # budget: channel keep-ratio (mnv2, mimics old --keep_ratio 0.5) XOR MAC target (other archs)
+    if a.get("prune_ratio") is not None:
+        f += ["--pruning_ratio", str(a["prune_ratio"])]
+    else:
+        f += ["--mac_target_g", str(a["mac"])]
     if a["cap"]:
         f += ["--max_prune_ratio", a["cap"]]
     if a.get("interior"):
