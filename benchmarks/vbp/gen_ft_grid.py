@@ -6,6 +6,7 @@ Run ON THE CLUSTER (creates dirs under /algo/.../NORMNET/<arch>/). Pure stdlib, 
     python3 gen_ft_grid.py            # write all 20 run_ddp.sh
     python3 gen_ft_grid.py --dry_run  # print, write nothing
     python3 gen_ft_grid.py --archs resnet50,mobilenet_v1   # subset
+    python3 gen_ft_grid.py --diag --archs mobilenet_v2 --scorers nci  # + Option-1 diagnostic cell
 
 Each cell = prune (scorer) + full FT with the arch's SOTA-isomorphic recipe. Numbers are meant to
 compare to the published pruning papers (DepGraph / Isomorphic-Pruning / AMC), NOT to KD-accelerated
@@ -94,15 +95,33 @@ SCORERS = {
 }
 
 
-def core_flags(a):
-    """Flags common to every cell: prune protocol B_native (mean-fold, no recalib) + FT scaffolding."""
+# ------------------------------------------------------------------ Option-1 diagnostic cells
+#   Isolate the pat(->0.69) vs normnet(->0.64) infra gap. Same nci criterion + same mimic-69
+#   schedule as the mnv2 grid cell, but the 3 infra suspects flipped to the pat-equivalents that
+#   reached 0.69: interior_only OFF, per-layer normalizer (mean == pat --norm_per_layer), and
+#   plain native-BN fold (--fold_native_bn: fold Conv->BN, prune, REINSERT fresh BN + recalib + FT
+#   == exactly pat --fold_bn_before_prune's flow). reparam stays (intrinsic to normnet — no
+#   no-reparam mode). Read: recovers to ~0.69 => gap is these flags, fix grid for ALL scorers;
+#   stays ~0.64 => gap is the reparam prune engine itself. Gated behind --diag (default off).
+DIAG = [
+    dict(arch="mobilenet_v2", name="nci_patmatch", scorer="nci",
+         override=dict(imp_normalizer="mean", interior_off=True, fold_native=True)),
+]
+
+
+def core_flags(a, ov=None):
+    """Flags common to every cell: prune protocol B_native (mean-fold, no recalib) + FT scaffolding.
+    ov = per-cell infra override (diagnostic): imp_normalizer, interior_off, fold_native."""
+    ov = ov or {}
     f = ["--global_pruning", "--reparam_variant", "mean", "--bias_comp",
          "--recalib_batches", str(RECALIB_BATCHES), "--skip_norm_eval",
          "--calib_batches", str(CALIB_BATCHES),
          "--epochs_train", "0", "--epochs_norm_ft", "0",
-         "--imp_normalizer", "width",
+         "--imp_normalizer", ov.get("imp_normalizer", "width"),   # diag: mean == pat norm_per_layer
          "--val_resize", str(a["val_resize"]),
          "--train_batch_size", str(a.get("train_bs", TRAIN_BS))]  # per-arch batch (mnv2=256)
+    if ov.get("fold_native"):
+        f += ["--fold_native_bn"]        # diag: plain native-BN fold (== pat --fold_bn_before_prune)
     # budget: channel keep-ratio (mnv2, mimics old --keep_ratio 0.5) XOR MAC target (other archs)
     if a.get("prune_ratio") is not None:
         f += ["--pruning_ratio", str(a["prune_ratio"])]
@@ -110,25 +129,26 @@ def core_flags(a):
         f += ["--mac_target_g", str(a["mac"])]
     if a["cap"]:
         f += ["--max_prune_ratio", a["cap"]]
-    if a.get("interior"):
+    if a.get("interior") and not ov.get("interior_off"):   # diag: interior_off drops residual guard
         f += ["--interior_only"]         # protect residual-stream out-channels (arch opt-in)
     if a.get("amp"):
-        f += ["--amp"]                   # bf16 FT (mnv2 SOTA-match; accuracy-neutral)
+        f += ["--amp"]                   # fp16 FT (accuracy-neutral, ~2x faster)
     if USE_KD and not a.get("kd_off"):   # kd_off per arch (mnv2 matches SOTA recipe = no KD)
         alpha, T = a.get("kd", ("0.5", "2.0"))          # per-arch KD; convnext = (0.0, 4.0)
         f += ["--use_kd", "--kd_alpha", alpha, "--kd_T", T]
     return f
 
 
-def build_sh(arch, scorer):
+def build_sh(arch, scorer, name=None, ov=None):
     a = ARCHS[arch]
-    save_dir = os.path.join(a["root"], scorer)
-    tag = f"{arch}_ft_{scorer}"
+    cell = name or scorer            # diagnostic cells save under their own name (not the scorer)
+    save_dir = os.path.join(a["root"], cell)
+    tag = f"{arch}_ft_{cell}"
     flags = ["--model_type", a["model_type"], "--cnn_arch", a["cnn_arch"],
              "--model_name", os.path.join(a["root"], a["ckpt"]),
              "--data_path", DATA_PATH,
              "--save_dir", save_dir, "--save_tag", tag]
-    flags += core_flags(a) + SCORERS[scorer] + a["recipe"]
+    flags += core_flags(a, ov) + SCORERS[scorer] + a["recipe"]
     line = (f"python3 -m torch.distributed.launch --nproc_per_node={NGPU} "
             f"{REPO}/benchmarks/vbp/normnet_main.py \\\n    " + " ".join(flags))
     return save_dir, f"#!/bin/bash\nset -e\ncd {REPO}\n{line}\n"
@@ -139,23 +159,31 @@ def main():
     ap.add_argument("--archs", default=",".join(ARCHS), help="comma list; default all 4")
     ap.add_argument("--scorers", default=",".join(SCORERS), help="comma list; default all 5")
     ap.add_argument("--dry_run", action="store_true", help="print, write nothing")
+    ap.add_argument("--diag", action="store_true",
+                    help="ALSO emit Option-1 diagnostic cells (pat-infra-match; see DIAG). "
+                         "Filtered by --archs. Default off = normal grid only.")
     args = ap.parse_args()
 
     archs = [x for x in args.archs.split(",") if x]
     scorers = [x for x in args.scorers.split(",") if x]
+    # (arch, scorer, name, override) tuples: the arch x scorer grid, plus optional diagnostic cells
+    cells = [(a, s, None, None) for a in archs for s in scorers]
+    if args.diag:
+        cells += [(d["arch"], d["scorer"], d["name"], d["override"])
+                  for d in DIAG if d["arch"] in archs]
     made = []
-    for arch in archs:
-        for scorer in scorers:
-            save_dir, sh = build_sh(arch, scorer)
-            sh_path = os.path.join(save_dir, "run_ddp.sh")
-            if args.dry_run:
-                print(f"\n# ===== {arch} / {scorer}  ->  {sh_path} =====\n{sh}")
-                continue
-            os.makedirs(save_dir, exist_ok=True)
-            with open(sh_path, "w") as fh:
-                fh.write(sh)
-            os.chmod(sh_path, 0o755)
-            made.append(sh_path)
+    for arch, scorer, name, ov in cells:
+        save_dir, sh = build_sh(arch, scorer, name=name, ov=ov)
+        cell = name or scorer
+        sh_path = os.path.join(save_dir, "run_ddp.sh")
+        if args.dry_run:
+            print(f"\n# ===== {arch} / {cell}  ->  {sh_path} =====\n{sh}")
+            continue
+        os.makedirs(save_dir, exist_ok=True)
+        with open(sh_path, "w") as fh:
+            fh.write(sh)
+        os.chmod(sh_path, 0o755)
+        made.append(sh_path)
     if not args.dry_run:
         print(f"wrote {len(made)} run_ddp.sh:")
         for p in made:
