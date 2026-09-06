@@ -104,8 +104,13 @@ SCORERS = {
 #   no-reparam mode). Read: recovers to ~0.69 => gap is these flags, fix grid for ALL scorers;
 #   stays ~0.64 => gap is the reparam prune engine itself. Gated behind --diag (default off).
 DIAG = [
+    # pat (->0.69) log: norm_per_layer=True, interior_only=True, fold_bn_before_prune=True, global.
+    # Per-layer dump proved the mask driver = NORMALIZER: pat norm_per_layer cuts ~uniform ~50%/layer
+    # (deep f17/f18 protected); normnet width keeps early ~99% + dumps deep f15-18 to 20% -> different
+    # net. So patmatch flips ONLY the normalizer (width->mean == norm_per_layer) + native-BN fold;
+    # interior_only STAYS ON (pat has it; earlier interior_off=True was wrong, made mask worse).
     dict(arch="mobilenet_v2", name="nci_patmatch", scorer="nci",
-         override=dict(imp_normalizer="mean", interior_off=True, fold_native=True)),
+         override=dict(imp_normalizer="mean", fold_native=True)),
 ]
 
 
