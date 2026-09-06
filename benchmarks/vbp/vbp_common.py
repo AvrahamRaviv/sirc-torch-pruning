@@ -249,6 +249,29 @@ def build_calib_loader(args, use_ddp=True):
                       num_workers=args.num_workers, pin_memory=True, drop_last=True)
 
 
+def build_aug_calib_loader(args, use_ddp=True):
+    """Calib loader over the TRAIN split with the AUGMENTED TRAIN transform (RandomResizedCrop +
+    flip) — the OPPOSITE of build_calib_loader's clean center-crop.
+
+    For CLASSICAL scorers (tp_variance / variance) whose σ must match vbp_imagenet_pat: pat measures
+    activation variance on the augmented training stream, NOT the clean crop that build_calib_loader
+    serves for reparam σ. Augmentation inflates deep-layer σ (scale/crop/flip make f15-17 semantic
+    channels fire variably) → those layers score high → KEPT (pat's f17≈61%); clean center-crop
+    deflates deep-layer σ → tp_variance guts f15-17 to the cap (≈20%). This loader restores pat's σ.
+
+    Shuffled so a small max_batches sees a representative class mix. Single-rank (short read)."""
+    aug_transform = get_train_transform(args.model_type)
+    pkl = os.path.join(args.data_path, "train_samples.pkl")
+    if os.path.exists(pkl):
+        with open(pkl, "rb") as f:
+            samples = pickle.load(f)
+        calib_dst = FastImageNet(samples, transform=aug_transform)
+    else:
+        calib_dst = ImageFolder(os.path.join(args.data_path, "train"), transform=aug_transform)
+    return DataLoader(calib_dst, batch_size=args.val_batch_size, shuffle=True,
+                      num_workers=args.num_workers, pin_memory=True, drop_last=True)
+
+
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------

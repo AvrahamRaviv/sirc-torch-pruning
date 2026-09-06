@@ -36,8 +36,8 @@ import torch
 import torch_pruning as tp
 
 from vbp_common import (
-    setup_logging, build_dataloaders, build_calib_loader, load_model, validate,
-    build_whole_net_reparam_layers,
+    setup_logging, build_dataloaders, build_calib_loader, build_aug_calib_loader,
+    load_model, validate, build_whole_net_reparam_layers,
 )
 from normalize_net import (
     build_reparam_manager, train_normalized, log_info, get_device,
@@ -1034,7 +1034,16 @@ def main(argv):
             # POST-activation output variance (the proven vbp_imagenet_pat criterion). Without
             # target_layers collect_statistics hooks the raw pre-activation output → different
             # ranking → different prune distribution → bad retention (convnext esp.).
-            var_imp.collect_statistics(model, calib_loader, device,
+            # --classical_calib_aug: measure σ on the AUGMENTED train stream (RandomResizedCrop+flip)
+            # like vbp_imagenet_pat, NOT the clean center-crop calib_loader. Clean σ deflates deep-
+            # layer variance → tp_variance guts f15-17 to the cap; aug σ restores pat's mask (f17
+            # ~61% not 20%). Default off = clean calib (back-compat, bit-identical when unset).
+            _sigma_loader = calib_loader
+            if getattr(args, "classical_calib_aug", False):
+                _sigma_loader = build_aug_calib_loader(args, use_ddp=use_ddp)
+                log_info("classical σ: AUGMENTED train calib (matches vbp_imagenet_pat, "
+                         "restores deep-layer σ)")
+            var_imp.collect_statistics(model, _sigma_loader, device,
                                        target_layers=_post_act_target_layers(model, args.model_type, ex),
                                        max_batches=args.calib_batches)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -1635,6 +1644,12 @@ def parse_args(argv):
     p.add_argument("--calib_split", default="train", choices=["train", "val"],
                    help="data split for reparam σ/μ + cov + measured-Var calibration. "
                         "'val' matches the research harness that built the mnv2 leaderboard")
+    p.add_argument("--classical_calib_aug", action="store_true",
+                   help="CLASSICAL scorers (tp_variance/variance): measure activation σ on the "
+                        "AUGMENTED train stream (RandomResizedCrop+flip) like vbp_imagenet_pat, "
+                        "instead of the clean center-crop calib_loader. Clean σ deflates deep-layer "
+                        "variance → guts f15-17 to the cap; aug σ restores pat's mask (f17~61%). "
+                        "Default off = clean calib (back-compat). No effect on reparam/NCI scorers.")
     # ---- cross-platform DEBUG instrumentation (default off → byte-identical behavior) ----
     p.add_argument("--calib_tensor", default="",
                    help="DEBUG: pin the calibration input. If file missing → dump the first "

@@ -112,8 +112,11 @@ DIAG = [
     # (deep f17/f18 protected); normnet width keeps early ~99% + dumps deep f15-18 to 20% -> different
     # net. So patmatch flips ONLY the normalizer (width->mean == norm_per_layer) + native-BN fold;
     # interior_only STAYS ON (pat has it; earlier interior_off=True was wrong, made mask worse).
+    # classical_aug: measure tp_variance σ on the AUGMENTED train stream like pat (--classical_calib_aug).
+    # ROOT of the residual gap: normnet measures σ on clean center-crop → deep-layer σ deflated →
+    # f15-17 gutted to the 20% cap; pat measures σ on RandomResizedCrop+flip → f17 stays ~61%.
     dict(arch="mobilenet_v2", name="nci_patmatch", scorer="nci",
-         override=dict(imp_normalizer="mean", fold_native=True)),
+         override=dict(imp_normalizer="mean", fold_native=True, classical_aug=True)),
 ]
 
 
@@ -130,6 +133,8 @@ def core_flags(a, ov=None):
          "--train_batch_size", str(a.get("train_bs", TRAIN_BS))]  # per-arch batch (mnv2=256)
     if ov.get("fold_native"):
         f += ["--fold_native_bn"]        # diag: plain native-BN fold (== pat --fold_bn_before_prune)
+    if ov.get("classical_aug"):
+        f += ["--classical_calib_aug"]   # diag: measure classical σ on augmented train (== pat)
     # budget: channel keep-ratio (mnv2, mimics old --keep_ratio 0.5) XOR MAC target (other archs)
     if a.get("prune_ratio") is not None:
         f += ["--pruning_ratio", str(a["prune_ratio"])]
