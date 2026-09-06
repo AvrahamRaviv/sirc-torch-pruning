@@ -46,7 +46,10 @@ ARCHS = {
         root="/algo/NetOptimization/outputs/NORMNET/MNv2",
         ckpt="mobilenet_v2_weights.pth", model_type="cnn", cnn_arch="mobilenet_v2",
         val_resize=256, cap="0.8", interior=True,
-        train_bs=256, amp=True, prune_ratio=0.5,
+        train_bs=256, amp=True, mac=0.16,   # 0.16 target -> ~0.17G (52%) = pat's exact operating point.
+        # (was prune_ratio=0.5, but 50% interior CHANNELS != 50% MACs: normnet caps deep f15-17 and
+        #  spares hi-res mid layers -> lands 0.22G, a LIGHTER prune than pat's keep_ratio0.5=0.17G.
+        #  MAC target pins the same compute so the scorer comparison is apples-to-apples.)
         # MIMIC-OWN-69 recipe. Reproduce the user's own MNv2 run that hit ~0.69 (vbp_imagenet_pat.py
         # global weight_variance_both + VNR). Schedule is copied 1:1; ONLY TWO INTENTIONAL DIFFS:
         #   (1) criterion  = our scorer (propagation/iter/magnitude/vbp/nci) instead of
