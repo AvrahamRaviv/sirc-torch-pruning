@@ -46,7 +46,12 @@ ARCHS = {
         root="/algo/NetOptimization/outputs/NORMNET/MNv2",
         ckpt="mobilenet_v2_weights.pth", model_type="cnn", cnn_arch="mobilenet_v2",
         val_resize=256, cap="0.8", interior=True,
-        train_bs=256, amp=True, mac=0.16,   # 0.16 target -> ~0.17G (52%) = pat's exact operating point.
+        train_bs=256, mac=0.16,   # 0.16 target -> ~0.17G (52%) = pat's exact operating point.
+        # ALL 4 scorers now run pat-EQUIVALENT infra (== the 0.69 run): mean normalizer
+        # (== norm_per_layer), native-BN fold (== fold_bn_before_prune), augmented-σ calib
+        # (train RandomResizedCrop, == pat's train_loader). amp OFF to erase any fp16 gap.
+        # Only remaining diffs vs pat 0.69: (1) criterion = our scorer, (2) no VNR sparse phase.
+        imp_norm="mean", fold_native=True, classical_aug=True,
         # (was prune_ratio=0.5, but 50% interior CHANNELS != 50% MACs: normnet caps deep f15-17 and
         #  spares hi-res mid layers -> lands 0.22G, a LIGHTER prune than pat's keep_ratio0.5=0.17G.
         #  MAC target pins the same compute so the scorer comparison is apples-to-apples.)
@@ -128,13 +133,13 @@ def core_flags(a, ov=None):
          "--recalib_batches", str(RECALIB_BATCHES), "--skip_norm_eval",
          "--calib_batches", str(CALIB_BATCHES),
          "--epochs_train", "0", "--epochs_norm_ft", "0",
-         "--imp_normalizer", ov.get("imp_normalizer", "width"),   # diag: mean == pat norm_per_layer
+         "--imp_normalizer", ov.get("imp_normalizer", a.get("imp_norm", "width")),  # mnv2=mean (==pat norm_per_layer)
          "--val_resize", str(a["val_resize"]),
          "--train_batch_size", str(a.get("train_bs", TRAIN_BS))]  # per-arch batch (mnv2=256)
-    if ov.get("fold_native"):
-        f += ["--fold_native_bn"]        # diag: plain native-BN fold (== pat --fold_bn_before_prune)
-    if ov.get("classical_aug"):
-        f += ["--classical_calib_aug"]   # diag: measure classical σ on augmented train (== pat)
+    if ov.get("fold_native") or a.get("fold_native"):
+        f += ["--fold_native_bn"]        # mnv2: native-BN fold (== pat --fold_bn_before_prune)
+    if ov.get("classical_aug") or a.get("classical_aug"):
+        f += ["--classical_calib_aug"]   # mnv2: measure classical σ on augmented train (== pat)
     # budget: channel keep-ratio (mnv2, mimics old --keep_ratio 0.5) XOR MAC target (other archs)
     if a.get("prune_ratio") is not None:
         f += ["--pruning_ratio", str(a["prune_ratio"])]
