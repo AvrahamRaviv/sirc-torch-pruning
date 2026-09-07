@@ -65,9 +65,11 @@ ARCHS = {
         # eta_min 1e-6, KD on, bs 256/GPU, --keep_ratio 0.5 == --pruning_ratio 0.5 (drop mac
         # target), bn recalib on. Residual (accuracy-neutral) delta: --amp fp16 for vacation speed
         # (their cmd had none). interior_only kept = our method's residual-stream protection.
+        # NO ft warmup: the actual 0.69 pat log ran flat lr=5e-4 from FT step 1 (recover-FT, not
+        # scratch). warmup 5 throttled epoch-1 lr to ~5e-6 -> ep1 acc 0.03 vs pat's ~47. Match pat.
         recipe=["--opt", "adamw", "--epochs_ft", "200", "--lr_ft", "0.0005",
                 "--lr_schedule", "cosine", "--ft_eta_min", "1e-6",
-                "--ft_warmup_epochs", "5", "--wd", "0.01"]),
+                "--ft_warmup_epochs", "0", "--wd", "0.01"]),
     "convnext_t": dict(
         root="/algo/NetOptimization/outputs/NORMNET/ConvNeXt_tiny",
         ckpt="convnext_tiny_22k_1k_224.pth", model_type="convnext", cnn_arch="convnext_tiny",
