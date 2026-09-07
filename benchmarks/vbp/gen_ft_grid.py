@@ -45,28 +45,19 @@ ARCHS = {
     "mobilenet_v2": dict(
         root="/algo/NetOptimization/outputs/NORMNET/MNv2",
         ckpt="mobilenet_v2_weights.pth", model_type="cnn", cnn_arch="mobilenet_v2",
-        val_resize=256, cap="0.8", interior=True,
-        train_bs=256, mac=0.16,   # 0.16 target -> ~0.17G (52%) = pat's exact operating point.
-        # ALL 4 scorers now run pat-EQUIVALENT infra (== the 0.69 run): mean normalizer
-        # (== norm_per_layer), native-BN fold (== fold_bn_before_prune), augmented-σ calib
-        # (train RandomResizedCrop, == pat's train_loader). amp OFF to erase any fp16 gap.
-        # Only remaining diffs vs pat 0.69: (1) criterion = our scorer, (2) no VNR sparse phase.
+        val_resize=256, cap="0.95", interior=True,
+        train_bs=256, prune_ratio=0.5, recalib=100, kd=("0.7", "2.0"),
+        # EXACT pat 0.69 replica — every flag verified against the winning log (2026-03-29). pat =
+        # criterion variance + importance_mode tp_variance (== our nci), keep_ratio 0.5 (CHANNEL
+        # target, NOT MAC), max_pruning_rate 0.95, norm_per_layer, fold_bn_before_prune, bn_recalib
+        # 100, interior_only, KD alpha 0.7 T 2, NO VNR (sparse none). keep_ratio 0.5 + cap 0.95 lands
+        # 0.17G (54% MAC) while KEEPING f17 ~61%. The earlier mac_target 0.16 + cap 0.8 was WRONG:
+        # its 20% floor gutted f15-17 to 192 ch, destroying the top features -> pat ep1 0.47 vs ours
+        # 0.126. Pat curve ep1 0.47 -> ep10 0.62. Only intended diff left: criterion = grid scorer
+        # (for nci that is ZERO diff -> nci should reproduce pat's ~0.69).
         imp_norm="mean", fold_native=True, classical_aug=True,
-        # (was prune_ratio=0.5, but 50% interior CHANNELS != 50% MACs: normnet caps deep f15-17 and
-        #  spares hi-res mid layers -> lands 0.22G, a LIGHTER prune than pat's keep_ratio0.5=0.17G.
-        #  MAC target pins the same compute so the scorer comparison is apples-to-apples.)
-        # MIMIC-OWN-69 recipe. Reproduce the user's own MNv2 run that hit ~0.69 (vbp_imagenet_pat.py
-        # global weight_variance_both + VNR). Schedule is copied 1:1; ONLY TWO INTENTIONAL DIFFS:
-        #   (1) criterion  = our scorer (propagation/iter/magnitude/vbp/nci) instead of
-        #                    weight_variance_both  (each scorer carries its own normalizer)
-        #   (2) no VNR     = drop the 10ep --sparse_mode vnr sparsity-learning phase
-        #                    (normnet_main is prune+FT only; this is the controlled "no-SL" arm)
-        # Everything else matches the 69-run: AdamW, lr_ft 5e-4, wd 0.01, 200ep, warmup 5,
-        # eta_min 1e-6, KD on, bs 256/GPU, --keep_ratio 0.5 == --pruning_ratio 0.5 (drop mac
-        # target), bn recalib on. Residual (accuracy-neutral) delta: --amp fp16 for vacation speed
-        # (their cmd had none). interior_only kept = our method's residual-stream protection.
-        # NO ft warmup: the actual 0.69 pat log ran flat lr=5e-4 from FT step 1 (recover-FT, not
-        # scratch). warmup 5 throttled epoch-1 lr to ~5e-6 -> ep1 acc 0.03 vs pat's ~47. Match pat.
+        # NO ft warmup: pat's config carries warmup 5 but rebuilds the FT scheduler post-prune
+        # WITHOUT it, so pat FT ran flat lr=5e-4 from step 1. warmup 0 reproduces that behavior.
         recipe=["--opt", "adamw", "--epochs_ft", "200", "--lr_ft", "0.0005",
                 "--lr_schedule", "cosine", "--ft_eta_min", "1e-6",
                 "--ft_warmup_epochs", "0", "--wd", "0.01"]),
@@ -132,7 +123,7 @@ def core_flags(a, ov=None):
     ov = per-cell infra override (diagnostic): imp_normalizer, interior_off, fold_native."""
     ov = ov or {}
     f = ["--global_pruning", "--reparam_variant", "mean", "--bias_comp",
-         "--recalib_batches", str(RECALIB_BATCHES), "--skip_norm_eval",
+         "--recalib_batches", str(a.get("recalib", RECALIB_BATCHES)), "--skip_norm_eval",
          "--calib_batches", str(CALIB_BATCHES),
          "--epochs_train", "0", "--epochs_norm_ft", "0",
          "--imp_normalizer", ov.get("imp_normalizer", a.get("imp_norm", "width")),  # mnv2=mean (==pat norm_per_layer)
