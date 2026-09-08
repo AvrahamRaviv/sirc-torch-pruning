@@ -6,7 +6,6 @@ Run ON THE CLUSTER (creates dirs under /algo/.../NORMNET/<arch>/). Pure stdlib, 
     python3 gen_ft_grid.py            # write all 20 run_ddp.sh
     python3 gen_ft_grid.py --dry_run  # print, write nothing
     python3 gen_ft_grid.py --archs resnet50,mobilenet_v1   # subset
-    python3 gen_ft_grid.py --diag --archs mobilenet_v2 --scorers nci  # + Option-1 diagnostic cell
 
 Each cell = prune (scorer) + full FT with the arch's SOTA-isomorphic recipe. Numbers are meant to
 compare to the published pruning papers (DepGraph / Isomorphic-Pruning / AMC), NOT to KD-accelerated
@@ -44,27 +43,16 @@ ARCHS = {
                 "--wd", "1e-4", "--momentum", "0.9"]),   # Isomorphic R50@2.0G: 100ep (DepGraph=90)
     "mobilenet_v2": dict(
         root="/algo/NetOptimization/outputs/NORMNET/MNv2",
-        # ABSOLUTE ckpt = pat's EXACT MNv2 net (torchvision V1, dense 0.7187). CRITICAL: the file
-        # NORMNET/MNv2/mobilenet_v2_weights.pth did NOT exist (real file: ..._v2.weights) → normnet
-        # silently RANDOM-INITED every MNv2 run for weeks (pruned+FT'd noise → f17 junk, ep1 0.126,
-        # never 0.69). Point at pat's proven ckpt (absolute path overrides root in os.path.join, so
-        # outputs still save under NORMNET/MNv2/<cell>). Do NOT use ..._v2.weights = torchvision V2
-        # recipe (running_var collapse). save_dir stays root/cell.
+        # Absolute ckpt = pretrained MNv2 (torchvision V1, dense 0.7187). Absolute because the bare
+        # filename under root did not exist -> load_model would random-init. Do NOT use the V2-recipe
+        # weights (running_var collapse). save_dir still resolves under root/<cell> (abs path wins in
+        # os.path.join).
         ckpt="/algo/NetOptimization/outputs/VBP/MNv2_TP/mobilenet_v2_weights.pth",
         model_type="cnn", cnn_arch="mobilenet_v2",
         val_resize=256, cap="0.95", interior=True,
         train_bs=256, prune_ratio=0.5, recalib=100, kd=("0.7", "2.0"),
-        # EXACT pat 0.69 replica — every flag verified against the winning log (2026-03-29). pat =
-        # criterion variance + importance_mode tp_variance (== our nci), keep_ratio 0.5 (CHANNEL
-        # target, NOT MAC), max_pruning_rate 0.95, norm_per_layer, fold_bn_before_prune, bn_recalib
-        # 100, interior_only, KD alpha 0.7 T 2, NO VNR (sparse none). keep_ratio 0.5 + cap 0.95 lands
-        # 0.17G (54% MAC) while KEEPING f17 ~61%. The earlier mac_target 0.16 + cap 0.8 was WRONG:
-        # its 20% floor gutted f15-17 to 192 ch, destroying the top features -> pat ep1 0.47 vs ours
-        # 0.126. Pat curve ep1 0.47 -> ep10 0.62. Only intended diff left: criterion = grid scorer
-        # (for nci that is ZERO diff -> nci should reproduce pat's ~0.69).
         imp_norm="mean", fold_native=True, classical_aug=True,
-        # NO ft warmup: pat's config carries warmup 5 but rebuilds the FT scheduler post-prune
-        # WITHOUT it, so pat FT ran flat lr=5e-4 from step 1. warmup 0 reproduces that behavior.
+        # keep_ratio 0.5 + cap 0.95 -> 0.17G (54% MAC). AdamW 200ep lr5e-4 cosine, no warmup, KD 0.7.
         recipe=["--opt", "adamw", "--epochs_ft", "200", "--lr_ft", "0.0005",
                 "--lr_schedule", "cosine", "--ft_eta_min", "1e-6",
                 "--ft_warmup_epochs", "0", "--wd", "0.01"]),
@@ -103,70 +91,46 @@ SCORERS = {
 }
 
 
-# ------------------------------------------------------------------ Option-1 diagnostic cells
-#   Isolate the pat(->0.69) vs normnet(->0.64) infra gap. Same nci criterion + same mimic-69
-#   schedule as the mnv2 grid cell, but the 3 infra suspects flipped to the pat-equivalents that
-#   reached 0.69: interior_only OFF, per-layer normalizer (mean == pat --norm_per_layer), and
-#   plain native-BN fold (--fold_native_bn: fold Conv->BN, prune, REINSERT fresh BN + recalib + FT
-#   == exactly pat --fold_bn_before_prune's flow). reparam stays (intrinsic to normnet — no
-#   no-reparam mode). Read: recovers to ~0.69 => gap is these flags, fix grid for ALL scorers;
-#   stays ~0.64 => gap is the reparam prune engine itself. Gated behind --diag (default off).
-DIAG = [
-    # pat (->0.69) log: norm_per_layer=True, interior_only=True, fold_bn_before_prune=True, global.
-    # Per-layer dump proved the mask driver = NORMALIZER: pat norm_per_layer cuts ~uniform ~50%/layer
-    # (deep f17/f18 protected); normnet width keeps early ~99% + dumps deep f15-18 to 20% -> different
-    # net. So patmatch flips ONLY the normalizer (width->mean == norm_per_layer) + native-BN fold;
-    # interior_only STAYS ON (pat has it; earlier interior_off=True was wrong, made mask worse).
-    # classical_aug: measure tp_variance σ on the AUGMENTED train stream like pat (--classical_calib_aug).
-    # ROOT of the residual gap: normnet measures σ on clean center-crop → deep-layer σ deflated →
-    # f15-17 gutted to the 20% cap; pat measures σ on RandomResizedCrop+flip → f17 stays ~61%.
-    dict(arch="mobilenet_v2", name="nci_patmatch", scorer="nci",
-         override=dict(imp_normalizer="mean", fold_native=True, classical_aug=True)),
-]
-
-
-def core_flags(a, ov=None):
-    """Flags common to every cell: prune protocol B_native (mean-fold, no recalib) + FT scaffolding.
-    ov = per-cell infra override (diagnostic): imp_normalizer, interior_off, fold_native."""
-    ov = ov or {}
+def core_flags(a):
+    """Flags common to every cell: prune protocol (mean-fold) + FT scaffolding. Per-arch keys
+    (imp_norm / fold_native / classical_aug / recalib / kd / cap / prune_ratio) override defaults."""
     f = ["--global_pruning", "--reparam_variant", "mean", "--bias_comp",
          "--recalib_batches", str(a.get("recalib", RECALIB_BATCHES)), "--skip_norm_eval",
          "--calib_batches", str(CALIB_BATCHES),
          "--epochs_train", "0", "--epochs_norm_ft", "0",
-         "--imp_normalizer", ov.get("imp_normalizer", a.get("imp_norm", "width")),  # mnv2=mean (==pat norm_per_layer)
+         "--imp_normalizer", a.get("imp_norm", "width"),
          "--val_resize", str(a["val_resize"]),
          "--train_batch_size", str(a.get("train_bs", TRAIN_BS))]  # per-arch batch (mnv2=256)
-    if ov.get("fold_native") or a.get("fold_native"):
-        f += ["--fold_native_bn"]        # mnv2: native-BN fold (== pat --fold_bn_before_prune)
-    if ov.get("classical_aug") or a.get("classical_aug"):
-        f += ["--classical_calib_aug"]   # mnv2: measure classical σ on augmented train (== pat)
-    # budget: channel keep-ratio (mnv2, mimics old --keep_ratio 0.5) XOR MAC target (other archs)
+    if a.get("fold_native"):
+        f += ["--fold_native_bn"]        # fold Conv->BN, prune, reinsert fresh BN + recalib + FT
+    if a.get("classical_aug"):
+        f += ["--classical_calib_aug"]   # measure classical-scorer σ on augmented train stream
+    # budget: channel keep-ratio (mnv2) XOR MAC target (other archs)
     if a.get("prune_ratio") is not None:
         f += ["--pruning_ratio", str(a["prune_ratio"])]
     else:
         f += ["--mac_target_g", str(a["mac"])]
     if a["cap"]:
         f += ["--max_prune_ratio", a["cap"]]
-    if a.get("interior") and not ov.get("interior_off"):   # diag: interior_off drops residual guard
+    if a.get("interior"):
         f += ["--interior_only"]         # protect residual-stream out-channels (arch opt-in)
     if a.get("amp"):
         f += ["--amp"]                   # fp16 FT (accuracy-neutral, ~2x faster)
-    if USE_KD and not a.get("kd_off"):   # kd_off per arch (mnv2 matches SOTA recipe = no KD)
+    if USE_KD and not a.get("kd_off"):
         alpha, T = a.get("kd", ("0.5", "2.0"))          # per-arch KD; convnext = (0.0, 4.0)
         f += ["--use_kd", "--kd_alpha", alpha, "--kd_T", T]
     return f
 
 
-def build_sh(arch, scorer, name=None, ov=None):
+def build_sh(arch, scorer):
     a = ARCHS[arch]
-    cell = name or scorer            # diagnostic cells save under their own name (not the scorer)
-    save_dir = os.path.join(a["root"], cell)
-    tag = f"{arch}_ft_{cell}"
+    save_dir = os.path.join(a["root"], scorer)
+    tag = f"{arch}_ft_{scorer}"
     flags = ["--model_type", a["model_type"], "--cnn_arch", a["cnn_arch"],
              "--model_name", os.path.join(a["root"], a["ckpt"]),
              "--data_path", DATA_PATH,
              "--save_dir", save_dir, "--save_tag", tag]
-    flags += core_flags(a, ov) + SCORERS[scorer] + a["recipe"]
+    flags += core_flags(a) + SCORERS[scorer] + a["recipe"]
     line = (f"python3 -m torch.distributed.launch --nproc_per_node={NGPU} "
             f"{REPO}/benchmarks/vbp/normnet_main.py \\\n    " + " ".join(flags))
     return save_dir, f"#!/bin/bash\nset -e\ncd {REPO}\n{line}\n"
@@ -177,25 +141,16 @@ def main():
     ap.add_argument("--archs", default=",".join(ARCHS), help="comma list; default all 4")
     ap.add_argument("--scorers", default=",".join(SCORERS), help="comma list; default all 5")
     ap.add_argument("--dry_run", action="store_true", help="print, write nothing")
-    ap.add_argument("--diag", action="store_true",
-                    help="ALSO emit Option-1 diagnostic cells (pat-infra-match; see DIAG). "
-                         "Filtered by --archs. Default off = normal grid only.")
     args = ap.parse_args()
 
     archs = [x for x in args.archs.split(",") if x]
     scorers = [x for x in args.scorers.split(",") if x]
-    # (arch, scorer, name, override) tuples: the arch x scorer grid, plus optional diagnostic cells
-    cells = [(a, s, None, None) for a in archs for s in scorers]
-    if args.diag:
-        cells += [(d["arch"], d["scorer"], d["name"], d["override"])
-                  for d in DIAG if d["arch"] in archs]
     made = []
-    for arch, scorer, name, ov in cells:
-        save_dir, sh = build_sh(arch, scorer, name=name, ov=ov)
-        cell = name or scorer
+    for arch, scorer in [(a, s) for a in archs for s in scorers]:
+        save_dir, sh = build_sh(arch, scorer)
         sh_path = os.path.join(save_dir, "run_ddp.sh")
         if args.dry_run:
-            print(f"\n# ===== {arch} / {cell}  ->  {sh_path} =====\n{sh}")
+            print(f"\n# ===== {arch} / {scorer}  ->  {sh_path} =====\n{sh}")
             continue
         os.makedirs(save_dir, exist_ok=True)
         with open(sh_path, "w") as fh:

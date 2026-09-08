@@ -253,13 +253,9 @@ def build_aug_calib_loader(args, use_ddp=True):
     """Calib loader over the TRAIN split with the AUGMENTED TRAIN transform (RandomResizedCrop +
     flip) — the OPPOSITE of build_calib_loader's clean center-crop.
 
-    For CLASSICAL scorers (tp_variance / variance) whose σ must match vbp_imagenet_pat: pat measures
-    activation variance on the augmented training stream, NOT the clean crop that build_calib_loader
-    serves for reparam σ. Augmentation inflates deep-layer σ (scale/crop/flip make f15-17 semantic
-    channels fire variably) → those layers score high → KEPT (pat's f17≈61%); clean center-crop
-    deflates deep-layer σ → tp_variance guts f15-17 to the cap (≈20%). This loader restores pat's σ.
-
-    Shuffled so a small max_batches sees a representative class mix. Single-rank (short read)."""
+    For CLASSICAL scorers (tp_variance / variance): measure activation σ on the augmented training
+    stream instead of the clean crop that build_calib_loader serves for reparam σ. Selected via
+    --classical_calib_aug. Shuffled so a small max_batches sees a representative class mix."""
     aug_transform = get_train_transform(args.model_type)
     pkl = os.path.join(args.data_path, "train_samples.pkl")
     if os.path.exists(pkl):

@@ -1040,18 +1040,14 @@ def main(argv):
             # (no weight term). scorer "tp_variance" = group-L2(both sides) × σ.
             var_imp = tp.importance.VarianceImportance(
                 norm_per_layer=(args.imp_normalizer == "mean"), importance_mode=args.scorer)
-            # POST-activation output variance (the proven vbp_imagenet_pat criterion). Without
-            # target_layers collect_statistics hooks the raw pre-activation output → different
-            # ranking → different prune distribution → bad retention (convnext esp.).
+            # POST-activation output variance. Without target_layers, collect_statistics hooks the
+            # raw pre-activation output → different ranking → different prune distribution.
             # --classical_calib_aug: measure σ on the AUGMENTED train stream (RandomResizedCrop+flip)
-            # like vbp_imagenet_pat, NOT the clean center-crop calib_loader. Clean σ deflates deep-
-            # layer variance → tp_variance guts f15-17 to the cap; aug σ restores pat's mask (f17
-            # ~61% not 20%). Default off = clean calib (back-compat, bit-identical when unset).
+            # instead of the clean center-crop calib_loader. Default off = clean calib (bit-identical).
             _sigma_loader = calib_loader
             if getattr(args, "classical_calib_aug", False):
                 _sigma_loader = build_aug_calib_loader(args, use_ddp=use_ddp)
-                log_info("classical σ: AUGMENTED train calib (matches vbp_imagenet_pat, "
-                         "restores deep-layer σ)")
+                log_info("classical σ: AUGMENTED train calib")
             var_imp.collect_statistics(model, _sigma_loader, device,
                                        target_layers=_post_act_target_layers(model, args.model_type, ex),
                                        max_batches=args.calib_batches)
@@ -1655,10 +1651,9 @@ def parse_args(argv):
                         "'val' matches the research harness that built the mnv2 leaderboard")
     p.add_argument("--classical_calib_aug", action="store_true",
                    help="CLASSICAL scorers (tp_variance/variance): measure activation σ on the "
-                        "AUGMENTED train stream (RandomResizedCrop+flip) like vbp_imagenet_pat, "
-                        "instead of the clean center-crop calib_loader. Clean σ deflates deep-layer "
-                        "variance → guts f15-17 to the cap; aug σ restores pat's mask (f17~61%). "
-                        "Default off = clean calib (back-compat). No effect on reparam/NCI scorers.")
+                        "AUGMENTED train stream (RandomResizedCrop+flip) instead of the clean "
+                        "center-crop calib_loader. Default off = clean calib (back-compat). "
+                        "No effect on reparam/NCI scorers.")
     # ---- cross-platform DEBUG instrumentation (default off → byte-identical behavior) ----
     p.add_argument("--calib_tensor", default="",
                    help="DEBUG: pin the calibration input. If file missing → dump the first "
