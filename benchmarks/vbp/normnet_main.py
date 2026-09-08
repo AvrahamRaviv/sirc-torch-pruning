@@ -74,6 +74,15 @@ def _load_any(args, device):
                     log_info(f"VNR checkpoint detected → {ckpt}")
                     args.checkpoint = None       # inner load_model random-inits the arch;
                     return load_normnet_checkpoint(ckpt, device, args)  # strict-load overwrites
+    # GUARD: an absolute --model_name that does not exist → load_model SILENTLY random-inits
+    # (logs "no checkpoint provided" and prunes+FTs pure noise → never recovers). This burned the
+    # MNv2 grid for weeks (wrong filename NORMNET/MNv2/mobilenet_v2_weights.pth). Fail loud instead.
+    mn = getattr(args, "model_name", "") or ""
+    if os.path.isabs(mn) and not os.path.exists(mn):
+        raise FileNotFoundError(
+            f"--model_name points at a nonexistent file:\n    {mn}\n"
+            f"load_model would SILENTLY random-init the arch (pruning noise, never recovers). "
+            f"Fix the path, or pass a non-absolute arch name / HF id for intentional from-scratch.")
     return load_model(args, device)
 
 

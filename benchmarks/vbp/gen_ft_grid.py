@@ -44,7 +44,14 @@ ARCHS = {
                 "--wd", "1e-4", "--momentum", "0.9"]),   # Isomorphic R50@2.0G: 100ep (DepGraph=90)
     "mobilenet_v2": dict(
         root="/algo/NetOptimization/outputs/NORMNET/MNv2",
-        ckpt="mobilenet_v2_weights.pth", model_type="cnn", cnn_arch="mobilenet_v2",
+        # ABSOLUTE ckpt = pat's EXACT MNv2 net (torchvision V1, dense 0.7187). CRITICAL: the file
+        # NORMNET/MNv2/mobilenet_v2_weights.pth did NOT exist (real file: ..._v2.weights) → normnet
+        # silently RANDOM-INITED every MNv2 run for weeks (pruned+FT'd noise → f17 junk, ep1 0.126,
+        # never 0.69). Point at pat's proven ckpt (absolute path overrides root in os.path.join, so
+        # outputs still save under NORMNET/MNv2/<cell>). Do NOT use ..._v2.weights = torchvision V2
+        # recipe (running_var collapse). save_dir stays root/cell.
+        ckpt="/algo/NetOptimization/outputs/VBP/MNv2_TP/mobilenet_v2_weights.pth",
+        model_type="cnn", cnn_arch="mobilenet_v2",
         val_resize=256, cap="0.95", interior=True,
         train_bs=256, prune_ratio=0.5, recalib=100, kd=("0.7", "2.0"),
         # EXACT pat 0.69 replica — every flag verified against the winning log (2026-03-29). pat =
