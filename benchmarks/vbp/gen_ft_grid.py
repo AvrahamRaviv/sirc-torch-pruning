@@ -51,7 +51,7 @@ ARCHS = {
         model_type="cnn", cnn_arch="mobilenet_v2",
         val_resize=256, cap="0.95", interior=True,
         train_bs=256, prune_ratio=0.5, recalib=100, kd=("0.7", "2.0"),
-        imp_norm="mean", fold_native=True, classical_aug=True,
+        imp_norm="mean", fold_native=True,
         # keep_ratio 0.5 + cap 0.95 -> 0.17G (54% MAC). AdamW 200ep lr5e-4 cosine, no warmup, KD 0.7.
         recipe=["--opt", "adamw", "--epochs_ft", "200", "--lr_ft", "0.0005",
                 "--lr_schedule", "cosine", "--ft_eta_min", "1e-6",
@@ -78,6 +78,13 @@ ARCHS = {
                 "--wd", "4e-5", "--momentum", "0.9"]),
 }
 
+# A/B probe (MNv2 iter only): plain BN-fold FT weights (reparam_variant bn = pat's fold_bn_before_prune)
+# vs the mean-center fold the mobilenet_v2 cell uses. Separate root -> cannot overwrite the mean run.
+# Run explicitly: gen_ft_grid.py --archs mobilenet_v2_bn --scorers iter
+ARCHS["mobilenet_v2_bn"] = {**ARCHS["mobilenet_v2"],
+                            "root": "/algo/NetOptimization/outputs/NORMNET/MNv2_bnfold",
+                            "reparam": "bn"}
+
 # ------------------------------------------------------------------ scorer -> prune flags
 #   (from reproduce_table.BASES; vbp=variance, nci=tp_variance -- trust the mapping that made the
 #    retention table). All width normalizer. cov/iter = the variance-covariance propagation family.
@@ -94,7 +101,7 @@ SCORERS = {
 def core_flags(a):
     """Flags common to every cell: prune protocol (mean-fold) + FT scaffolding. Per-arch keys
     (imp_norm / fold_native / classical_aug / recalib / kd / cap / prune_ratio) override defaults."""
-    f = ["--global_pruning", "--reparam_variant", "mean", "--bias_comp",
+    f = ["--global_pruning", "--reparam_variant", a.get("reparam", "mean"), "--bias_comp",
          "--recalib_batches", str(a.get("recalib", RECALIB_BATCHES)), "--skip_norm_eval",
          "--calib_batches", str(CALIB_BATCHES),
          "--epochs_train", "0", "--epochs_norm_ft", "0",
