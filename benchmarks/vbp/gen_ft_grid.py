@@ -36,11 +36,19 @@ USE_KD = True                  # KD on (user choice; teacher = the dense --model
 ARCHS = {
     "resnet50": dict(
         root="/algo/NetOptimization/outputs/NORMNET/ResNet50",
-        ckpt="resnet50_imagenet1k.pth", model_type="cnn", cnn_arch="resnet50",
-        val_resize=256, mac=2.00, cap=None,
-        recipe=["--opt", "sgd", "--epochs_ft", "100", "--lr_ft", "0.04",
-                "--lr_schedule", "step", "--lr_step_size", "30", "--lr_gamma", "0.1",
-                "--wd", "1e-4", "--momentum", "0.9"]),   # Isomorphic R50@2.0G: 100ep (DepGraph=90)
+        # Reproduce the proven A0 run (per_layer + mean + cap0.8, hit 0.7701 @ 30ep > DepGraph 75.8).
+        # Load via --checkpoint (proven path under VBP/, NOT the bare NORMNET/ file that may be absent
+        # -> random init). model_name stays the arch string for construction.
+        checkpoint="/algo/NetOptimization/outputs/VBP/ResNet50_TP/resnet50_imagenet1k.pth",
+        model_type="cnn", cnn_arch="resnet50",
+        val_resize=232, mac=2.00, cap="0.8", interior=True,
+        calib=50, train_bs=128, imp_norm="mean", recalib=0,   # A0 ran no post-prune BN recalib
+        # A0 recipe verbatim: SGD lr0.02 COSINE (eta_min/warmup = defaults 1e-6/0), wd1e-4 mom0.9,
+        # KD 0.5. ONLY diff vs the 0.7701@30ep run = epochs 30 -> 100 (cosine spread = margin over
+        # SOTA; A0 was still climbing at e30). Bump epochs_ft to 150 if you want more tail.
+        recipe=["--opt", "sgd", "--epochs_ft", "100", "--lr_ft", "0.02",
+                "--lr_schedule", "cosine", "--ft_eta_min", "1e-6",
+                "--wd", "1e-4", "--momentum", "0.9"]),
     "mobilenet_v2": dict(
         root="/algo/NetOptimization/outputs/NORMNET/MNv2",
         # Absolute ckpt = pretrained MNv2 (torchvision V1, dense 0.7187). Absolute because the bare
@@ -89,6 +97,7 @@ ARCHS["mobilenet_v2_bn"] = {**ARCHS["mobilenet_v2"],
 #   (from reproduce_table.BASES; vbp=variance, nci=tp_variance -- trust the mapping that made the
 #    retention table). All width normalizer. cov/iter = the variance-covariance propagation family.
 SCORERS = {
+    "per_layer": ["--scorer", "per_layer"],   # normnet ‖σv‖ per-layer (A0 R50 proven scorer)
     "magnitude": ["--scorer", "magnitude"],
     "vbp":       ["--scorer", "variance"],
     "nci":       ["--scorer", "tp_variance"],
@@ -103,7 +112,7 @@ def core_flags(a):
     (imp_norm / fold_native / classical_aug / recalib / kd / cap / prune_ratio) override defaults."""
     f = ["--global_pruning", "--reparam_variant", a.get("reparam", "mean"), "--bias_comp",
          "--recalib_batches", str(a.get("recalib", RECALIB_BATCHES)), "--skip_norm_eval",
-         "--calib_batches", str(CALIB_BATCHES),
+         "--calib_batches", str(a.get("calib", CALIB_BATCHES)),
          "--epochs_train", "0", "--epochs_norm_ft", "0",
          "--imp_normalizer", a.get("imp_norm", "width"),
          "--val_resize", str(a["val_resize"]),
@@ -133,8 +142,11 @@ def build_sh(arch, scorer):
     a = ARCHS[arch]
     save_dir = os.path.join(a["root"], scorer)
     tag = f"{arch}_ft_{scorer}"
-    flags = ["--model_type", a["model_type"], "--cnn_arch", a["cnn_arch"],
-             "--model_name", os.path.join(a["root"], a["ckpt"]),
+    if a.get("checkpoint"):                        # load weights via --checkpoint; model_name = arch
+        load = ["--model_name", a["cnn_arch"], "--checkpoint", a["checkpoint"]]
+    else:                                          # load via --model_name = abs ckpt path
+        load = ["--model_name", os.path.join(a["root"], a["ckpt"])]
+    flags = ["--model_type", a["model_type"], "--cnn_arch", a["cnn_arch"]] + load + [
              "--data_path", DATA_PATH,
              "--save_dir", save_dir, "--save_tag", tag]
     flags += core_flags(a) + SCORERS[scorer] + a["recipe"]
